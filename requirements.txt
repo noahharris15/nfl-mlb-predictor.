@@ -3,7 +3,3 @@ pandas
 numpy
 nfl_data_py
 pybaseball
-statsapi
-beautifulsoup4
-lxml
-requests
