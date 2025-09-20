@@ -1,9 +1,9 @@
-# app.py — NFL + MLB predictor (2025 only) + NFL QB Player Props (Stathead)
+# app.py — NFL + MLB predictor (2025 only) + NFL Player Props from CSV
 # Run: streamlit run app.py
 
 import io
 import re
-import time
+import os
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -24,12 +24,6 @@ except Exception:
 SIM_TRIALS = 10_000
 HOME_EDGE_NFL = 0.6   # ~0.6 pts to home mean
 EPS = 1e-9
-
-# Your Stathead tiny URLs (QB passing 2025)
-STATHEAD_QB_URLS = [
-    "https://stathead.com/tiny/t1A4t",
-    "https://stathead.com/tiny/0gq7J",
-]
 
 # Hard-coded BR team IDs (stable)
 MLB_TEAMS_2025 = {
@@ -71,6 +65,15 @@ def prob_over_poisson(lmbda: float, line: float, trials: int = SIM_TRIALS):
     sims = np.random.poisson(lmbda, size=trials)
     p_over = float((sims > line).mean())
     return p_over
+
+def fair_ml(p):
+    if p <= 0: return "∞"
+    if p >= 1: return "-∞"
+    dec = 1.0/p
+    if dec >= 2:  # ≥ +100
+        return f"+{int(round((dec-1)*100))}"
+    else:
+        return f"{int(round(-100/(dec-1)))}"
 
 # =============================== NFL ==========================================
 @st.cache_data(show_spinner=False)
@@ -171,18 +174,6 @@ def mlb_team_rates_2025():
         df["RA_pg"] = 0.9 * df["RA_pg"] + 0.1 * league_ra
     return df
 
-def _mlb_team_to_id_map() -> dict:
-    if not HAS_STATSAPI:
-        return {}
-    teams = statsapi.get("teams", {"sportIds": 1}).get("teams", [])
-    name_to_id = {}
-    for t in teams:
-        name_to_id[t["name"]] = t["id"]
-        if "teamName" in t and "locationName" in t:
-            alt = f'{t["locationName"]} {t["teamName"]}'
-            name_to_id[alt] = t["id"]
-    return name_to_id
-
 def get_probable_pitchers_and_era(home_team: str, away_team: str):
     if not HAS_STATSAPI:
         return None, None, None, None
@@ -230,89 +221,98 @@ def mlb_matchup_mu(rates: pd.DataFrame, home: str, away: str,
         mu_home = max(EPS, mu_home - scale * (LgERA - a_pit_era))
     return mu_home, mu_away
 
-# ============================ Stathead helpers ================================
-def clean_headers(df: pd.DataFrame) -> pd.DataFrame:
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [
-            " ".join([str(x) for x in tup if str(x) != "nan"]).strip()
-            for tup in df.columns.values
-        ]
-    df.columns = [re.sub(r"\s+", " ", str(c)).strip() for c in df.columns]
-    df = df.loc[:, ~df.columns.str.fullmatch(r"")]
-    return df
-
-def coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
+# ============================ CSV helpers for props ===========================
+def _clean_numeric_cols(df: pd.DataFrame) -> pd.DataFrame:
     for c in df.columns:
         if df[c].dtype == "O":
-            s = df[c].astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False)
+            s = (df[c].astype(str)
+                     .str.replace(",", "", regex=False)
+                     .str.replace("%", "", regex=False)
+                     .str.strip())
             df[c] = pd.to_numeric(s, errors="ignore")
     return df
 
-def biggest_table_from_html(html: str) -> pd.DataFrame:
-    tables = pd.read_html(io.StringIO(html))
-    if not tables:
-        raise RuntimeError("No tables found.")
-    return max(tables, key=lambda t: t.shape[0] * t.shape[1])
-
-def fetch_stathead_table(url: str, cookie: str = "") -> pd.DataFrame:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    if cookie:
-        import requests
-        r = requests.get(url, headers={"User-Agent": headers["User-Agent"], "Cookie": cookie}, timeout=30)
-        r.raise_for_status()
-        df = biggest_table_from_html(r.text)
-    else:
-        # try vanilla first
-        tables = pd.read_html(url)
-        df = max(tables, key=lambda t: t.shape[0] * t.shape[1])
-    df = clean_headers(df)
-    if "Rk" in df.columns:
-        df = df[df["Rk"].astype(str).str.fullmatch(r"\d+")]
-    df = df.dropna(how="all")
-    df = coerce_numeric(df).reset_index(drop=True)
-    return df
+def _try_read_csv(paths: list[str]) -> Optional[pd.DataFrame]:
+    for p in paths:
+        if os.path.exists(p):
+            try:
+                return pd.read_csv(p)
+            except Exception:
+                pass
+    return None
 
 @st.cache_data(show_spinner=False)
-def load_qb_stathead_2025(urls: list[str], cookie: str = "") -> pd.DataFrame:
-    # Merge all provided tables on "Player" (outer) and keep key columns
-    dfs = []
-    for u in urls:
-        try:
-            dfs.append(fetch_stathead_table(u, cookie=cookie))
-        except Exception:
-            pass
-    if not dfs:
+def load_qb_from_csv() -> pd.DataFrame:
+    # Try common locations
+    df = _try_read_csv([
+        "nfl_2025_qb_passing.csv",
+        "data/nfl_2025_qb_passing.csv",
+        "datasets/nfl_2025_qb_passing.csv",
+    ])
+    if df is None:
         return pd.DataFrame()
-    df = dfs[0]
-    for d in dfs[1:]:
-        df = df.merge(d, on="Player", how="outer", suffixes=("", "_dup"))
-        # Drop any exact dup columns
-        dup_cols = [c for c in df.columns if c.endswith("_dup")]
-        df = df.drop(columns=dup_cols, errors="ignore")
-
-    # The tables you shared include these columns (based on your paste):
-    # Player, Team (maybe), G, Cmp, Att, Yds, TD, Int
-    for col in ["G","Cmp","Att","Yds","TD","Int"]:
+    df = _clean_numeric_cols(df)
+    # Ensure columns
+    for col in ["Player","Team","G","Cmp","Att","Yds","TD","Int"]:
         if col not in df.columns:
             df[col] = np.nan
-
-    # Per-game rates (avoid div by zero)
     g = df["G"].replace(0, np.nan)
     df["Yds_pg"] = df["Yds"] / g
     df["Cmp_pg"] = df["Cmp"] / g
     df["Att_pg"] = df["Att"] / g
     df["TD_pg"]  = df["TD"]  / g
     df["Int_pg"] = df["Int"] / g
-
-    # Fill tiny gaps with zeros for cleaner UI (only on per-game fields)
     for col in ["Yds_pg","Cmp_pg","Att_pg","TD_pg","Int_pg"]:
         df[col] = df[col].fillna(0.0)
-
-    # Keep tidy columns
     keep = ["Player","Team","G","Cmp","Att","Yds","TD","Int","Yds_pg","Cmp_pg","Att_pg","TD_pg","Int_pg"]
     keep = [c for c in keep if c in df.columns]
-    df = df[keep].sort_values("Yds_pg", ascending=False, na_position="last").reset_index(drop=True)
-    return df
+    return df[keep].sort_values("Yds_pg", ascending=False, na_position="last").reset_index(drop=True)
+
+@st.cache_data(show_spinner=False)
+def load_rb_from_csv() -> pd.DataFrame:
+    df = _try_read_csv([
+        "nfl_2025_rb_rushing.csv",
+        "data/nfl_2025_rb_rushing.csv",
+        "datasets/nfl_2025_rb_rushing.csv",
+    ])
+    if df is None:
+        return pd.DataFrame()
+    df = _clean_numeric_cols(df)
+    for col in ["Player","Team","G","Att","Yds","TD"]:
+        if col not in df.columns:
+            df[col] = np.nan
+    g = df["G"].replace(0, np.nan)
+    df["RushYds_pg"] = df["Yds"] / g
+    df["RushAtt_pg"] = df["Att"] / g
+    df["RushTD_pg"]  = df["TD"]  / g
+    for col in ["RushYds_pg","RushAtt_pg","RushTD_pg"]:
+        df[col] = df[col].fillna(0.0)
+    keep = ["Player","Team","G","Att","Yds","TD","RushYds_pg","RushAtt_pg","RushTD_pg"]
+    keep = [c for c in keep if c in df.columns]
+    return df[keep].sort_values("RushYds_pg", ascending=False, na_position="last").reset_index(drop=True)
+
+@st.cache_data(show_spinner=False)
+def load_wr_from_csv() -> pd.DataFrame:
+    df = _try_read_csv([
+        "nfl_2025_receiving.csv",
+        "data/nfl_2025_receiving.csv",
+        "datasets/nfl_2025_receiving.csv",
+    ])
+    if df is None:
+        return pd.DataFrame()
+    df = _clean_numeric_cols(df)
+    for col in ["Player","Team","G","Tgt","Rec","Yds","TD"]:
+        if col not in df.columns:
+            df[col] = np.nan
+    g = df["G"].replace(0, np.nan)
+    df["RecYds_pg"] = df["Yds"] / g
+    df["Receptions_pg"] = df["Rec"] / g
+    df["RecTD_pg"]  = df["TD"]  / g
+    for col in ["RecYds_pg","Receptions_pg","RecTD_pg"]:
+        df[col] = df[col].fillna(0.0)
+    keep = ["Player","Team","G","Tgt","Rec","Yds","TD","RecYds_pg","Receptions_pg","RecTD_pg"]
+    keep = [c for c in keep if c in df.columns]
+    return df[keep].sort_values("RecYds_pg", ascending=False, na_position="last").reset_index(drop=True)
 
 # ================================ UI ==========================================
 st.set_page_config(page_title="NFL + MLB Predictor — 2025 (stats only)", layout="wide")
@@ -320,12 +320,12 @@ st.title("🏈⚾ NFL + MLB Predictor — 2025 (stats only)")
 st.caption(
     "Matchup win % from **team scoring rates** (NFL: PF/PA; MLB: RS/RA), "
     "MLB optionally nudged by **probable starters + ERA**. "
-    "Player props (QB) use quick sims from Stathead 2025 per-game rates."
+    "Player props use **your CSVs** (QB/RB/WR-TE) from Stathead."
 )
 
 page = st.sidebar.radio(
     "Choose a page",
-    ["NFL (2025)", "MLB (2025)", "NFL Player Props (QB, 2025 Stathead)"],
+    ["NFL (2025)", "MLB (2025)", "NFL Player Props (from CSV)"],
     index=0
 )
 
@@ -405,82 +405,168 @@ elif page == "MLB (2025)":
     except Exception as e:
         st.error(str(e))
 
-# --------------------- NFL Player Props (QB, Stathead 2025) -------------------
+# --------------------- NFL Player Props (from CSV) ----------------------------
 else:
-    st.subheader("🎯 NFL Player Props (QB) — 2025 Stathead quick sim")
+    st.subheader("🎯 NFL Player Props — 2025 (from your CSV files)")
 
-    with st.expander("Stathead access (optional)"):
-        st.write("If your tiny links require login, paste your browser **Cookie** below (from DevTools → Network).")
-        cookie = st.text_input("Cookie (optional)", type="password", value="")
+    # Load existing CSVs from repo (if present)
+    qb_df = load_qb_from_csv()
+    rb_df = load_rb_from_csv()
+    wr_df = load_wr_from_csv()
 
-    # Load QB table(s)
-    qbs = load_qb_stathead_2025(STATHEAD_QB_URLS, cookie=cookie)
-    if qbs.empty:
-        st.error("Couldn't load QB tables from Stathead. Open the tiny links in your browser to verify access.")
-        st.stop()
+    # If any missing, allow uploading right here
+    if qb_df.empty or rb_df.empty or wr_df.empty:
+        st.info("If a table below is empty, upload the CSV now (you can export from Stathead on your phone).")
 
-    st.markdown("**2025 QB per-game rates (from your Stathead tables)**")
-    st.dataframe(
-        qbs[["Player","Team","G","Yds_pg","TD_pg","Int_pg","Cmp_pg","Att_pg","Yds","TD","Int","Cmp","Att"]]
-        .rename(columns={"Yds_pg":"Yds/G","TD_pg":"TD/G","Int_pg":"INT/G","Cmp_pg":"Cmp/G","Att_pg":"Att/G"})
-        .round(2),
-        use_container_width=True, height=380
-    )
+    ucol1, ucol2, ucol3 = st.columns(3)
+    with ucol1:
+        qb_up = st.file_uploader("Upload QB Passing CSV", type=["csv"], key="up_qb")
+        if qb_up is not None:
+            tmp = pd.read_csv(qb_up)
+            qb_df = _clean_numeric_cols(tmp)
+            st.success("QB CSV loaded.")
+    with ucol2:
+        rb_up = st.file_uploader("Upload RB Rushing CSV", type=["csv"], key="up_rb")
+        if rb_up is not None:
+            tmp = pd.read_csv(rb_up)
+            rb_df = _clean_numeric_cols(tmp)
+            st.success("RB CSV loaded.")
+    with ucol3:
+        wr_up = st.file_uploader("Upload WR/TE Receiving CSV", type=["csv"], key="up_wr")
+        if wr_up is not None:
+            tmp = pd.read_csv(wr_up)
+            wr_df = _clean_numeric_cols(tmp)
+            st.success("WR/TE CSV loaded.")
 
-    # Pick player + market
-    left, right = st.columns(2)
-    with left:
-        player = st.selectbox("Player", qbs["Player"].tolist(), index=0)
-        market = st.selectbox("Market", ["Pass Yds", "Pass TD", "Interceptions", "Completions"], index=0)
-    with right:
-        line = st.number_input("Prop line", min_value=0.0, value=250.0 if market=="Pass Yds" else 1.5, step=0.5)
+    # Show quick previews
+    with st.expander("Preview CSVs"):
+        if not qb_df.empty:
+            st.markdown("**QB Passing (first 10)**")
+            st.dataframe(qb_df.head(10), use_container_width=True)
+        else:
+            st.warning("QB CSV not loaded.")
+        if not rb_df.empty:
+            st.markdown("**RB Rushing (first 10)**")
+            # If user uploaded arbitrary columns, recompute rates:
+            if "RushYds_pg" not in rb_df.columns and {"G","Yds"}.issubset(rb_df.columns):
+                g = rb_df["G"].replace(0, np.nan)
+                rb_df["RushYds_pg"] = (rb_df["Yds"]/g).fillna(0.0)
+            if "RushAtt_pg" not in rb_df.columns and {"G","Att"}.issubset(rb_df.columns):
+                g = rb_df["G"].replace(0, np.nan)
+                rb_df["RushAtt_pg"] = (rb_df["Att"]/g).fillna(0.0)
+            st.dataframe(rb_df.head(10), use_container_width=True)
+        else:
+            st.warning("RB CSV not loaded.")
+        if not wr_df.empty:
+            st.markdown("**WR/TE Receiving (first 10)**")
+            if "RecYds_pg" not in wr_df.columns and {"G","Yds"}.issubset(wr_df.columns):
+                g = wr_df["G"].replace(0, np.nan)
+                wr_df["RecYds_pg"] = (wr_df["Yds"]/g).fillna(0.0)
+            if "Receptions_pg" not in wr_df.columns and {"G","Rec"}.issubset(wr_df.columns):
+                g = wr_df["G"].replace(0, np.nan)
+                wr_df["Receptions_pg"] = (wr_df["Rec"]/g).fillna(0.0)
+            st.dataframe(wr_df.head(10), use_container_width=True)
+        else:
+            st.warning("WR/TE CSV not loaded.")
 
-        # Uncertainty knobs (so you can tune tight/loose sims)
+    # Selector
+    cohort = st.radio("Market group", ["QB (Passing)", "RB (Rushing)", "WR/TE (Receiving)"], horizontal=True)
+
+    # Build market options + pull the right row + simulate
+    if cohort == "QB (Passing)":
+        if qb_df.empty:
+            st.error("Load a QB CSV first.")
+            st.stop()
+        player = st.selectbox("Player", qb_df["Player"].tolist(), index=0, key="qb_pick")
+        market = st.selectbox("Market", ["Pass Yds", "Pass TD", "Interceptions", "Completions"], index=0, key="qb_mkt")
+        default_line = 250.0 if market=="Pass Yds" else (1.5 if market=="Pass TD" else (0.5 if market=="Interceptions" else 22.5))
+        line = st.number_input("Prop line", min_value=0.0, value=default_line, step=0.5, key="qb_line")
         if market in ("Pass Yds","Completions"):
             default_sd = 65.0 if market=="Pass Yds" else 5.0
-            sd = st.slider("Simulation SD (controls volatility)", min_value=5.0, max_value=120.0,
-                           value=default_sd, step=1.0)
+            sd = st.slider("Simulation SD (volatility)", 5.0, 120.0, default_sd, 1.0, key="qb_sd")
         else:
-            sd = None  # not used for Poisson markets
+            sd = None
 
-    row = qbs[qbs["Player"] == player].iloc[0]
-    G = max(1.0, float(row.get("G", 1.0)))
+        row = qb_df[qb_df["Player"] == player].iloc[0]
+        G = max(1.0, float(row.get("G", 1.0)))
 
-    # Build per-game rate from table
-    if market == "Pass Yds":
-        mu = float(row.get("Yds_pg", np.nan)) if pd.notna(row.get("Yds_pg")) else float(row.get("Yds", 0.0))/G
-        p_over = prob_over_normal(mu, sd or 65.0, line, SIM_TRIALS)
-    elif market == "Completions":
-        mu = float(row.get("Cmp_pg", np.nan)) if pd.notna(row.get("Cmp_pg")) else float(row.get("Cmp", 0.0))/G
-        p_over = prob_over_normal(mu, sd or 5.0, line, SIM_TRIALS)
-    elif market == "Pass TD":
-        lam = float(row.get("TD_pg", np.nan)) if pd.notna(row.get("TD_pg")) else float(row.get("TD", 0.0))/G
-        p_over = prob_over_poisson(lam, line, SIM_TRIALS)
-    else:  # Interceptions
-        lam = float(row.get("Int_pg", np.nan)) if pd.notna(row.get("Int_pg")) else float(row.get("Int", 0.0))/G
-        p_over = prob_over_poisson(lam, line, SIM_TRIALS)
+        if market == "Pass Yds":
+            mu = float(row.get("Yds_pg", np.nan)) if pd.notna(row.get("Yds_pg")) else float(row.get("Yds", 0.0))/G
+            p_over = prob_over_normal(mu, sd or 65.0, line, SIM_TRIALS)
+        elif market == "Completions":
+            mu = float(row.get("Cmp_pg", np.nan)) if pd.notna(row.get("Cmp_pg")) else float(row.get("Cmp", 0.0))/G
+            p_over = prob_over_normal(mu, sd or 5.0, line, SIM_TRIALS)
+        elif market == "Pass TD":
+            lam = float(row.get("TD_pg", np.nan)) if pd.notna(row.get("TD_pg")) else float(row.get("TD", 0.0))/G
+            p_over = prob_over_poisson(lam, line, SIM_TRIALS)
+        else:  # Interceptions
+            lam = float(row.get("Int_pg", np.nan)) if pd.notna(row.get("Int_pg")) else float(row.get("Int", 0.0))/G
+            p_over = prob_over_poisson(lam, line, SIM_TRIALS)
 
+    elif cohort == "RB (Rushing)":
+        if rb_df.empty:
+            st.error("Load an RB Rushing CSV first.")
+            st.stop()
+        player = st.selectbox("Player", rb_df["Player"].tolist(), index=0, key="rb_pick")
+        market = st.selectbox("Market", ["Rush Yds", "Rush Attempts", "Rush TD"], index=0, key="rb_mkt")
+        default_line = 60.5 if market=="Rush Yds" else (14.5 if market=="Rush Attempts" else 0.5)
+        line = st.number_input("Prop line", min_value=0.0, value=default_line, step=0.5, key="rb_line")
+        if market in ("Rush Yds", "Rush Attempts"):
+            default_sd = 25.0 if market=="Rush Yds" else 5.0
+            sd = st.slider("Simulation SD (volatility)", 3.0, 60.0, default_sd, 1.0, key="rb_sd")
+        else:
+            sd = None
+
+        row = rb_df[rb_df["Player"] == player].iloc[0]
+        G = max(1.0, float(row.get("G", 1.0)))
+
+        if market == "Rush Yds":
+            mu = float(row.get("RushYds_pg", np.nan)) if pd.notna(row.get("RushYds_pg")) else float(row.get("Yds", 0.0))/G
+            p_over = prob_over_normal(mu, sd or 25.0, line, SIM_TRIALS)
+        elif market == "Rush Attempts":
+            mu = float(row.get("RushAtt_pg", np.nan)) if pd.notna(row.get("RushAtt_pg")) else float(row.get("Att", 0.0))/G
+            p_over = prob_over_normal(mu, sd or 5.0, line, SIM_TRIALS)
+        else:  # Rush TD
+            lam = float(row.get("RushTD_pg", np.nan)) if pd.notna(row.get("RushTD_pg")) else float(row.get("TD", 0.0))/G
+            p_over = prob_over_poisson(lam, line, SIM_TRIALS)
+
+    else:  # WR/TE (Receiving)
+        if wr_df.empty:
+            st.error("Load a WR/TE Receiving CSV first.")
+            st.stop()
+        player = st.selectbox("Player", wr_df["Player"].tolist(), index=0, key="wr_pick")
+        market = st.selectbox("Market", ["Rec Yds", "Receptions", "Rec TD"], index=0, key="wr_mkt")
+        default_line = 60.5 if market=="Rec Yds" else (4.5 if market=="Receptions" else 0.5)
+        line = st.number_input("Prop line", min_value=0.0, value=default_line, step=0.5, key="wr_line")
+        if market in ("Rec Yds", "Receptions"):
+            default_sd = 30.0 if market=="Rec Yds" else 2.5
+            sd = st.slider("Simulation SD (volatility)", 2.0, 80.0, default_sd, 0.5, key="wr_sd")
+        else:
+            sd = None
+
+        row = wr_df[wr_df["Player"] == player].iloc[0]
+        G = max(1.0, float(row.get("G", 1.0)))
+
+        if market == "Rec Yds":
+            mu = float(row.get("RecYds_pg", np.nan)) if pd.notna(row.get("RecYds_pg")) else float(row.get("Yds", 0.0))/G
+            p_over = prob_over_normal(mu, sd or 30.0, line, SIM_TRIALS)
+        elif market == "Receptions":
+            mu = float(row.get("Receptions_pg", np.nan)) if pd.notna(row.get("Receptions_pg")) else float(row.get("Rec", 0.0))/G
+            p_over = prob_over_normal(mu, sd or 2.5, line, SIM_TRIALS)
+        else:  # Rec TD
+            lam = float(row.get("RecTD_pg", np.nan)) if pd.notna(row.get("RecTD_pg")) else float(row.get("TD", 0.0))/G
+            p_over = prob_over_poisson(lam, line, SIM_TRIALS)
+
+    # Results
     p_under = 1.0 - p_over
-    def fair_ml(p):
-        if p <= 0: return "∞"
-        if p >= 1: return "-∞"
-        dec = 1.0/p
-        if dec >= 2:  # ≥ +100
-            return f"+{int(round((dec-1)*100))}"
-        else:
-            return f"{int(round(-100/(dec-1)))}"
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Over %", f"{p_over*100:.1f}%")
-    with col2:
-        st.metric("Under %", f"{p_under*100:.1f}%")
-    with col3:
-        st.metric("Fair ML (Over)", fair_ml(p_over))
+    c1, c2, c3 = st.columns(3)
+    with c1: st.metric("Over %", f"{p_over*100:.1f}%")
+    with c2: st.metric("Under %", f"{p_under*100:.1f}%")
+    with c3: st.metric("Fair ML (Over)", fair_ml(p_over))
 
     st.caption(
-        "Method: simple quick-sim.\n"
-        "• **Yards / Completions** → Normal(mean=per-game rate, sd slider), truncated at 0.\n"
-        "• **TD / INT** → Poisson(lambda = per-game rate).\n"
-        "This is intentionally lightweight; you can tighten/loosen variance with the SD slider."
+        "Method: quick sims on your per-game rates from CSV.\n"
+        "• Yards / Receptions / Attempts → Normal(mean=per-game, sd slider), truncated at 0.\n"
+        "• TD / INT → Poisson(lambda = per-game).\n"
+        "Tune variance with the SD sliders to taste."
     )
