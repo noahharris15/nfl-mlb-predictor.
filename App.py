@@ -1,4 +1,4 @@
-# app.py — NFL + MLB predictor (2025 only) + matchup-aware Player Props
+# app.py — NFL + MLB predictor (2025 only) + matchup-aware Player Props (CSV-only)
 # Run: streamlit run app.py
 
 import io
@@ -23,12 +23,6 @@ except Exception:
 SIM_TRIALS = 10_000
 HOME_EDGE_NFL = 0.6   # ~0.6 pts to home mean
 EPS = 1e-9
-
-# Your Stathead tiny URLs (QB passing 2025)
-STATHEAD_QB_URLS = [
-    "https://stathead.com/tiny/t1A4t",
-    "https://stathead.com/tiny/0gq7J",
-]
 
 # Hard-coded BR team IDs (stable)
 MLB_TEAMS_2025 = {
@@ -218,7 +212,7 @@ def mlb_matchup_mu(rates: pd.DataFrame, home: str, away: str,
         mu_home = max(EPS, mu_home - scale * (LgERA - a_pit_era))
     return mu_home, mu_away
 
-# ============================ Stathead helpers ================================
+# ============================ CSV helpers =====================================
 def clean_headers(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [
@@ -236,64 +230,17 @@ def coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = pd.to_numeric(s, errors="ignore")
     return df
 
-def biggest_table_from_html(html: str) -> pd.DataFrame:
-    tables = pd.read_html(io.StringIO(html))
-    if not tables:
-        raise RuntimeError("No tables found.")
-    return max(tables, key=lambda t: t.shape[0] * t.shape[1])
-
-def fetch_stathead_table(url: str, cookie: str = "") -> pd.DataFrame:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    if cookie:
-        import requests
-        r = requests.get(url, headers={"User-Agent": headers["User-Agent"], "Cookie": cookie}, timeout=30)
-        r.raise_for_status()
-        df = biggest_table_from_html(r.text)
-    else:
-        tables = pd.read_html(url)
-        df = max(tables, key=lambda t: t.shape[0] * t.shape[1])
-    df = clean_headers(df)
-    if "Rk" in df.columns:
-        df = df[df["Rk"].astype(str).str.fullmatch(r"\d+")]
-    df = df.dropna(how="all")
-    df = coerce_numeric(df).reset_index(drop=True)
-    return df
-
-@st.cache_data(show_spinner=False)
-def load_qb_stathead_2025(urls: list[str], cookie: str = "") -> pd.DataFrame:
-    # Merge all provided tables on "Player" (outer) and keep key columns
-    dfs = []
-    for u in urls:
-        try:
-            dfs.append(fetch_stathead_table(u, cookie=cookie))
-        except Exception:
-            pass
-    if not dfs:
+def read_user_csv(upload) -> pd.DataFrame:
+    if not upload:
         return pd.DataFrame()
-    df = dfs[0]
-    for d in dfs[1:]:
-        df = df.merge(d, on="Player", how="outer", suffixes=("", "_dup"))
-        dup_cols = [c for c in df.columns if c.endswith("_dup")]
-        df = df.drop(columns=dup_cols, errors="ignore")
-
-    for col in ["G","Cmp","Att","Yds","TD","Int","Team"]:
-        if col not in df.columns:
-            df[col] = np.nan
-
-    g = df["G"].replace(0, np.nan)
-    df["Yds_pg"] = df["Yds"] / g
-    df["Cmp_pg"] = df["Cmp"] / g
-    df["Att_pg"] = df["Att"] / g
-    df["TD_pg"]  = df["TD"]  / g
-    df["Int_pg"] = df["Int"] / g
-
-    for col in ["Yds_pg","Cmp_pg","Att_pg","TD_pg","Int_pg"]:
-        df[col] = df[col].fillna(0.0)
-
-    keep = ["Player","Team","G","Cmp","Att","Yds","TD","Int","Yds_pg","Cmp_pg","Att_pg","TD_pg","Int_pg"]
-    keep = [c for c in keep if c in df.columns]
-    df = df[keep].sort_values("Yds_pg", ascending=False, na_position="last").reset_index(drop=True)
-    return df
+    try:
+        df = pd.read_csv(upload)
+        df = clean_headers(df)
+        df = coerce_numeric(df)
+        return df
+    except Exception as e:
+        st.warning(f"Could not read CSV: {e}")
+        return pd.DataFrame()
 
 # ================================ UI ==========================================
 st.set_page_config(page_title="NFL + MLB Predictor — 2025 (stats only)", layout="wide")
@@ -301,12 +248,12 @@ st.title("🏈⚾ NFL + MLB Predictor — 2025 (stats only)")
 st.caption(
     "Matchup win % from **team scoring rates** (NFL: PF/PA; MLB: RS/RA), "
     "MLB optionally nudged by **probable starters + ERA**. "
-    "Player props use quick sims with **matchup adjustments**."
+    "Player props use **your CSVs** with matchup adjustments."
 )
 
 page = st.sidebar.radio(
     "Choose a page",
-    ["NFL (2025)", "MLB (2025)", "NFL Player Props (matchup-aware)"],
+    ["NFL (2025)", "MLB (2025)", "NFL Player Props (CSV-only, matchup-aware)"],
     index=0
 )
 
@@ -386,74 +333,96 @@ elif page == "MLB (2025)":
     except Exception as e:
         st.error(str(e))
 
-# --------------------- NFL Player Props (matchup-aware) -----------------------
+# --------------------- NFL Player Props (CSV-only, matchup-aware) -------------
 else:
-    st.subheader("🎯 NFL Player Props — 2025 matchup-aware quick sim")
+    st.subheader("🎯 NFL Player Props — CSV-only (QB/RB/WR) with matchup adjustments")
 
-    with st.expander("Stathead access (optional)"):
-        st.write("If your tiny links require login, paste your browser **Cookie** below (from DevTools → Network).")
-        cookie = st.text_input("Cookie (optional)", type="password", value="")
+    st.markdown("**Upload your player CSVs** (any headers; we autodetect common ones)")
+    up_qb = st.file_uploader("QB CSV", type=["csv"], key="qbcsv")
+    up_rb = st.file_uploader("RB CSV (optional)", type=["csv"], key="rbcsv")
+    up_wr = st.file_uploader("WR/TE CSV (optional)", type=["csv"], key="wrcsv")
 
-    # ---- player tables (your Stathead tiny URLs for QB; CSV upload for RB/WR) --
-    qbs = load_qb_stathead_2025(STATHEAD_QB_URLS, cookie=cookie)
-    st.markdown("**Load optional RB / WR per-game CSVs** (any columns you have; we'll discover usable ones)")
-    up_rb = st.file_uploader("RB stats CSV (optional)", type=["csv"], key="rbcsv")
-    up_wr = st.file_uploader("WR/TE stats CSV (optional)", type=["csv"], key="wrcsv")
+    def std_pg(df: pd.DataFrame, pos_hint: str) -> pd.DataFrame:
+        """Compute per-game fields if totals present; keep original if already per-game."""
+        if df.empty: return df
+        df = df.copy()
+        for base in ["G","Cmp","Att","Yds","TD","Int","Tgt","Rec","Rush Att","Rush Yds","Rec Yds"]:
+            if base not in df.columns:
+                # try common aliases
+                alias = {
+                    "Rush Att": ["Att"], "Rush Yds": ["Yds"], "Rec Yds": ["Yds"]
+                }.get(base, [])
+                for a in alias:
+                    if a in df.columns and base not in df.columns:
+                        df[base] = df[a]
+        G = df["G"] if "G" in df.columns else np.nan
 
-    def _read_csv(upload):
-        if not upload: return pd.DataFrame()
-        try:
-            df = pd.read_csv(upload)
-            df = clean_headers(df)
-            df = coerce_numeric(df)
-            return df
-        except Exception as e:
-            st.warning(f"Could not read CSV: {e}")
-            return pd.DataFrame()
+        def mk_pg(total, pg_name):
+            if total in df.columns and "G" in df.columns:
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    df[pg_name] = df[total] / df["G"].replace(0, np.nan)
+            return
 
-    rbs = _read_csv(up_rb)
-    wrs = _read_csv(up_wr)
+        # QB
+        if pos_hint == "QB":
+            if "Yds_pg" not in df.columns and "Yds" in df.columns: mk_pg("Yds","Yds_pg")
+            if "Cmp_pg" not in df.columns and "Cmp" in df.columns: mk_pg("Cmp","Cmp_pg")
+            if "Att_pg" not in df.columns and "Att" in df.columns: mk_pg("Att","Att_pg")
+            if "TD_pg"  not in df.columns and "TD"  in df.columns: mk_pg("TD","TD_pg")
+            if "Int_pg" not in df.columns and "Int" in df.columns: mk_pg("Int","Int_pg")
+        # RB
+        if pos_hint == "RB":
+            if "RushYds_pg" not in df.columns and "Rush Yds" in df.columns: mk_pg("Rush Yds","RushYds_pg")
+            if "RushAtt_pg" not in df.columns and "Rush Att" in df.columns: mk_pg("Rush Att","RushAtt_pg")
+            # sometimes RB receiving included
+            if "Rec_pg" not in df.columns and "Rec" in df.columns: mk_pg("Rec","Rec_pg")
+            if "RecYds_pg" not in df.columns and "Rec Yds" in df.columns: mk_pg("Rec Yds","RecYds_pg")
+        # WR/TE
+        if pos_hint == "WR":
+            if "Rec_pg" not in df.columns and "Rec" in df.columns: mk_pg("Rec","Rec_pg")
+            if "RecYds_pg" not in df.columns and "Rec Yds" in df.columns: mk_pg("Rec Yds","RecYds_pg")
+            if "Tgt_pg" not in df.columns and "Tgt" in df.columns: mk_pg("Tgt","Tgt_pg")
 
-    # Standardize key columns if present
-    for df in (qbs, rbs, wrs):
-        if not df.empty:
-            for col in ["Player","Team","G"]:
-                if col not in df.columns:
-                    df[col] = df.get(col, np.nan)
+        # fill per-game NaNs with 0 for display
+        for c in [c for c in df.columns if c.endswith("_pg")]:
+            df[c] = df[c].fillna(0.0)
+        return df
 
-    pools = []
-    if not qbs.empty: pools.append(qbs.assign(Pos="QB"))
-    if not rbs.empty: pools.append(rbs.assign(Pos="RB"))
-    if not wrs.empty: pools.append(wrs.assign(Pos="WR/TE"))
-    if pools:
-        players_all = pd.concat(pools, ignore_index=True)
-    else:
-        st.error("No player data. Load Stathead QB (auto) or upload RB/WR CSVs.")
+    qbs = std_pg(read_user_csv(up_qb), "QB")
+    rbs = std_pg(read_user_csv(up_rb), "RB")
+    wrs = std_pg(read_user_csv(up_wr), "WR")
+
+    # Must have at least one table
+    if qbs.empty and rbs.empty and wrs.empty:
+        st.info("Upload at least one CSV (QB/RB/WR).")
         st.stop()
 
-    # ---- Defense CSV (optional, enables opponent adjustment) -------------------
+    # Optional Defense CSV for matchup scaling
     st.markdown("**(Optional) Defense allowed per-game CSV**")
-    st.caption("Headers like: team, pass_yds_allowed_pg, rush_yds_allowed_pg, rec_yds_allowed_pg, receptions_allowed_pg, pass_td_allowed_pg, int_made_pg")
+    st.caption("Include columns like: team, pass_yds_allowed_pg, pass_td_allowed_pg, int_made_pg, rush_yds_allowed_pg, rec_yds_allowed_pg, receptions_allowed_pg …")
     defcsv = st.file_uploader("Defense allowed CSV", type=["csv"], key="defcsv")
-    defense = _read_csv(defcsv)
+    defense = read_user_csv(defcsv)
     if not defense.empty and "team" in defense.columns:
         defense["team_key"] = defense["team"].str.lower().str.strip()
         def_league_means = {c: defense[c].mean() for c in defense.columns if c.endswith("_allowed_pg") or c.endswith("_made_pg")}
     else:
         def_league_means = {}
-        if defcsv: st.warning("Defense CSV loaded but missing 'team' column; no adjustment will be applied.")
+        if defcsv: st.warning("Defense CSV loaded but missing 'team' column; no defense adjustment will be applied.")
 
-    # ---- upcoming schedule for opponent selection (reuses NFL page data) ------
+    # Upcoming schedule for opponent selection
     try:
         nfl_rates, upcoming = nfl_team_rates_2025()
     except Exception:
         nfl_rates, upcoming = pd.DataFrame(), pd.DataFrame()
+    all_teams = sorted(set(upcoming.get("home_team", pd.Series(dtype=str))).union(set(upcoming.get("away_team", pd.Series(dtype=str))))) if not upcoming.empty else []
 
-    def _team_of(player_row):
-        t = str(player_row.get("Team", "")).strip()
-        return t if t else None
+    # Combine for selection
+    pools = []
+    if not qbs.empty: pools.append(qbs.assign(Pos="QB"))
+    if not rbs.empty: pools.append(rbs.assign(Pos="RB"))
+    if not wrs.empty: pools.append(wrs.assign(Pos="WR/TE"))
+    players_all = pd.concat(pools, ignore_index=True)
 
-    # UI: choose player and opponent
     st.markdown("### Pick player + matchup")
     c1, c2 = st.columns([1,1])
     with c1:
@@ -461,9 +430,9 @@ else:
         market = st.selectbox(
             "Market",
             [
-                "Pass Yds", "Completions", "Pass TD", "Interceptions",
-                "Rush Yds", "Rush Att",
-                "Rec Yds", "Receptions",
+                "Pass Yds", "Completions", "Pass TD", "Interceptions",  # QB
+                "Rush Yds", "Rush Att",                                 # RB/QB
+                "Rec Yds", "Receptions",                                # WR/RB/TE
             ],
             index=0
         )
@@ -476,17 +445,14 @@ else:
         line = st.number_input("Prop line", min_value=0.0, value=float(defaults.get(market, 1.5)), step=0.5)
 
     prow = players_all.loc[players_all["Player"] == player].iloc[0]
-    player_team = _team_of(prow) or st.text_input("Player team (if missing)", "")
-
-    all_teams = sorted(set(upcoming.get("home_team", pd.Series(dtype=str))).union(set(upcoming.get("away_team", pd.Series(dtype=str))))) if not upcoming.empty else []
+    player_team = str(prow.get("Team", "") or "")
     opp = st.selectbox("Opponent team", all_teams if all_teams else [""], index=0 if all_teams else None, placeholder="Type opponent…")
 
-    # Strength knobs
+    # Strength knobs — “regular” SD defaults
     st.markdown("### Matchup strength (how much to weigh the opponent and team context)")
     w_def = st.slider("Defense weight (0=no effect, 1=full scale)", 0.0, 1.0, 0.6, 0.05)
     use_team_off = st.checkbox("Nudge by offense scoring strength (team PF vs league avg)", value=True)
 
-    # SD defaults per market (“regular”)
     sd_defaults = {
         "Pass Yds": 60.0, "Completions": 6.0,
         "Pass TD": None, "Interceptions": None,
@@ -498,102 +464,5 @@ else:
     if market in ("Pass Yds","Completions","Rush Yds","Rush Att","Rec Yds","Receptions"):
         sd = st.slider("Simulation SD (volatility)", 2.0, 120.0, float(sd_base), 1.0)
 
-    # Build neutral per-game rate from the row (works for QB/RB/WR if columns exist)
-    G = float(prow.get("G", np.nan)) if pd.notna(prow.get("G", np.nan)) else np.nan
-    if pd.isna(G) or G <= 0: G = 1.0
-
-    def get_pg(row, total_names, per_game_names):
-        for nm in per_game_names:
-            if nm in row.index and pd.notna(row[nm]): return float(row[nm])
-        for nm in total_names:
-            if nm in row.index and pd.notna(row[nm]): return float(row[nm]) / G
-        return 0.0
-
-    mu_map = {
-        "Pass Yds": get_pg(prow, ["Yds","Pass Yds","PassYds"], ["Yds_pg","PassYds_pg"]),
-        "Completions": get_pg(prow, ["Cmp","Completions"], ["Cmp_pg","Comp_pg"]),
-        "Pass TD": get_pg(prow, ["TD","Pass TD"], ["TD_pg","PassTD_pg"]),
-        "Interceptions": get_pg(prow, ["Int","INT"], ["Int_pg","INT_pg"]),
-        "Rush Yds": get_pg(prow, ["Rush Yds","Yds"], ["RushYds_pg","Rush Yds_pg","Yds_pg"]),
-        "Rush Att": get_pg(prow, ["Att","Rush Att"], ["Att_pg","RushAtt_pg"]),
-        "Rec Yds": get_pg(prow, ["Rec Yds","Yds"], ["RecYds_pg","Rec Yds_pg","Yds_pg"]),
-        "Receptions": get_pg(prow, ["Rec","Receptions"], ["Rec_pg","Receptions_pg"]),
-    }
-    mu_neutral = float(mu_map.get(market, 0.0))
-
-    # ---- Defense scaling -------------------------------------------------------
-    def defense_scale(market, opp_team):
-        if defense.empty or not opp_team: return 1.0
-        key = opp_team.lower().strip()
-        row = defense.loc[defense["team_key"] == key]
-        if row.empty: return 1.0
-
-        colmap = {
-            "Pass Yds": ["pass_yds_allowed_pg","passing_yards_allowed_pg","pass_yds_pg"],
-            "Completions": ["completions_allowed_pg","pass_comp_allowed_pg"],
-            "Pass TD": ["pass_td_allowed_pg","passing_td_allowed_pg"],
-            "Interceptions": ["int_made_pg","interceptions_made_pg"],
-            "Rush Yds": ["rush_yds_allowed_pg","rushing_yards_allowed_pg","rush_yds_pg"],
-            "Rush Att": ["rush_att_allowed_pg","rushing_att_allowed_pg"],
-            "Rec Yds": ["rec_yds_allowed_pg","receiving_yards_allowed_pg"],
-            "Receptions": ["receptions_allowed_pg","rec_allowed_pg"],
-        }
-        cols = colmap.get(market, [])
-        val = None
-        for c in cols:
-            if c in row.columns and pd.notna(row.iloc[0][c]):
-                val = float(row.iloc[0][c]); break
-        if val is None: return 1.0
-
-        lg = None
-        for c in cols:
-            if c in def_league_means and pd.notna(def_league_means[c]):
-                lg = float(def_league_means[c]); break
-        if not lg or lg <= 0: return 1.0
-        return (val / lg)
-
-    scale_def = defense_scale(market, opp)
-
-    # ---- Offense scaling (team scoring strength from NFL rates) ---------------
-    scale_off = 1.0
-    if use_team_off and 'nfl_rates' in locals() and isinstance(nfl_rates, pd.DataFrame) and not nfl_rates.empty and player_team:
-        lr = nfl_rates["PF_pg"].mean() if "PF_pg" in nfl_rates.columns else None
-        rowt = nfl_rates.loc[nfl_rates["team"].str.lower() == str(player_team).lower()]
-        if lr and not rowt.empty:
-            pf = float(rowt.iloc[0]["PF_pg"])
-            scale_off = pf / lr if lr > 0 else 1.0
-
-    # combine (defense heavier)
-    w_off = 0.4 if use_team_off else 0.0
-    mu_adj = mu_neutral * ((scale_def ** w_def) * (scale_off ** w_off))
-
-    # ---- Simulate --------------------------------------------------------------
-    if market in ("Pass Yds","Completions","Rush Yds","Rush Att","Rec Yds","Receptions"):
-        p_over = prob_over_normal(mu_adj, sd or 10.0, line, SIM_TRIALS)
-    elif market in ("Pass TD","Interceptions"):
-        p_over = prob_over_poisson(max(mu_adj, 1e-6), line, SIM_TRIALS)
-    else:
-        p_over = 0.5
-    p_under = 1.0 - p_over
-
-    def fair_ml(p):
-        if p <= 0: return "∞"
-        if p >= 1: return "-∞"
-        dec = 1.0/p
-        if dec >= 2:  # ≥ +100
-            return f"+{int(round((dec-1)*100))}"
-        else:
-            return f"{int(round(-100/(dec-1)))}"
-
-    cA, cB, cC = st.columns(3)
-    with cA: st.metric("Over %", f"{p_over*100:.1f}%")
-    with cB: st.metric("Under %", f"{p_under*100:.1f}%")
-    with cC: st.metric("Fair ML (Over)", fair_ml(p_over))
-
-    with st.expander("Numbers used"):
-        st.write(
-            f"**Neutral mean**: {mu_neutral:.2f}  \n"
-            f"**Defense scale**: ×{scale_def:.3f} (weight={w_def})  \n"
-            f"**Offense scale**: ×{scale_off:.3f} (enabled={use_team_off})  \n"
-            f"**Adjusted mean**: **{mu_adj:.2f}**"
-        )
+    # ---- Build neutral per-game from row (handles different CSV schemas) ------
+    G = float(prow.get("G
