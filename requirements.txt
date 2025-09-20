@@ -4,3 +4,5 @@ numpy
 nfl_data_py
 pybaseball
 MLB-StatsAPI
+openpyx1
+xlsxwriter
