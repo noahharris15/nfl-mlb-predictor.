@@ -1,7 +1,8 @@
-# app.py — NFL + MLB predictor (2025 only, stats-only) with MLB probable-pitcher ERA
-# + SIMPLE NFL PLAYER PROPS (auto defense strength, no sliders)
+# app.py — NFL + MLB predictor (2025 only, stats-only)
+# Adds Player Props page that ingests your QB/RB/WR CSVs plus a Defense CSV
+# and auto-adjusts projections by opponent defense (EPA/pass or EPA/rush).
+# No team dropdown on props page; optional Opponent text box only.
 
-import io
 import math
 import numpy as np
 import pandas as pd
@@ -15,15 +16,20 @@ import nfl_data_py as nfl
 # ---- MLB (pybaseball + statsapi) ---------------------------------------------
 from pybaseball import schedule_and_record
 try:
-    import statsapi  # for probables + pitcher stats (ERA)
+    import statsapi  # probables + pitcher stats (ERA)
     HAS_STATSAPI = True
 except Exception:
     HAS_STATSAPI = False
 
 # ----------------------------- constants --------------------------------------
 SIM_TRIALS = 10000
-HOME_EDGE_NFL = 0.6   # ~0.6 pts to the home offense mean (small HFA)
+HOME_EDGE_NFL = 0.6   # small HFA in points
 EPS = 1e-9
+
+# Default per-prop simulation SDs (kept basic per your request)
+SD_QB_PASS_YDS = 65.0
+SD_RB_RUSH_YDS = 25.0
+SD_WR_REC_YDS  = 35.0
 
 # Stable Baseball-Reference team IDs for 2025 (BR codes)
 MLB_TEAMS_2025: Dict[str, str] = {
@@ -39,7 +45,7 @@ MLB_TEAMS_2025: Dict[str, str] = {
     "TEX": "Texas Rangers","TOR": "Toronto Blue Jays","WSN": "Washington Nationals",
 }
 
-# -------------------------- generic: Poisson sim ------------------------------
+# -------------------------- generic -------------------------------------------
 def simulate_poisson_game(mu_home: float, mu_away: float, trials: int = SIM_TRIALS):
     mu_home = max(0.1, float(mu_home))
     mu_away = max(0.1, float(mu_away))
@@ -53,7 +59,7 @@ def simulate_poisson_game(mu_home: float, mu_away: float, trials: int = SIM_TRIA
     return p_home, 1.0 - p_home, float(h.mean()), float(a.mean()), float((h + a).mean())
 
 # ==============================================================================
-# NFL (2025) — team PF/PA + upcoming matchups
+# NFL (2025) — team PF/PA + upcoming matchups (unchanged)
 # ==============================================================================
 @st.cache_data(show_spinner=False)
 def nfl_team_rates_2025():
@@ -127,7 +133,7 @@ def nfl_matchup_mu(rates: pd.DataFrame, home: str, away: str) -> Tuple[float,flo
     return mu_home, mu_away
 
 # ==============================================================================
-# MLB (2025) — team RS/RA from BR + probable pitchers with ERA (statsapi)
+# MLB (2025) — team RS/RA + probables ERA (unchanged behavior)
 # ==============================================================================
 @st.cache_data(show_spinner=False)
 def mlb_team_rates_2025() -> pd.DataFrame:
@@ -139,17 +145,15 @@ def mlb_team_rates_2025() -> pd.DataFrame:
             sar = sar[pd.to_numeric(sar.get("RA"), errors="coerce").notna()]
             if sar.empty:
                 RS_pg = RA_pg = 4.5
-                games = 0
             else:
                 sar["R"] = sar["R"].astype(float)
                 sar["RA"] = sar["RA"].astype(float)
                 games = int(len(sar))
-                RS_pg = float(sar["R"].sum() / games)
-                RA_pg = float(sar["RA"].sum() / games)
-            rows.append({"team": name, "RS_pg": RS_pg, "RA_pg": RA_pg, "games": games})
+                RS_pg = float(sar["R"].sum() / games) if games else 4.5
+                RA_pg = float(sar["RA"].sum() / games) if games else 4.5
+            rows.append({"team": name, "RS_pg": RS_pg, "RA_pg": RA_pg})
         except Exception:
-            rows.append({"team": name, "RS_pg": 4.5, "RA_pg": 4.5, "games": 0})
-
+            rows.append({"team": name, "RS_pg": 4.5, "RA_pg": 4.5})
     df = pd.DataFrame(rows).drop_duplicates(subset=["team"]).reset_index(drop=True)
     if not df.empty:
         league_rs = float(df["RS_pg"].mean())
@@ -232,6 +236,16 @@ def _today_probables() -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=cols)
     return df.drop_duplicates(subset=["side","team"]).reset_index(drop=True)
 
+def mlb_matchup_mu(rates: pd.DataFrame, home: str, away: str) -> Tuple[float,float]:
+    rH = rates.loc[rates["team"].str.lower() == home.lower()]
+    rA = rates.loc[rates["team"].str.lower() == away.lower()]
+    if rH.empty or rA.empty:
+        raise ValueError(f"Unknown MLB team(s): {home}, {away}")
+    H, A = rH.iloc[0], rA.iloc[0]
+    mu_home = max(EPS, (H["RS_pg"] + A["RA_pg"]) / 2.0)
+    mu_away = max(EPS, (A["RS_pg"] + H["RA_pg"]) / 2.0)
+    return mu_home, mu_away
+
 def _apply_pitcher_adjustment(mu_home: float, mu_away: float,
                               home_era: Optional[float], away_era: Optional[float],
                               league_era: float = 4.30) -> Tuple[float,float]:
@@ -243,110 +257,106 @@ def _apply_pitcher_adjustment(mu_home: float, mu_away: float,
         return max(EPS, mu * factor)
     return adj(mu_home, home_era), adj(mu_away, away_era)
 
-def mlb_matchup_mu(rates: pd.DataFrame, home: str, away: str) -> Tuple[float,float]:
-    rH = rates.loc[rates["team"].str.lower() == home.lower()]
-    rA = rates.loc[rates["team"].str.lower() == away.lower()]
-    if rH.empty or rA.empty:
-        raise ValueError(f"Unknown MLB team(s): {home}, {away}")
-    H, A = rH.iloc[0], rA.iloc[0]
-    mu_home = max(EPS, (H["RS_pg"] + A["RA_pg"]) / 2.0)
-    mu_away = max(EPS, (A["RS_pg"] + H["RA_pg"]) / 2.0)
-    return mu_home, mu_away
-
 # ==============================================================================
-# Helpers for the Props page
+# Player Props — CSVs + Defense EPA adjustment (NEW)
 # ==============================================================================
-def _clean_pasted_csv(text: str) -> str:
-    if not text:
-        return text
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-
-    # drop banner line like "Receiving,Receiving,...,-additional"
-    if lines:
-        toks = [t.strip() for t in lines[0].split(",") if t.strip()]
-        if len(set(toks)) == 1 or (len(toks) > 2 and toks[-1].lower() == "-additional"):
-            lines = lines[1:]
-
-    # drop last sentinel column (e.g., "-9999")
-    if lines:
-        hdr = [t.strip() for t in lines[0].split(",")]
-        if hdr and (hdr[-1].startswith("-") or hdr[-1].isdigit()):
-            keep = len(hdr) - 1
-            lines = [",".join(row.split(",")[:keep]) for row in lines]
-
-    return "\n".join(lines)
-
-def _read_csv_widget(label: str, key_prefix: str) -> Optional[pd.DataFrame]:
-    c1, c2 = st.columns(2)
-    with c1:
-        f = st.file_uploader(f"{label} — Upload CSV", type=["csv"], key=f"{key_prefix}_file")
-    with c2:
-        txt = st.text_area(f"{label} — Or paste CSV text", height=160, key=f"{key_prefix}_paste")
-
-    if f is not None:
+def _read_csv(uploaded) -> Optional[pd.DataFrame]:
+    if uploaded is None:
+        return None
+    try:
+        return pd.read_csv(uploaded)
+    except Exception:
+        uploaded.seek(0)
         try:
-            return pd.read_csv(io.StringIO(f.getvalue().decode("utf-8")), engine="python")
-        except Exception as e:
-            st.error(f"Could not read uploaded CSV: {e}")
+            # Some sheets export with semicolons or tabs
+            return pd.read_csv(uploaded, sep=None, engine="python")
+        except Exception:
             return None
-    if txt and txt.strip():
+
+def _normalize_def_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Accepts your EPA defense table; normalizes column names."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["TEAM","EPA_PASS","EPA_RUSH","EPA_PLAY"])
+    cols = {c: c.strip().upper() for c in df.columns}
+    df = df.rename(columns=cols)
+    # common aliases
+    rename_map = {
+        "EPA/PASS": "EPA_PASS",
+        "EPA/RUSH": "EPA_RUSH",
+        "EPA/PLAY": "EPA_PLAY",
+        "TEAM": "TEAM",
+        "DEFENSE": "TEAM",
+    }
+    for k,v in rename_map.items():
+        if k in df.columns:
+            df = df.rename(columns={k:v})
+    # keep only needed
+    keep = [c for c in ["TEAM","EPA_PASS","EPA_RUSH","EPA_PLAY"] if c in df.columns]
+    df = df[keep].copy()
+    # team codes: uppercase and trim
+    df["TEAM"] = df["TEAM"].astype(str).str.strip()
+    return df
+
+def _def_factor(def_df: pd.DataFrame, opp_code: Optional[str], pos_group: str) -> float:
+    """
+    Convert defense EPA to a simple multiplier around 1.0.
+    - pos_group: "QB" or "WR" => EPA_PASS; "RB" => EPA_RUSH
+    - If opp_code missing or not found => 1.0 (league average)
+    """
+    if def_df is None or def_df.empty or not opp_code:
+        return 1.0
+    opp = str(opp_code).strip().upper()
+    row = def_df.loc[def_df["TEAM"].str.upper() == opp]
+    if row.empty:
+        return 1.0
+
+    col = "EPA_PASS" if pos_group in ("QB","WR") else "EPA_RUSH"
+    if col not in def_df.columns:
+        return 1.0
+
+    val = float(row.iloc[0][col])
+    # league mean & std
+    mean = float(def_df[col].mean())
+    std = float(def_df[col].std(ddof=0)) if def_df[col].std(ddof=0) > 0 else 0.05
+
+    # Negative EPA is good defense. We invert linearly:
+    # z < 0 (better defense) -> factor < 1 ; z > 0 (worse defense) -> factor > 1
+    z = (val - mean) / std
+    factor = 1.0 - 0.25 * z   # gentle scaling
+    factor = float(np.clip(factor, 0.7, 1.3))
+    return factor
+
+def _pick_player_row(df: pd.DataFrame, player_name: str) -> Optional[pd.Series]:
+    if df is None or df.empty:
+        return None
+    mask = df["Player"].astype(str).str.lower() == str(player_name).lower()
+    if not mask.any():
+        # try contains
+        mask = df["Player"].astype(str).str.lower().str.contains(str(player_name).lower())
+    if not mask.any():
+        return None
+    return df.loc[mask].iloc[0]
+
+def _yards_per_game(row: pd.Series, pos_group: str) -> Optional[float]:
+    # Your CSVs include Y/G for QBs (passing), RBs (rushing), WRs (receiving)
+    for col in ["Y/G","Yds/G","YPG","Yds per G"]:
+        if col in row.index:
+            try:
+                return float(row[col])
+            except Exception:
+                continue
+    # fallback: total / games if present
+    total_col = {"QB":"Yds", "RB":"Yds", "WR":"Yds"}.get(pos_group, "Yds")
+    if total_col in row.index and "G" in row.index:
         try:
-            cleaned = _clean_pasted_csv(txt)
-            return pd.read_csv(io.StringIO(cleaned), engine="python")
-        except Exception as e:
-            st.error(f"Could not parse pasted CSV: {e}")
+            return float(row[total_col]) / max(1.0, float(row["G"]))
+        except Exception:
             return None
     return None
 
-def _standardize_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [c.strip() for c in df.columns]
-    drop = [c for c in df.columns if c == "" or c.lower().startswith("unnamed")]
-    if drop:
-        df = df.drop(columns=drop)
-
-    cols = {c.lower(): c for c in df.columns}
-    def pick(*names):
-        for n in names:
-            if n in cols: return cols[n]
-        return None
-
-    ren = {}
-    mapping = {
-        "Player": pick("player","name"),
-        "Team": pick("team","tm"),
-        "Pos": pick("pos","position"),
-        "G": pick("g","games"),
-        "Season": pick("season","yr","year"),
-        "Yds": pick("yds","yards","pass yds","rush yds","rec yds"),
-        "Y_per_G": pick("y/g","yds/g","ypg","yards/g"),
-    }
-    for canon, src in mapping.items():
-        if src and src != canon:
-            ren[src] = canon
-    df = df.rename(columns=ren)
-
-    if "Y_per_G" not in df.columns:
-        if {"Yds","G"}.issubset(df.columns):
-            y = pd.to_numeric(df["Yds"], errors="coerce")
-            g = pd.to_numeric(df["G"], errors="coerce")
-            with np.errstate(divide="ignore", invalid="ignore"):
-                df["Y_per_G"] = y / g
-        else:
-            df["Y_per_G"] = np.nan
-    return df
-
-def _ensure_pos(df: pd.DataFrame, pos: str) -> pd.DataFrame:
-    df = df.copy()
-    if "Pos" not in df.columns or df["Pos"].isna().all():
-        df["Pos"] = pos
-    return df
-
-def _fair_ml_from_prob(p: float) -> str:
-    if p <= 0: return "∞"
-    if p >= 0.5:  # negative odds
-        return str(int(round(-100 * p / (1 - p))))
-    return f"+{int(round(100 * (1 - p) / p))}"
+def _simulate_yards(mean_yards: float, line: float, sd: float) -> float:
+    x = np.random.normal(loc=mean_yards, scale=sd, size=SIM_TRIALS)
+    return float((x >= float(line)).mean())
 
 # ==============================================================================
 # UI
@@ -354,15 +364,15 @@ def _fair_ml_from_prob(p: float) -> str:
 st.set_page_config(page_title="NFL + MLB Predictor — 2025 (stats only)", layout="wide")
 st.title("🏈⚾ NFL + MLB Predictor — 2025 (stats only)")
 st.caption(
-    "Win probabilities are simulated from **team scoring rates only**. "
-    "Props page uses your player CSVs and **auto opponent defense** from team points allowed."
+    "NFL/MLB game pages use team scoring rates only. "
+    "Player Props page uses your CSVs and adjusts by defense EPA (no team dropdown needed)."
 )
 
-page = st.radio("Pick a page", ["NFL", "MLB", "NFL Props"], horizontal=True)
+page = st.radio("Pick a page", ["NFL", "MLB", "Player Props"], horizontal=True)
 
-# -------------------------- NFL page --------------------------
+# -------------------------- NFL page (unchanged) ------------------------------
 if page == "NFL":
-    st.subheader("🏈 NFL — 2025 REG season (team-only)")
+    st.subheader("🏈 NFL — 2025 REG season")
     try:
         nfl_rates, upcoming = nfl_team_rates_2025()
     except Exception as e:
@@ -374,144 +384,146 @@ if page == "NFL":
         st.stop()
 
     if "date" in upcoming.columns and upcoming["date"].astype(str).str.len().gt(0).any():
-        choices_df = upcoming.copy()
-        choices_df["label"] = choices_df["home_team"] + " vs " + choices_df["away_team"] + " — " + choices_df["date"].astype(str)
+        choices = (upcoming["home_team"] + " vs " + upcoming["away_team"] +
+                   " — " + upcoming["date"].astype(str).fillna(""))
     else:
-        choices_df = upcoming.copy()
-        choices_df["label"] = choices_df["home_team"] + " vs " + choices_df["away_team"]
+        choices = (upcoming["home_team"] + " vs " + upcoming["away_team"])
 
-    pick = st.selectbox("Upcoming matchup", choices_df["label"].tolist())
-    sel = choices_df.loc[choices_df["label"] == pick].iloc[0]
-    home, away = sel["home_team"], sel["away_team"]
+    game = st.selectbox("Choose matchup", choices)
+    home = upcoming.iloc[choices.get_indexer([game])[0]]["home_team"]
+    away = upcoming.iloc[choices.get_indexer([game])[0]]["away_team"]
 
-    mu_home, mu_away = nfl_matchup_mu(nfl_rates, home, away)
-    p_home, p_away, mean_h, mean_a, total = simulate_poisson_game(mu_home, mu_away)
+    muH, muA = nfl_matchup_mu(nfl_rates, home, away)
+    pH, pA, mH, mA, tot = simulate_poisson_game(muH, muA)
 
     c1, c2, c3 = st.columns(3)
-    c1.metric(f"{home} win %", f"{p_home*100:.1f}%")
-    c2.metric(f"{away} win %", f"{p_away*100:.1f}%")
-    c3.metric("Avg total (pts)", f"{total:.2f}")
-    st.caption(f"Poisson means — {home}: {mu_home:.2f}, {away}: {mu_away:.2f}")
+    c1.metric(f"{home} win %", f"{pH*100:.1f}%")
+    c2.metric(f"{away} win %", f"{pA*100:.1f}%")
+    c3.metric("Expected total (pts)", f"{tot:.1f}")
 
-# -------------------------- MLB page --------------------------
+# -------------------------- MLB page (unchanged) ------------------------------
 elif page == "MLB":
-    st.subheader("⚾ MLB — 2025 REG season (team-only + probables ERA)")
+    st.subheader("⚾ MLB — 2025 Season (team RS/RA + probables ERA)")
     rates = mlb_team_rates_2025()
-    st.dataframe(rates, use_container_width=True, height=350)
-
-    st.markdown("**Today's Probable Pitchers (ERA)**")
     prob = _today_probables()
-    if prob.empty:
-        st.info("No probables found (or statsapi unavailable).")
+
+    st.write("**Today’s Probables (with ERA if available):**")
+    if prob is None or prob.empty:
+        st.info("No probables found (or statsapi not available).")
     else:
         st.dataframe(prob, use_container_width=True)
 
-    st.markdown("**Quick Matchup Sim**")
-    teams = sorted(rates["team"].tolist())
-    home = st.selectbox("Home", teams, index=min(teams.index("Los Angeles Dodgers") if "Los Angeles Dodgers" in teams else 0, len(teams)-1))
-    away = st.selectbox("Away", teams, index=min(teams.index("San Francisco Giants") if "San Francisco Giants" in teams else 1, len(teams)-1))
+    st.write("**Team scoring rates:**")
+    st.dataframe(rates.sort_values("team"), use_container_width=True)
 
-    mu_home, mu_away = mlb_matchup_mu(rates, home, away)
+    # Quick sim widget (unchanged behavior)
+    home_team = st.selectbox("Home team", rates["team"].tolist())
+    away_team = st.selectbox("Away team", [t for t in rates["team"].tolist() if t != home_team])
 
-    # try attach ERA if available
-    h_era = None
-    a_era = None
-    if not prob.empty:
-        he = prob.loc[(prob["side"] == "Home") & (prob["team"] == home)]
-        ae = prob.loc[(prob["side"] == "Away") & (prob["team"] == away)]
-        if not he.empty: h_era = he.iloc[0]["ERA"]
-        if not ae.empty: a_era = ae.iloc[0]["ERA"]
-    mu_home, mu_away = _apply_pitcher_adjustment(mu_home, mu_away, h_era, a_era)
+    muH, muA = mlb_matchup_mu(rates, home_team, away_team)
 
-    p_home, p_away, mean_h, mean_a, total = simulate_poisson_game(mu_home, mu_away)
+    # Attach pitcher ERA adjustment if we have probables
+    home_era = None
+    away_era = None
+    if prob is not None and not prob.empty:
+        hrow = prob.loc[(prob["side"]=="Home") & (prob["team"].str.lower()==home_team.lower())]
+        arow = prob.loc[(prob["side"]=="Away") & (prob["team"].str.lower()==away_team.lower())]
+        if not hrow.empty:
+            home_era = hrow.iloc[0]["ERA"]
+        if not arow.empty:
+            away_era = arow.iloc[0]["ERA"]
+    muH_adj, muA_adj = _apply_pitcher_adjustment(muH, muA, home_era, away_era)
+
+    pH, pA, mH, mA, tot = simulate_poisson_game(muH_adj, muA_adj)
     c1, c2, c3 = st.columns(3)
-    c1.metric(f"{home} win %", f"{p_home*100:.1f}%")
-    c2.metric(f"{away} win %", f"{p_away*100:.1f}%")
-    c3.metric("Avg total (runs)", f"{total:.2f}")
-    st.caption(f"Poisson means — {home}: {mu_home:.2f}, {away}: {mu_away:.2f} (ERA-adjusted)")
+    c1.metric(f"{home_team} win %", f"{pH*100:.1f}%")
+    c2.metric(f"{away_team} win %", f"{pA*100:.1f}%")
+    c3.metric("Expected total (runs)", f"{tot:.2f}")
 
-# -------------------------- NFL Props page --------------------------
+# -------------------------- Player Props page (NEW) ---------------------------
 else:
-    st.subheader("🏈 NFL Player Props — Simple (auto defense strength)")
+    st.subheader("📈 Player Props — CSV Uploads + Defense Adjustment")
 
-    st.markdown("**1) Load your player CSVs**")
-    qbs = _read_csv_widget("QBs CSV", "qbs")
-    rbs = _read_csv_widget("RBs CSV", "rbs")
-    wrs = _read_csv_widget("WRs CSV", "wrs")
+    st.markdown("Upload your **QB**, **RB**, and **WR** CSVs (the same format you pasted). "
+                "Then pick a player and enter a yardage line. "
+                "Optionally upload a **Defense EPA** CSV and type the opponent code (e.g., `PHI`).")
 
-    frames = []
-    if qbs is not None: frames.append(_ensure_pos(_standardize_cols(qbs), "QB"))
-    if rbs is not None: frames.append(_ensure_pos(_standardize_cols(rbs), "RB"))
-    if wrs is not None: frames.append(_ensure_pos(_standardize_cols(wrs), "WR"))
+    c_up1, c_up2, c_up3 = st.columns(3)
+    up_qb = c_up1.file_uploader("QB CSV", type=["csv"], key="qb_csv")
+    up_rb = c_up2.file_uploader("RB CSV", type=["csv"], key="rb_csv")
+    up_wr = c_up3.file_uploader("WR CSV", type=["csv"], key="wr_csv")
 
-    if not frames:
-        st.info("Upload/paste at least one of QBs/RBs/WRs to continue.")
-        st.stop()
+    up_def = st.file_uploader("Defense CSV (EPA table you pasted)", type=["csv"], key="def_csv")
 
-    players = pd.concat(frames, ignore_index=True)
-    keep = [c for c in ["Player","Team","Pos","Season","G","Yds","Y_per_G"] if c in players.columns]
-    players = players[keep].copy()
+    df_qb = _read_csv(up_qb)
+    df_rb = _read_csv(up_rb)
+    df_wr = _read_csv(up_wr)
+    df_def = _normalize_def_cols(_read_csv(up_def)) if up_def else pd.DataFrame(columns=["TEAM","EPA_PASS","EPA_RUSH","EPA_PLAY"])
 
-    st.markdown("**2) Choose market & player**")
-    market = st.selectbox("Market", ["Pass Yds (QB)", "Rush Yds (RB)", "Rec Yds (WR)"])
-
-    if market == "Pass Yds (QB)":
-        pool = players[players["Pos"] == "QB"].copy()
-        auto_sd = 40.0
-    elif market == "Rush Yds (RB)":
-        pool = players[players["Pos"] == "RB"].copy()
-        auto_sd = 25.0
+    # Build a combined player list for selection
+    options = []
+    sources = []
+    for df, tag in [(df_qb,"QB"), (df_rb,"RB"), (df_wr,"WR")]:
+        if df is None or df.empty or "Player" not in (df.columns):
+            continue
+        temp = df.copy()
+        temp["__POSGROUP__"] = tag
+        options.append(temp[["Player","Team","__POSGROUP__"]])
+        sources.append((tag, df))
+    if options:
+        show = pd.concat(options, ignore_index=True)
+        st.dataframe(show.rename(columns={"__POSGROUP__":"Pos"}), use_container_width=True)
     else:
-        pool = players[players["Pos"] == "WR"].copy()
-        auto_sd = 30.0
+        st.info("Upload at least one of the QB / RB / WR CSVs to begin.")
 
-    if pool.empty:
-        st.warning("No players for that market in your uploads.")
-        st.stop()
+    # UI controls (no team dropdown)
+    sel_player = st.text_input("Player name (exact or partial)")
+    prop_type = st.selectbox("Prop type", ["Passing Yards (QB)", "Rushing Yards (RB)", "Receiving Yards (WR)"])
+    line_val = st.number_input("Yardage line", min_value=0.0, step=0.5)
+    opp_code = st.text_input("Opponent (team code, optional — e.g., PHI). Leave blank to use league average.")
 
-    player_name = st.selectbox("Player", sorted(pool["Player"].dropna().astype(str).unique().tolist()))
-    row = pool.loc[pool["Player"] == player_name].iloc[0]
-    base_mean = float(pd.to_numeric(row.get("Y_per_G", 0.0), errors="coerce") or 0.0)
-    team = str(row.get("Team", ""))
+    if st.button("Run Simulation", use_container_width=True):
+        if not sel_player:
+            st.warning("Enter a player name.")
+            st.stop()
 
-    # Auto defense factor from NFL team PA_pg (no user file required)
-    st.markdown("**3) Opponent**")
-    nfl_rates, _upcoming = nfl_team_rates_2025()
-    opp = st.selectbox("Opponent team (from NFL team list)", [""] + sorted(nfl_rates["team"].tolist()))
-    def_factor = 1.0
-    if opp:
-        # Use PA_pg as a generic defensive strength proxy across markets.
-        # Scale vs league average PA_pg (lower PA => tougher defense => factor < 1).
-        league_pa = float(nfl_rates["PA_pg"].mean())
-        opp_pa = float(nfl_rates.loc[nfl_rates["team"] == opp, "PA_pg"].iloc[0])
-        if league_pa > 0:
-            def_factor = opp_pa / league_pa
-        # Clamp a bit to avoid extremes early season
-        def_factor = float(np.clip(def_factor, 0.75, 1.25))
+        # determine which table to search
+        pos_group = "QB" if "Passing" in prop_type else ("RB" if "Rushing" in prop_type else "WR")
+        target_df = {"QB": df_qb, "RB": df_rb, "WR": df_wr}.get(pos_group)
+        if target_df is None or target_df.empty:
+            st.error(f"Please upload the {pos_group} CSV.")
+            st.stop()
 
-    st.markdown("**4) Prop input**")
-    prop_line = st.number_input("Prop line", value=float(np.round(base_mean, 1)), step=0.5, format="%.2f")
+        row = _pick_player_row(target_df, sel_player)
+        if row is None:
+            st.error("Player not found in the uploaded CSV.")
+            st.stop()
 
-    if st.button("Compute Over%"):
-        adjusted_mean = max(0.0, base_mean * def_factor)
-        sd = auto_sd  # fixed by market — no user tuning
+        base_mean = _yards_per_game(row, pos_group)
+        if base_mean is None:
+            st.error("Couldn't locate Y/G (yards per game) in your CSV row for this player.")
+            st.stop()
 
-        sims = np.random.normal(loc=adjusted_mean, scale=sd, size=10000)
-        sims = np.clip(sims, 0, None)
+        # defense multiplier from EPA
+        factor = _def_factor(df_def, opp_code if opp_code else None, pos_group)
 
-        over_p = float((sims > prop_line).mean())
-        under_p = 1.0 - over_p
+        # apply factor
+        adj_mean = float(base_mean) * float(factor)
 
-        st.write("---")
-        st.subheader(f"{player_name} — {market}")
-        opp_note = opp if opp else "Neutral"
-        st.caption(
-            f"Team: {team} | Baseline Y/G: {base_mean:.2f} | "
-            f"Opponent: {opp_note} | Defense factor (from PA_pg): {def_factor:.2f} | "
-            f"Adjusted mean: {adjusted_mean:.2f} | SD used: {sd:.1f}"
+        # fixed SDs per position (kept simple)
+        sd = SD_QB_PASS_YDS if pos_group == "QB" else (SD_RB_RUSH_YDS if pos_group == "RB" else SD_WR_REC_YDS)
+
+        prob_over = _simulate_yards(adj_mean, line_val, sd)
+        st.success(
+            f"**{sel_player} — {prop_type}**\n\n"
+            f"Mean (from CSV): **{base_mean:.1f}** yds\n"
+            f"Defense factor (EPA): **×{factor:.3f}** → Adjusted mean: **{adj_mean:.1f}** yds\n"
+            f"Line: **{line_val:.1f}** → **P(over) = {prob_over*100:.1f}%**, **P(under) = {(1-prob_over)*100:.1f}%**"
         )
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Over %", f"{over_p*100:.1f}%")
-        c2.metric("Under %", f"{under_p*100:.1f}%")
-        c3.metric("Fair ML (Over)", _fair_ml_from_prob(over_p))
+        with st.expander("Show player row used"):
+            st.dataframe(pd.DataFrame(row).T)
+
+        if not df_def.empty:
+            with st.expander("Defense table (normalized)"):
+                st.dataframe(df_def, use_container_width=True)
