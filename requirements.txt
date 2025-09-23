@@ -4,4 +4,3 @@ numpy
 nfl_data_py
 pybaseball
 statsapi
-pyarrow
