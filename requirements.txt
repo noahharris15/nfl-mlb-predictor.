@@ -1,6 +1,6 @@
-streamlit
-pandas
-numpy
-nfl_data_py
-pybaseball
-MLB-StatsAPI
+streamlit>=1.37
+pandas>=2.1
+numpy>=1.26
+nfl_data_py>=0.3.3
+pybaseball>=2.2.7
+statsapi>=1.6.2
