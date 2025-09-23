@@ -1,6 +1,7 @@
 streamlit
 pandas
 numpy
+nfl_data_py
 pybaseball
 statsapi
-nfl_data_py
+pyarrow
