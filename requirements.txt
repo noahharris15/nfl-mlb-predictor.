@@ -1,7 +1,6 @@
-streamlit==1.37.1
-pandas==2.2.2
-numpy==1.26.4
-nfl_data_py==0.3.1
-pybaseball==2.2.7
-statsapi==1.0.2
-pyarrow==17.0.0
+streamlit
+pandas
+numpy
+nfl_data_py
+pybaseball
+statsapi
