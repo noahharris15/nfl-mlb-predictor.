@@ -201,10 +201,10 @@ def _def_epa_from_df(df: pd.DataFrame) -> Dict[str, float]:
     return out
 
 def load_embedded_defense() -> Tuple[Dict[str,float], Dict[str,float], str]:
-    """
+    
     Parse DEFENSE_CSV_TEXT if present; else use fallback.
     Returns: (def_factor_map, def_epa_map_used, source_label)
-    """
+    
     text = DEFENSE_CSV_TEXT.strip()
     if text and not text.startswith("Team,EPA/PLAY\n# PASTE"):
         try:
