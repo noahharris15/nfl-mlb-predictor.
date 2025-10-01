@@ -1,12 +1,13 @@
 # app.py — NFL + MLB Predictor (2025, stats-only) + Player Props
-# Defense CSV is EMBEDDED below (paste your CSV into DEFENSE_CSV_TEXT).
-# If you leave it blank, we fall back to your previous embedded EPA table.
+# Defense CSV/TEXT is EMBEDDED below (paste your table into DEFENSE_TEXT).
+# Works with: (A) regular CSVs (any delimiter) Team + EPA/PLAY, or
+#             (B) your "two-line blocks": numeric row (starts with 2025) then team name line.
 
 from __future__ import annotations
 import io
 import math
 from datetime import date
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 
 import numpy as np
 import pandas as pd
@@ -18,84 +19,86 @@ import nfl_data_py as nfl
 # ---- MLB team records (BR) ----
 from pybaseball import schedule_and_record
 
-# ======================= PASTE YOUR DEFENSE CSV HERE ==========================
-# Example header formats that work:
+# ======================= PASTE YOUR DEFENSE TEXT HERE =========================
+# This can be a proper CSV OR your two-line format (season row, then team name).
+# Example accepted CSV headers:
 #   Team,EPA/PLAY
 #   TEAM,epa_play
 #   team_code,epa
 #
-# >>> Replace ONLY the ... with your full CSV text (including header row) <<<
-DEFENSE_CSV_TEXT = """\
+# >>> Replace ONLY the ... with your full table text (including any header row) <<<
+DEFENSE_TEXT = """\
 Team,EPA/PLAY
 # Team	Season	EPA/Play	Total EPA	Success %	EPA/Pass	EPA/Rush	Pass Yards	Comp %	Pass TD	Rush Yards	Rush TD	ADoT	Sack %	Scramble %	Int %
 2025	-0.17	-38.71	0.4174	-0.37	0.06	685	0.6762	3	521	4	5.8	0.0813	0.065	0.0163
-Minnesota Vikings														
+Minnesota Vikings
 2025	-0.13	-33.41	0.379	-0.17	-0.05	984	0.5962	7	331	1	8.15	0.0409	0.0468	0.0526
-Jacksonville Jaguars														
+Jacksonville Jaguars
 2025	-0.11	-26.37	0.3796	-0.1	-0.12	853	0.5746	2	397	2	9.94	0.0974	0.0325	0.0065
-Denver Broncos														
+Denver Broncos
 2025	-0.11	-25.57	0.3667	-0.17	0.01	710	0.5938	3	445	3	7.69	0.0823	0.1076	0.019
-Los Angeles Chargers														
+Los Angeles Chargers
 2025	-0.09	-21.51	0.3783	0	-0.22	894	0.6271	7	376	4	10.44	0.1	0.0571	0.0214
-Detroit Lions														
+Detroit Lions
 2025	-0.08	-20.49	0.4291	-0.11	-0.04	860	0.5693	5	504	3	8.43	0.0329	0.0658	0.0197
-Philadelphia Eagles														
+Philadelphia Eagles
 2025	-0.08	-19.59	0.4149	-0.16	0.04	790	0.5714	3	409	4	8.3	0.0733	0.04	0.0133
-Houston Texans														
+Houston Texans
 2025	-0.08	-18.57	0.4042	-0.12	0	851	0.664	5	394	2	8.12	0.0952	0.0544	0.0204
-Los Angeles Rams														
+Los Angeles Rams
 2025	-0.07	-18.65	0.4075	0	-0.19	910	0.6645	6	359	0	7.03	0.069	0.0575	0.0402
-Seattle Seahawks														
+Seattle Seahawks
 2025	-0.06	-14.94	0.4344	-0.09	-0.03	690	0.6829	5	462	2	7.02	0.0368	0.0588	0
-San Francisco 49ers														
+San Francisco 49ers
 2025	-0.06	-13.91	0.4202	-0.02	-0.11	832	0.6429	6	340	3	6.54	0.0645	0.1226	0.0065
-Tampa Bay Buccaneers														
+Tampa Bay Buccaneers
 2025	-0.05	-11.24	0.4279	-0.13	0.05	602	0.5769	5	436	2	10.08	0.0806	0.0806	0.0242
-Atlanta Falcons														
+Atlanta Falcons
 2025	-0.05	-10.73	0.379	0.06	-0.17	689	0.6442	8	281	2	7.95	0.0924	0.0336	0.0168
-Cleveland Browns														
+Cleveland Browns
 2025	-0.05	-11.02	0.4638	-0.04	-0.05	946	0.6643	8	384	2	6.69	0.0633	0.0506	0.0253
-Indianapolis Colts														
+Indianapolis Colts
 2025	-0.02	-3.64	0.4487	-0.09	0.09	778	0.6694	4	508	4	8.27	0.0694	0.0903	0.0208
-Kansas City Chiefs														
+Kansas City Chiefs
 2025	-0.01	-2.38	0.4559	0.06	-0.14	1068	0.6369	5	384	2	8.06	0.0444	0.0222	0.0111
-Arizona Cardinals														
+Arizona Cardinals
 2025	-0.01	-1.85	0.4315	0.14	-0.22	948	0.6565	5	411	4	7.98	0.0544	0.0544	0.0136
-Las Vegas Raiders														
+Las Vegas Raiders
 2025	0	0.2	0.4094	0.03	-0.07	886	0.6815	6	310	3	6.87	0.0632	0.0345	0.0115
-Green Bay Packers														
+Green Bay Packers
 2025	0	0.89	0.4912	0.01	0	886	0.7368	10	658	4	6.75	0.0407	0.0325	0.0569
-Chicago Bears														
-2025	0.02	3.33	0.4208	-0.06	0.1	564	0.6214	6	657	5	6.87	0.0732	0.0894	0.0163
-Buffalo Bills															
+Chicago Bears
+2025	0.02	3.33	0.4208	-0.06	0.1	564	0.6214	6	657	5	7.5	0.0155	0.0775	0.031
+Carolina Panthers
 2025	0.04	9.13	0.4133	0.03	0.05	802	0.6239	4	517	5	7.5	0.0155	0.0775	0.031
-Carolina Panthers														
+Buffalo Bills
 2025	0.04	11.09	0.461	0.11	-0.05	1131	0.6957	7	488	4	7.6	0.087	0.0559	0.0311
-Pittsburgh Steelers														
+Pittsburgh Steelers
 2025	0.04	10.44	0.4183	0.18	-0.12	1062	0.6098	7	430	3	10.83	0.0714	0.05	0.0071
-Washington Commanders													
+Washington Commanders
 2025	0.05	12.43	0.4693	0.19	-0.15	1024	0.712	7	310	2	7.68	0.0725	0.0217	0.0217
-New England Patriots														
+New England Patriots
 2025	0.07	18.22	0.4613	-0.01	0.19	1021	0.6375	5	612	6	7.88	0.0562	0.0449	0.0169
-New York Giants														
+New York Giants
 2025	0.07	17.94	0.4417	0.2	-0.06	884	0.7117	9	475	4	7.4	0.0853	0.0543	0.0078
-New Orleans Saints														
+New Orleans Saints
 2025	0.1	27.12	0.4731	0.13	0.04	1089	0.6536	8	543	5	6.99	0.0366	0.0305	0.0305
-Cincinnati Bengals														
+Cincinnati Bengals
 2025	0.11	25.77	0.3959	0.23	-0.03	834	0.6577	7	522	4	6.11	0.0476	0.0714	0
-New York Jets														
+New York Jets
 2025	0.12	30.47	0.4435	0.16	0.07	935	0.6984	6	566	7	6.82	0.0294	0.0441	0.0221
-Tennessee Titans														
+Tennessee Titans
 2025	0.14	39.54	0.4685	0.14	0.12	1084	0.6667	9	565	7	8.04	0.0233	0.0523	0.0058
-Baltimore Ravens														
+Baltimore Ravens
 2025	0.25	65.26	0.4943	0.4	0.06	1237	0.7333	10	493	6	9.19	0.034	0.0476	0.0068
-Dallas Cowboys														
+Dallas Cowboys
 2025	0.25	59.66	0.5397	0.34	0.12	941	0.7757	7	632	5	6.15	0.0615	0.1154	0
-Miami Dolphins														
+Miami Dolphins
+"""
 
 # ==============================================================================
 
-# Fallback (used only if DEFENSE_CSV_TEXT is empty or unparsable)
+# Fallback (used only if DEFENSE_TEXT is empty or unparsable)
 DEF_EPA_2025_FALLBACK = {
     "MIN": -0.27, "JAX": -0.15, "GB": -0.13, "SF": -0.11, "ATL": -0.10,
     "IND": -0.08, "LAC": -0.08, "DEN": -0.08, "LAR": -0.07, "SEA": -0.07,
@@ -115,9 +118,30 @@ ALIAS_TO_STD = {
     "JAC": "JAX", "WSH": "WAS", "LA": "LAR", "OAK": "LV",
 }
 
-def norm_team_code(code: str) -> str:
-    c = (code or "").strip().upper()
-    return ALIAS_TO_STD.get(c, c)
+TEAM_NAME_TO_CODE = {
+    "arizona cardinals": "ARI", "atlanta falcons": "ATL", "baltimore ravens": "BAL",
+    "buffalo bills": "BUF", "carolina panthers": "CAR", "chicago bears": "CHI",
+    "cincinnati bengals": "CIN", "cleveland browns": "CLE", "dallas cowboys": "DAL",
+    "denver broncos": "DEN", "detroit lions": "DET", "green bay packers": "GB",
+    "houston texans": "HOU", "indianapolis colts": "IND", "jacksonville jaguars": "JAX",
+    "kansas city chiefs": "KC", "las vegas raiders": "LV", "los angeles chargers": "LAC",
+    "los angeles rams": "LAR", "miami dolphins": "MIA", "minnesota vikings": "MIN",
+    "new england patriots": "NE", "new orleans saints": "NO", "new york giants": "NYG",
+    "new york jets": "NYJ", "philadelphia eagles": "PHI", "pittsburgh steelers": "PIT",
+    "san francisco 49ers": "SF", "seattle seahawks": "SEA", "tampa bay buccaneers": "TB",
+    "tennessee titans": "TEN", "washington commanders": "WAS",
+}
+
+def norm_team_code(code_or_name: str) -> str:
+    c = (code_or_name or "").strip().upper()
+    if c in ALIAS_TO_STD:
+        return ALIAS_TO_STD[c]
+    # already a standard 2–3 letter code?
+    if len(c) <= 4 and c.isalpha():
+        return c
+    # try full team name
+    n = (code_or_name or "").strip().lower()
+    return TEAM_NAME_TO_CODE.get(n, c)
 
 # ----------------------------- constants --------------------------------------
 SIM_TRIALS = 10000
@@ -153,7 +177,7 @@ def _poisson_sim(mu_home: float, mu_away: float, trials: int = SIM_TRIALS):
 
 # ---------------------- Defense loading + factor map --------------------------
 def build_def_factor_map(epa_map: Dict[str, float]) -> Dict[str, float]:
-    Convert EPA/play (lower = tougher) to a multiplicative factor (~0.85..1.15)."""
+    """Convert EPA/play (lower = tougher) to a multiplicative factor (~0.85..1.15)."""
     if not epa_map:
         return {}
     series = pd.Series(epa_map, dtype=float)
@@ -164,16 +188,16 @@ def build_def_factor_map(epa_map: Dict[str, float]) -> Dict[str, float]:
     return {k: float(v) for k, v in factors.items()}
 
 def _def_epa_from_df(df: pd.DataFrame) -> Dict[str, float]:
-    
-    Try to extract {TEAM_CODE: epa_per_play} from arbitrary CSV/XLSX text.
-    Accepts columns like: Team / TEAM / team_code AND EPA/PLAY / EPA per play / epa_play / epa
-    
+    """
+    Extract {TEAM_CODE: epa_per_play} from a parsed DataFrame.
+    Accepts columns like: Team / TEAM / team_code AND EPA/PLAY / EPA per play / epa_play / epa.
+    """
     if df.empty:
         return {}
     cols_low = {str(c).strip().lower(): c for c in df.columns}
 
     team_candidates = ["team", "team_code", "def_team", "abbr", "tm", "defense", "opponent", "opp", "code"]
-    epa_candidates  = ["epa/play", "epa per play", "epa_play", "def_epa", "def epa", "epa"]
+    epa_candidates  = ["epa/play", "epa per play", "epa_play", "epa", "def_epa", "def epa"]
 
     team_col = next((cols_low[k] for k in team_candidates if k in cols_low), None)
     if team_col is None:
@@ -191,7 +215,7 @@ def _def_epa_from_df(df: pd.DataFrame) -> Dict[str, float]:
     if team_col is None or epa_col is None:
         return {}
 
-    out = {}
+    out: Dict[str, float] = {}
     for _, r in df[[team_col, epa_col]].dropna().iterrows():
         code = norm_team_code(str(r[team_col]))
         try:
@@ -200,18 +224,60 @@ def _def_epa_from_df(df: pd.DataFrame) -> Dict[str, float]:
             continue
     return out
 
+def _parse_two_line_blocks(text: str) -> Dict[str, float]:
+    """
+    Parse your custom format: numeric row (starts with '2025') then the next line is the team name.
+    We'll grab EPA/Play as the SECOND numeric field on that numeric row.
+    """
+    epa_map: Dict[str, float] = {}
+    if not text.strip():
+        return epa_map
+
+    lines: List[str] = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        # numeric row? begins with season year
+        if ln.split()[0].isdigit():
+            # tokenize by whitespace or commas/tabs
+            parts = [p for p in ln.replace(",", " ").split() if p]
+            if len(parts) >= 2:
+                try:
+                    # EPA/Play assumed second token
+                    epa = float(parts[1])
+                except Exception:
+                    epa = None
+                # next line should be the team name
+                if i + 1 < len(lines):
+                    team_line = lines[i+1]
+                    code = norm_team_code(team_line)
+                    if epa is not None and isinstance(code, str):
+                        epa_map[code] = epa
+                i += 2
+                continue
+        i += 1
+    return epa_map
+
 def load_embedded_defense() -> Tuple[Dict[str,float], Dict[str,float], str]:
-    
-    Parse DEFENSE_CSV_TEXT if present; else use fallback.
+    """
+    Parse DEFENSE_TEXT if present; else use fallback.
     Returns: (def_factor_map, def_epa_map_used, source_label)
-    
-    text = DEFENSE_CSV_TEXT.strip()
-    if text and not text.startswith("Team,EPA/PLAY\n# PASTE"):
+    """
+    text = DEFENSE_TEXT.strip()
+    if text:
+        # 1) try any-delimiter CSV first
         try:
-            df = pd.read_csv(io.StringIO(text))
+            df = pd.read_csv(io.StringIO(text), sep=None, engine="python", comment="#")
             epa_map = _def_epa_from_df(df)
             if epa_map:
-                return build_def_factor_map(epa_map), epa_map, "Embedded CSV (in script)"
+                return build_def_factor_map(epa_map), epa_map, "Embedded CSV"
+        except Exception:
+            pass
+        # 2) try your two-line format
+        try:
+            epa_map = _parse_two_line_blocks(text)
+            if epa_map:
+                return build_def_factor_map(epa_map), epa_map, "Embedded two-line blocks"
         except Exception:
             pass
     # fallback
@@ -427,7 +493,7 @@ elif page == "MLB":
 else:
     st.subheader("🎯 Player Props — drop in your CSVs")
 
-    # Build defense factors from embedded CSV (or fallback)
+    # Build defense factors from embedded text (CSV or two-line blocks) or fallback
     DEF_FACTOR_2025, DEF_EPA_USED, DEF_SOURCE = load_embedded_defense()
     st.caption(f"Defense source in use: **{DEF_SOURCE}**")
 
@@ -458,35 +524,8 @@ else:
         st.info("Upload at least one of QB/RB/WR CSVs to begin.")
         st.stop()
 
-    def _yardage_column_guess(df: pd.DataFrame, pos: str) -> str:
-        prefer = ["Y/G","Yds/G","YDS/G","Yards/G","PY/G","RY/G","Rec Y/G",
-                  "Yds","Yards","yds","yards"]
-        low = [c.lower() for c in df.columns]
-        for wanted in [p.lower() for p in prefer]:
-            if wanted in low:
-                return df.columns[low.index(wanted)]
-        for c in df.columns:
-            if pd.api.types.is_numeric_dtype(df[c]): return c
-        return df.columns[-1]
-
-    def _player_column_guess(df: pd.DataFrame) -> str:
-        for c in df.columns:
-            if str(c).lower() in ("player","name"):
-                return c
-        return df.columns[0]
-
-    def _estimate_sd(mean_val: float, pos: str) -> float:
-        mean_val = float(mean_val)
-        if pos == "QB": return max(35.0, 0.60 * mean_val)
-        if pos == "RB": return max(20.0, 0.75 * mean_val)
-        return max(22.0, 0.85 * mean_val)  # WR
-
-    def run_prop_sim(mean_yards: float, line: float, sd: float) -> Tuple[float,float]:
-        sd = max(5.0, float(sd))
-        z = (line - mean_yards) / sd
-        p_over = float(1.0 - 0.5*(1.0 + math.erf(z / math.sqrt(2))))
-        return np.clip(p_over, 0.0, 1.0), np.clip(1.0 - p_over, 0.0, 1.0)
-
+    name_col = _player_column_guess(dfs.get("QB", pd.DataFrame())) if "QB" in dfs else None  # safe default
+    # UI
     pos = st.selectbox("Market", ["QB","RB","WR"])
     df = dfs.get(pos, pd.DataFrame())
     if df.empty:
@@ -499,7 +538,7 @@ else:
     players = df[name_col].astype(str).tolist()
     player = st.selectbox("Player", players)
 
-    opp_in = st.text_input("Opponent team code (e.g., DAL, PHI). Aliases like KAN/NOR/GNB/SFO are OK.", value="")
+    opp_in = st.text_input("Opponent (team code like DAL or full name like Dallas Cowboys). Aliases KAN/NOR/GNB/SFO OK.", value="")
     opp = norm_team_code(opp_in)
 
     row = df.loc[df[name_col]==player].head(1)
