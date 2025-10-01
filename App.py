@@ -153,7 +153,7 @@ def _poisson_sim(mu_home: float, mu_away: float, trials: int = SIM_TRIALS):
 
 # ---------------------- Defense loading + factor map --------------------------
 def build_def_factor_map(epa_map: Dict[str, float]) -> Dict[str, float]:
-    """Convert EPA/play (lower = tougher) to a multiplicative factor (~0.85..1.15)."""
+    Convert EPA/play (lower = tougher) to a multiplicative factor (~0.85..1.15)."""
     if not epa_map:
         return {}
     series = pd.Series(epa_map, dtype=float)
