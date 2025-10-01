@@ -1,8 +1,9 @@
 # app.py — NFL + MLB Predictor (2025, stats-only) + Player Props
-# Defense strength is EMBEDDED (from 2025 EPA/play you provided).
-# No defense upload needed. Player Props keeps the player drop-down UX.
+# Defense CSV is EMBEDDED below (paste your CSV into DEFENSE_CSV_TEXT).
+# If you leave it blank, we fall back to your previous embedded EPA table.
 
 from __future__ import annotations
+import io
 import math
 from datetime import date
 from typing import Optional, Tuple, Dict
@@ -14,56 +15,100 @@ import streamlit as st
 # ---- NFL (team pages) ----
 import nfl_data_py as nfl
 
-# ---- MLB team records (BR) + optional probables (statsapi) ----
+# ---- MLB team records (BR) ----
 from pybaseball import schedule_and_record
-try:
-    import statsapi
-    HAS_STATSAPI = True
-except Exception:
-    HAS_STATSAPI = False
 
-# ------------------------------------------------------------------------------
-# Embedded 2025 NFL Defense EPA/play (from your sheet; lower = tougher defense)
-# Keys are standard team codes. We'll normalize common alternates (KAN->KC etc).
-# ------------------------------------------------------------------------------
-DEF_EPA_2025 = {
-    "MIN": -0.27,
-    "JAX": -0.15,
-    "GB": -0.13,
-    "SF": -0.11,
-    "ATL": -0.10,
-    "IND": -0.08,
-    "LAC": -0.08,
-    "DEN": -0.08,
-    "LAR": -0.07,
-    "SEA": -0.07,
-    "PHI": -0.06,
-    "TB": -0.05,
-    "CAR": -0.05,
-    "ARI": -0.03,
-    "CLE": -0.02,
-    "WAS": -0.02,
-    "HOU":  0.00,
-    "KC":   0.01,
-    "DET":  0.01,
-    "LV":   0.03,   # Raiders
-    "PIT":  0.05,
-    "CIN":  0.05,
-    "NO":   0.05,
-    "BUF":  0.05,
-    "CHI":  0.06,
-    "NE":   0.09,
-    "NYJ":  0.10,
-    "TEN":  0.11,
-    "BAL":  0.11,
-    "NYG":  0.13,
-    "DAL":  0.21,
-    "MIA":  0.28,
+# ======================= PASTE YOUR DEFENSE CSV HERE ==========================
+# Example header formats that work:
+#   Team,EPA/PLAY
+#   TEAM,epa_play
+#   team_code,epa
+#
+# >>> Replace ONLY the ... with your full CSV text (including header row) <<<
+DEFENSE_CSV_TEXT = """\
+Team,EPA/PLAY
+# Team	Season	EPA/Play	Total EPA	Success %	EPA/Pass	EPA/Rush	Pass Yards	Comp %	Pass TD	Rush Yards	Rush TD	ADoT	Sack %	Scramble %	Int %
+2025	-0.17	-38.71	0.4174	-0.37	0.06	685	0.6762	3	521	4	5.8	0.0813	0.065	0.0163
+Minnesota Vikings														
+2025	-0.13	-33.41	0.379	-0.17	-0.05	984	0.5962	7	331	1	8.15	0.0409	0.0468	0.0526
+Jacksonville Jaguars														
+2025	-0.11	-26.37	0.3796	-0.1	-0.12	853	0.5746	2	397	2	9.94	0.0974	0.0325	0.0065
+Denver Broncos														
+2025	-0.11	-25.57	0.3667	-0.17	0.01	710	0.5938	3	445	3	7.69	0.0823	0.1076	0.019
+Los Angeles Chargers														
+2025	-0.09	-21.51	0.3783	0	-0.22	894	0.6271	7	376	4	10.44	0.1	0.0571	0.0214
+Detroit Lions														
+2025	-0.08	-20.49	0.4291	-0.11	-0.04	860	0.5693	5	504	3	8.43	0.0329	0.0658	0.0197
+Philadelphia Eagles														
+2025	-0.08	-19.59	0.4149	-0.16	0.04	790	0.5714	3	409	4	8.3	0.0733	0.04	0.0133
+Houston Texans														
+2025	-0.08	-18.57	0.4042	-0.12	0	851	0.664	5	394	2	8.12	0.0952	0.0544	0.0204
+Los Angeles Rams														
+2025	-0.07	-18.65	0.4075	0	-0.19	910	0.6645	6	359	0	7.03	0.069	0.0575	0.0402
+Seattle Seahawks														
+2025	-0.06	-14.94	0.4344	-0.09	-0.03	690	0.6829	5	462	2	7.02	0.0368	0.0588	0
+San Francisco 49ers														
+2025	-0.06	-13.91	0.4202	-0.02	-0.11	832	0.6429	6	340	3	6.54	0.0645	0.1226	0.0065
+Tampa Bay Buccaneers														
+2025	-0.05	-11.24	0.4279	-0.13	0.05	602	0.5769	5	436	2	10.08	0.0806	0.0806	0.0242
+Atlanta Falcons														
+2025	-0.05	-10.73	0.379	0.06	-0.17	689	0.6442	8	281	2	7.95	0.0924	0.0336	0.0168
+Cleveland Browns														
+2025	-0.05	-11.02	0.4638	-0.04	-0.05	946	0.6643	8	384	2	6.69	0.0633	0.0506	0.0253
+Indianapolis Colts														
+2025	-0.02	-3.64	0.4487	-0.09	0.09	778	0.6694	4	508	4	8.27	0.0694	0.0903	0.0208
+Kansas City Chiefs														
+2025	-0.01	-2.38	0.4559	0.06	-0.14	1068	0.6369	5	384	2	8.06	0.0444	0.0222	0.0111
+Arizona Cardinals														
+2025	-0.01	-1.85	0.4315	0.14	-0.22	948	0.6565	5	411	4	7.98	0.0544	0.0544	0.0136
+Las Vegas Raiders														
+2025	0	0.2	0.4094	0.03	-0.07	886	0.6815	6	310	3	6.87	0.0632	0.0345	0.0115
+Green Bay Packers														
+2025	0	0.89	0.4912	0.01	0	886	0.7368	10	658	4	6.75	0.0407	0.0325	0.0569
+Chicago Bears														
+2025	0.02	3.33	0.4208	-0.06	0.1	564	0.6214	6	657	5	6.87	0.0732	0.0894	0.0163
+Buffalo Bills															
+2025	0.04	9.13	0.4133	0.03	0.05	802	0.6239	4	517	5	7.5	0.0155	0.0775	0.031
+Carolina Panthers														
+2025	0.04	11.09	0.461	0.11	-0.05	1131	0.6957	7	488	4	7.6	0.087	0.0559	0.0311
+Pittsburgh Steelers														
+2025	0.04	10.44	0.4183	0.18	-0.12	1062	0.6098	7	430	3	10.83	0.0714	0.05	0.0071
+Washington Commanders													
+2025	0.05	12.43	0.4693	0.19	-0.15	1024	0.712	7	310	2	7.68	0.0725	0.0217	0.0217
+New England Patriots														
+2025	0.07	18.22	0.4613	-0.01	0.19	1021	0.6375	5	612	6	7.88	0.0562	0.0449	0.0169
+New York Giants														
+2025	0.07	17.94	0.4417	0.2	-0.06	884	0.7117	9	475	4	7.4	0.0853	0.0543	0.0078
+New Orleans Saints														
+2025	0.1	27.12	0.4731	0.13	0.04	1089	0.6536	8	543	5	6.99	0.0366	0.0305	0.0305
+Cincinnati Bengals														
+2025	0.11	25.77	0.3959	0.23	-0.03	834	0.6577	7	522	4	6.11	0.0476	0.0714	0
+New York Jets														
+2025	0.12	30.47	0.4435	0.16	0.07	935	0.6984	6	566	7	6.82	0.0294	0.0441	0.0221
+Tennessee Titans														
+2025	0.14	39.54	0.4685	0.14	0.12	1084	0.6667	9	565	7	8.04	0.0233	0.0523	0.0058
+Baltimore Ravens														
+2025	0.25	65.26	0.4943	0.4	0.06	1237	0.7333	10	493	6	9.19	0.034	0.0476	0.0068
+Dallas Cowboys														
+2025	0.25	59.66	0.5397	0.34	0.12	941	0.7757	7	632	5	6.15	0.0615	0.1154	0
+Miami Dolphins														
+
+# ==============================================================================
+
+# Fallback (used only if DEFENSE_CSV_TEXT is empty or unparsable)
+DEF_EPA_2025_FALLBACK = {
+    "MIN": -0.27, "JAX": -0.15, "GB": -0.13, "SF": -0.11, "ATL": -0.10,
+    "IND": -0.08, "LAC": -0.08, "DEN": -0.08, "LAR": -0.07, "SEA": -0.07,
+    "PHI": -0.06, "TB": -0.05, "CAR": -0.05, "ARI": -0.03, "CLE": -0.02,
+    "WAS": -0.02, "HOU":  0.00, "KC": 0.01, "DET": 0.01, "LV": 0.03,
+    "PIT": 0.05, "CIN": 0.05, "NO": 0.05, "BUF": 0.05, "CHI": 0.06,
+    "NE": 0.09, "NYJ": 0.10, "TEN": 0.11, "BAL": 0.11, "NYG": 0.13,
+    "DAL": 0.21, "MIA": 0.28,
 }
 
 # Accept lots of alias codes and map to our keys above.
 ALIAS_TO_STD = {
-    # legacy Pro-Football-Ref style
+    # PFR-style
     "GNB": "GB", "SFO": "SF", "KAN": "KC", "NWE": "NE", "NOR": "NO", "TAM": "TB",
     "LVR": "LV", "SDG": "LAC", "STL": "LAR",
     # common alternates
@@ -74,20 +119,9 @@ def norm_team_code(code: str) -> str:
     c = (code or "").strip().upper()
     return ALIAS_TO_STD.get(c, c)
 
-# Turn EPA/play into multiplicative DEF_FACTOR (~0.85..1.15) once at import.
-def build_def_factor_map(epa_map: Dict[str, float]) -> Dict[str, float]:
-    series = pd.Series(epa_map, dtype=float)
-    mu, sd = float(series.mean()), float(series.std(ddof=0) or 1.0)
-    z = (series - mu) / (sd if sd > 1e-9 else 1.0)
-    # Lower EPA (better D) => lower factor; clamp ±2σ → 0.85..1.15
-    factors = 1.0 + np.clip(z, -2.0, 2.0) * 0.075
-    return {k: float(v) for k, v in factors.items()}
-
-DEF_FACTOR_2025 = build_def_factor_map(DEF_EPA_2025)
-
 # ----------------------------- constants --------------------------------------
 SIM_TRIALS = 10000
-HOME_EDGE_NFL = 0.6    # small NFL home bump in Poisson mean (points)
+HOME_EDGE_NFL = 0.6    # small NFL home bump
 EPS = 1e-9
 
 # Stable Baseball-Reference team IDs for 2025 (BR codes)
@@ -117,8 +151,71 @@ def _poisson_sim(mu_home: float, mu_away: float, trials: int = SIM_TRIALS):
     p_home = float(wins_home.mean())
     return p_home, 1.0 - p_home, float(h.mean()), float(a.mean())
 
-def _team_code_clean(s: str) -> str:
-    return norm_team_code(s)
+# ---------------------- Defense loading + factor map --------------------------
+def build_def_factor_map(epa_map: Dict[str, float]) -> Dict[str, float]:
+    """Convert EPA/play (lower = tougher) to a multiplicative factor (~0.85..1.15)."""
+    if not epa_map:
+        return {}
+    series = pd.Series(epa_map, dtype=float)
+    mu, sd = float(series.mean()), float(series.std(ddof=0) or 1.0)
+    z = (series - mu) / (sd if sd > 1e-9 else 1.0)
+    # Lower EPA (better D) => lower factor; clamp ±2σ → 0.85..1.15
+    factors = 1.0 + np.clip(z, -2.0, 2.0) * 0.075
+    return {k: float(v) for k, v in factors.items()}
+
+def _def_epa_from_df(df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Try to extract {TEAM_CODE: epa_per_play} from arbitrary CSV/XLSX text.
+    Accepts columns like: Team / TEAM / team_code AND EPA/PLAY / EPA per play / epa_play / epa
+    """
+    if df.empty:
+        return {}
+    cols_low = {str(c).strip().lower(): c for c in df.columns}
+
+    team_candidates = ["team", "team_code", "def_team", "abbr", "tm", "defense", "opponent", "opp", "code"]
+    epa_candidates  = ["epa/play", "epa per play", "epa_play", "def_epa", "def epa", "epa"]
+
+    team_col = next((cols_low[k] for k in team_candidates if k in cols_low), None)
+    if team_col is None:
+        # fallback: first non-numeric column
+        for c in df.columns:
+            if not pd.api.types.is_numeric_dtype(df[c]):
+                team_col = c; break
+
+    epa_col = next((cols_low[k] for k in epa_candidates if k in cols_low), None)
+    if epa_col is None:
+        # fallback: last numeric column
+        num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        epa_col = num_cols[-1] if num_cols else None
+
+    if team_col is None or epa_col is None:
+        return {}
+
+    out = {}
+    for _, r in df[[team_col, epa_col]].dropna().iterrows():
+        code = norm_team_code(str(r[team_col]))
+        try:
+            out[code] = float(r[epa_col])
+        except Exception:
+            continue
+    return out
+
+def load_embedded_defense() -> Tuple[Dict[str,float], Dict[str,float], str]:
+    """
+    Parse DEFENSE_CSV_TEXT if present; else use fallback.
+    Returns: (def_factor_map, def_epa_map_used, source_label)
+    """
+    text = DEFENSE_CSV_TEXT.strip()
+    if text and not text.startswith("Team,EPA/PLAY\n# PASTE"):
+        try:
+            df = pd.read_csv(io.StringIO(text))
+            epa_map = _def_epa_from_df(df)
+            if epa_map:
+                return build_def_factor_map(epa_map), epa_map, "Embedded CSV (in script)"
+        except Exception:
+            pass
+    # fallback
+    return build_def_factor_map(DEF_EPA_2025_FALLBACK), DEF_EPA_2025_FALLBACK, "Embedded fallback"
 
 # ==============================================================================
 # NFL (2025) — team PF/PA + upcoming matchups (simple UI)
@@ -228,19 +325,9 @@ def mlb_team_rates_2025() -> pd.DataFrame:
 # ==============================================================================
 # Player Props — CSVs + embedded defense
 # ==============================================================================
-def _read_any_table(upload) -> pd.DataFrame:
-    if upload is None:
-        return pd.DataFrame()
-    name = upload.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(upload)
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        return pd.read_excel(upload)
-    return pd.read_csv(upload)
-
 def _yardage_column_guess(df: pd.DataFrame, pos: str) -> str:
-    # forgiving guesses
-    prefer = ["Y/G","Yds/G","YDS/G","Yards/G","PY/G","RY/G","Rec Y/G","Yds","Yards","yds","yards"]
+    prefer = ["Y/G","Yds/G","YDS/G","Yards/G","PY/G","RY/G","Rec Y/G",
+              "Yds","Yards","yds","yards"]
     low = [c.lower() for c in df.columns]
     for wanted in [p.lower() for p in prefer]:
         if wanted in low:
@@ -276,7 +363,7 @@ st.title("🏈⚾ NFL + MLB Predictor — 2025 (stats only)")
 st.caption(
     "Team pages use **2025 scoring rates only** (NFL: PF/PA; MLB: RS/RA). "
     "Player Props: upload your QB/RB/WR CSVs, pick a player, set a line. "
-    "Defense strength is **embedded** from your 2025 EPA/play table—type the opponent code (e.g., DAL)."
+    "Defense is **embedded** in this script (EPA/play)."
 )
 
 page = st.radio("Pick a page", ["NFL", "MLB", "Player Props"], horizontal=True)
@@ -340,6 +427,11 @@ elif page == "MLB":
 else:
     st.subheader("🎯 Player Props — drop in your CSVs")
 
+    # Build defense factors from embedded CSV (or fallback)
+    DEF_FACTOR_2025, DEF_EPA_USED, DEF_SOURCE = load_embedded_defense()
+    st.caption(f"Defense source in use: **{DEF_SOURCE}**")
+
+    # Player CSV uploads
     c1, c2, c3 = st.columns(3)
     with c1:
         qb_up = st.file_uploader("QB CSV", type=["csv","xlsx"], key="qb")
@@ -347,6 +439,15 @@ else:
         rb_up = st.file_uploader("RB CSV", type=["csv","xlsx"], key="rb")
     with c3:
         wr_up = st.file_uploader("WR CSV", type=["csv","xlsx"], key="wr")
+
+    def _read_any_table(up):
+        if up is None: return pd.DataFrame()
+        name = (up.name or "").lower()
+        if name.endswith(".csv"):
+            return pd.read_csv(up)
+        if name.endswith(".xlsx") or name.endswith(".xls"):
+            return pd.read_excel(up)
+        return pd.read_csv(up)
 
     dfs = {}
     if qb_up: dfs["QB"] = _read_any_table(qb_up).copy()
@@ -356,6 +457,35 @@ else:
     if not dfs:
         st.info("Upload at least one of QB/RB/WR CSVs to begin.")
         st.stop()
+
+    def _yardage_column_guess(df: pd.DataFrame, pos: str) -> str:
+        prefer = ["Y/G","Yds/G","YDS/G","Yards/G","PY/G","RY/G","Rec Y/G",
+                  "Yds","Yards","yds","yards"]
+        low = [c.lower() for c in df.columns]
+        for wanted in [p.lower() for p in prefer]:
+            if wanted in low:
+                return df.columns[low.index(wanted)]
+        for c in df.columns:
+            if pd.api.types.is_numeric_dtype(df[c]): return c
+        return df.columns[-1]
+
+    def _player_column_guess(df: pd.DataFrame) -> str:
+        for c in df.columns:
+            if str(c).lower() in ("player","name"):
+                return c
+        return df.columns[0]
+
+    def _estimate_sd(mean_val: float, pos: str) -> float:
+        mean_val = float(mean_val)
+        if pos == "QB": return max(35.0, 0.60 * mean_val)
+        if pos == "RB": return max(20.0, 0.75 * mean_val)
+        return max(22.0, 0.85 * mean_val)  # WR
+
+    def run_prop_sim(mean_yards: float, line: float, sd: float) -> Tuple[float,float]:
+        sd = max(5.0, float(sd))
+        z = (line - mean_yards) / sd
+        p_over = float(1.0 - 0.5*(1.0 + math.erf(z / math.sqrt(2))))
+        return np.clip(p_over, 0.0, 1.0), np.clip(1.0 - p_over, 0.0, 1.0)
 
     pos = st.selectbox("Market", ["QB","RB","WR"])
     df = dfs.get(pos, pd.DataFrame())
@@ -370,19 +500,15 @@ else:
     player = st.selectbox("Player", players)
 
     opp_in = st.text_input("Opponent team code (e.g., DAL, PHI). Aliases like KAN/NOR/GNB/SFO are OK.", value="")
-    opp = _team_code_clean(opp_in)
+    opp = norm_team_code(opp_in)
 
-    # pull player's mean from the row; set line default to mean
     row = df.loc[df[name_col]==player].head(1)
     csv_mean = float(pd.to_numeric(row[yard_col], errors="coerce").fillna(0).mean()) if not row.empty else 0.0
     line = st.number_input("Yardage line", value=round(csv_mean or 0.0, 2), step=0.5)
 
-    # position-based SD
     est_sd = _estimate_sd(csv_mean, pos)
 
-    # embedded defense factor (neutral if not found)
     def_factor = DEF_FACTOR_2025.get(opp, 1.00) if opp else 1.00
-
     adj_mean = csv_mean * def_factor
     p_over, p_under = run_prop_sim(adj_mean, line, est_sd)
 
@@ -396,10 +522,13 @@ else:
     with st.expander("Show player row used"):
         st.dataframe(row if not row.empty else df.head(5))
 
-    with st.expander("Embedded 2025 defense factors"):
-        show = pd.DataFrame({
-            "TEAM": list(DEF_FACTOR_2025.keys()),
-            "DEF_FACTOR": list(DEF_FACTOR_2025.values()),
-            "EPA/play": [DEF_EPA_2025[k] for k in DEF_FACTOR_2025.keys()]
-        }).sort_values("DEF_FACTOR")
-        st.dataframe(show.reset_index(drop=True))
+    with st.expander("Defense factors in use"):
+        if DEF_EPA_USED:
+            show = pd.DataFrame({
+                "TEAM": list(DEF_EPA_USED.keys()),
+                "EPA/play": list(DEF_EPA_USED.values()),
+                "DEF_FACTOR": [build_def_factor_map(DEF_EPA_USED)[k] for k in DEF_EPA_USED.keys()],
+            }).sort_values("DEF_FACTOR")
+            st.dataframe(show.reset_index(drop=True))
+        else:
+            st.write("No defense table parsed; using fallback.")
