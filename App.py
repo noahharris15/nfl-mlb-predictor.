@@ -164,10 +164,10 @@ def build_def_factor_map(epa_map: Dict[str, float]) -> Dict[str, float]:
     return {k: float(v) for k, v in factors.items()}
 
 def _def_epa_from_df(df: pd.DataFrame) -> Dict[str, float]:
-    """
+    
     Try to extract {TEAM_CODE: epa_per_play} from arbitrary CSV/XLSX text.
     Accepts columns like: Team / TEAM / team_code AND EPA/PLAY / EPA per play / epa_play / epa
-    """
+    
     if df.empty:
         return {}
     cols_low = {str(c).strip().lower(): c for c in df.columns}
