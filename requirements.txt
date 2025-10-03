@@ -1,9 +1,17 @@
-streamlit
-pandas
-numpy
-nfl_data_py
-pybaseball
-MLB_statsapi
-# CFBD for college football
-cfbd>=5.2.1
-requests>=2.32.0
+# Core app
+streamlit>=1.36
+pandas>=2.2
+numpy>=1.26
+
+# NFL team schedules
+nfl_data_py>=0.3.3
+
+# MLB team schedule/records
+pybaseball>=2.2.7
+
+# HTTP for CollegeFootballData (CFB page)
+requests>=2.31
+
+# PyBaseball HTML parsing deps (keeps things smooth)
+beautifulsoup4>=4.12
+lxml>=4.9
