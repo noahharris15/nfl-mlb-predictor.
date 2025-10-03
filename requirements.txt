@@ -1,8 +1,9 @@
-streamlit==1.35.0
-pandas==2.2.2
-numpy==1.26.4
-nfl-data-py==0.3.3
-pybaseball==2.2.7
-requests>=2.31.0
-lxml>=4.9.3
-html5lib>=1.1
+streamlit
+pandas
+numpy
+nfl-data-py
+pybaseball
+requests
+# optional; comment out if you don't need yet:
+# cfbd
+# statsapi
