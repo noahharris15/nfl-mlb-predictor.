@@ -1,18 +1,8 @@
-# Core app
-streamlit>=1.36
-pandas>=2.2
-numpy>=1.26
-
-# NFL team schedules
-nfl_data_py>=0.3.3
-
-# MLB team schedule/records
-pybaseball>=2.2.7
-
-# HTTP for CollegeFootballData (CFB page)
-requests>=2.31
-
-# PyBaseball HTML parsing deps (keeps things smooth)
-beautifulsoup4>=4.12
-lxml>=4.9
-cfbd
+streamlit==1.35.0
+pandas==2.2.2
+numpy==1.26.4
+nfl-data-py==0.3.3
+pybaseball==2.2.7
+requests>=2.31.0
+lxml>=4.9.3
+html5lib>=1.1
