@@ -4,3 +4,6 @@ numpy
 nfl_data_py
 pybaseball
 MLB_statsapi
+# CFBD for college football
+cfbd>=5.2.1
+requests>=2.32.0
