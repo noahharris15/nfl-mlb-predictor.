@@ -1,132 +1,138 @@
-# app.py — NFL + MLB Predictor (2025, stats-only) + Player Props
-# - Embedded Defense CSV (robust parser, works with alternating "2025 line / Team name" format)
-# - Injury Report upload wired into BOTH NFL model page and Player Props page
-# - Player drop-down shows clean names only
+# app.py — NFL + MLB + Player Props (with embedded defense) + College Football
+# - NFL & MLB pages unchanged in spirit (PF/PA & RS/RA → Poisson sim)
+# - Player Props: upload QB/RB/WR CSVs, select player (names only), set line
+# - Defense: EMBEDDED CSV is parsed into opponent multipliers (fallback provided)
+# - CFB: pulls this season's games from CFBD (PF/PA → Poisson sim)
 
 from __future__ import annotations
 import io
+import os
 import math
-import re
-from typing import Optional, Tuple, Dict, Iterable
+from datetime import date
+from typing import Optional, Tuple, Dict
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 
-# ---- NFL team schedules/results ----
+# ---- NFL team pages ----
 import nfl_data_py as nfl
 
 # ---- MLB team records (BR) ----
 from pybaseball import schedule_and_record
 
 
-# ============================================================================
-# 1) EMBED YOUR DEFENSE CSV HERE  (leave header; paste full CSV rows below)
-#    It can be tidy "Team,EPA/PLAY" OR your alternating "2025 row / Team row".
-#    The parser below handles both.
-# ============================================================================
+# ======================= PASTE YOUR DEFENSE CSV HERE ==========================
+# Acceptable headers include something like:
+#   Team,EPA/PLAY
+#   TEAM,epa_play
+#   team_code,epa
+#
+# Replace ONLY the "..." content with your full CSV text (including header row).
+# If left blank or unparsable, the fallback table below is used.
+
 DEFENSE_CSV_TEXT = """\
 Team,EPA/PLAY
-# Example: works with alternating "season-row, then team-row"
-2025,-0.17,,,,,,,,,,,,,
+# Team	Season	EPA/Play	Total EPA	Success %	EPA/Pass	EPA/Rush	Pass Yards	Comp %	Pass TD	Rush Yards	Rush TD	ADoT	Sack %	Scramble %	Int %
+2025	-0.17	-38.71	0.4174	-0.37	0.06	685	0.6762	3	521	4	5.8	0.0813	0.065	0.0163
 Minnesota Vikings
-2025,-0.13,,,,,,,,,,,,,
+2025	-0.13	-33.41	0.379	-0.17	-0.05	984	0.5962	7	331	1	8.15	0.0409	0.0468	0.0526
 Jacksonville Jaguars
-2025,-0.11,,,,,,,,,,,,,
+2025	-0.11	-26.37	0.3796	-0.1	-0.12	853	0.5746	2	397	2	9.94	0.0974	0.0325	0.0065
 Denver Broncos
-2025,-0.11,,,,,,,,,,,,,
+2025	-0.11	-25.57	0.3667	-0.17	0.01	710	0.5938	3	445	3	7.69	0.0823	0.1076	0.019
 Los Angeles Chargers
-2025,-0.09,,,,,,,,,,,,,
+2025	-0.09	-21.51	0.3783	0	-0.22	894	0.6271	7	376	4	10.44	0.1	0.0571	0.0214
 Detroit Lions
-2025,-0.08,,,,,,,,,,,,,
+2025	-0.08	-20.49	0.4291	-0.11	-0.04	860	0.5693	5	504	3	8.43	0.0329	0.0658	0.0197
 Philadelphia Eagles
-2025,-0.08,,,,,,,,,,,,,
+2025	-0.08	-19.59	0.4149	-0.16	0.04	790	0.5714	3	409	4	8.3	0.0733	0.04	0.0133
 Houston Texans
-2025,-0.08,,,,,,,,,,,,,
+2025	-0.08	-18.57	0.4042	-0.12	0	851	0.664	5	394	2	8.12	0.0952	0.0544	0.0204
 Los Angeles Rams
-2025,-0.07,,,,,,,,,,,,,
+2025	-0.07	-18.65	0.4075	0	-0.19	910	0.6645	6	359	0	7.03	0.069	0.0575	0.0402
 Seattle Seahawks
-2025,-0.06,,,,,,,,,,,,,
+2025	-0.06	-14.94	0.4344	-0.09	-0.03	690	0.6829	5	462	2	7.02	0.0368	0.0588	0
 San Francisco 49ers
-2025,-0.06,,,,,,,,,,,,,
+2025	-0.06	-13.91	0.4202	-0.02	-0.11	832	0.6429	6	340	3	6.54	0.0645	0.1226	0.0065
 Tampa Bay Buccaneers
-2025,-0.05,,,,,,,,,,,,,
+2025	-0.05	-11.24	0.4279	-0.13	0.05	602	0.5769	5	436	2	10.08	0.0806	0.0806	0.0242
 Atlanta Falcons
-2025,-0.05,,,,,,,,,,,,,
+2025	-0.05	-10.73	0.379	0.06	-0.17	689	0.6442	8	281	2	7.95	0.0924	0.0336	0.0168
 Cleveland Browns
-2025,-0.05,,,,,,,,,,,,,
+2025	-0.05	-11.02	0.4638	-0.04	-0.05	946	0.6643	8	384	2	6.69	0.0633	0.0506	0.0253
 Indianapolis Colts
-2025,-0.02,,,,,,,,,,,,,
+2025	-0.02	-3.64	0.4487	-0.09	0.09	778	0.6694	4	508	4	8.27	0.0694	0.0903	0.0208
 Kansas City Chiefs
-2025,-0.01,,,,,,,,,,,,,
+2025	-0.01	-2.38	0.4559	0.06	-0.14	1068	0.6369	5	384	2	8.06	0.0444	0.0222	0.0111
 Arizona Cardinals
-2025,-0.01,,,,,,,,,,,,,
+2025	-0.01	-1.85	0.4315	0.14	-0.22	948	0.6565	5	411	4	7.98	0.0544	0.0544	0.0136
 Las Vegas Raiders
-2025,0.00,,,,,,,,,,,,,
+2025	0	0.2	0.4094	0.03	-0.07	886	0.6815	6	310	3	6.87	0.0632	0.0345	0.0115
 Green Bay Packers
-2025,0.00,,,,,,,,,,,,,
+2025	0	0.89	0.4912	0.01	0	886	0.7368	10	658	4	6.75	0.0407	0.0325	0.0569
 Chicago Bears
-2025,0.02,,,,,,,,,,,,,
+2025	0.02	3.33	0.4208	-0.06	0.1	564	0.6214	6	657	5	6.87	0.0732	0.0894	0.0163
 Buffalo Bills
-2025,0.04,,,,,,,,,,,,,
+2025	0.04	9.13	0.4133	0.03	0.05	802	0.6239	4	517	5	7.5	0.0155	0.0775	0.031
 Carolina Panthers
-2025,0.04,,,,,,,,,,,,,
+2025	0.04	11.09	0.461	0.11	-0.05	1131	0.6957	7	488	4	7.6	0.087	0.0559	0.0311
 Pittsburgh Steelers
-2025,0.04,,,,,,,,,,,,,
+2025	0.04	10.44	0.4183	0.18	-0.12	1062	0.6098	7	430	3	10.83	0.0714	0.05	0.0071
 Washington Commanders
-2025,0.05,,,,,,,,,,,,,
+2025	0.05	12.43	0.4693	0.19	-0.15	1024	0.712	7	310	2	7.68	0.0725	0.0217	0.0217
 New England Patriots
-2025,0.07,,,,,,,,,,,,,
+2025	0.07	18.22	0.4613	-0.01	0.19	1021	0.6375	5	612	6	7.88	0.0562	0.0449	0.0169
 New York Giants
-2025,0.07,,,,,,,,,,,,,
+2025	0.07	17.94	0.4417	0.2	-0.06	884	0.7117	9	475	4	7.4	0.0853	0.0543	0.0078
 New Orleans Saints
-2025,0.10,,,,,,,,,,,,,
+2025	0.1	27.12	0.4731	0.13	0.04	1089	0.6536	8	543	5	6.99	0.0366	0.0305	0.0305
 Cincinnati Bengals
-2025,0.11,,,,,,,,,,,,,
+2025	0.11	25.77	0.3959	0.23	-0.03	834	0.6577	7	522	4	6.11	0.0476	0.0714	0
 New York Jets
-2025,0.12,,,,,,,,,,,,,
+2025	0.12	30.47	0.4435	0.16	0.07	935	0.6984	6	566	7	6.82	0.0294	0.0441	0.0221
 Tennessee Titans
-2025,0.14,,,,,,,,,,,,,
+2025	0.14	39.54	0.4685	0.14	0.12	1084	0.6667	9	565	7	8.04	0.0233	0.0523	0.0058
 Baltimore Ravens
-2025,0.25,,,,,,,,,,,,,
+2025	0.25	65.26	0.4943	0.4	0.06	1237	0.7333	10	493	6	9.19	0.034	0.0476	0.0068
 Dallas Cowboys
-2025,0.25,,,,,,,,,,,,,
+2025	0.25	59.66	0.5397	0.34	0.12	941	0.7757	7	632	5	6.15	0.0615	0.1154	0
 Miami Dolphins
 """
 
 
-# ============================================================================
-# 2) CONSTANTS / MAPS
-# ============================================================================
-SIM_TRIALS = 10000
-HOME_EDGE_NFL = 0.6   # small NFL home bump
-EPS = 1e-9
+# ============================== FALLBACK TABLE =================================
+# Used only if the embedded CSV above is empty/unparsable. Values are EPA/play.
+DEF_EPA_2025_FALLBACK = {
+    "MIN": -0.27, "JAX": -0.15, "GB": -0.13, "SF": -0.11, "ATL": -0.10,
+    "IND": -0.08, "LAC": -0.08, "DEN": -0.08, "LAR": -0.07, "SEA": -0.07,
+    "PHI": -0.06, "TB": -0.05, "CAR": -0.05, "ARI": -0.03, "CLE": -0.02,
+    "WAS": -0.02, "HOU":  0.00, "KC": 0.01, "DET": 0.01, "LV": 0.03,
+    "PIT": 0.05, "CIN": 0.05, "NO": 0.05, "BUF": 0.05, "CHI": 0.06,
+    "NE": 0.09, "NYJ": 0.10, "TEN": 0.11, "BAL": 0.11, "NYG": 0.13,
+    "DAL": 0.21, "MIA": 0.28,
+}
 
-# Common alias normalization (codes typed on props page)
+# Accept aliases and map to standard keys for defense/opponent input.
 ALIAS_TO_STD = {
-    # PFR-ish
+    # PFR-style
     "GNB": "GB", "SFO": "SF", "KAN": "KC", "NWE": "NE", "NOR": "NO", "TAM": "TB",
     "LVR": "LV", "SDG": "LAC", "STL": "LAR",
     # common alternates
     "JAC": "JAX", "WSH": "WAS", "LA": "LAR", "OAK": "LV",
 }
-def norm_code(code: str) -> str:
+def norm_team_code(code: str) -> str:
     c = (code or "").strip().upper()
     return ALIAS_TO_STD.get(c, c)
 
-# Full-name → code (used for defense+injury lookups)
-TEAM_NAME_TO_CODE = {
-    "Arizona Cardinals":"ARI","Atlanta Falcons":"ATL","Baltimore Ravens":"BAL","Buffalo Bills":"BUF",
-    "Carolina Panthers":"CAR","Chicago Bears":"CHI","Cincinnati Bengals":"CIN","Cleveland Browns":"CLE",
-    "Dallas Cowboys":"DAL","Denver Broncos":"DEN","Detroit Lions":"DET","Green Bay Packers":"GB",
-    "Houston Texans":"HOU","Indianapolis Colts":"IND","Jacksonville Jaguars":"JAX","Kansas City Chiefs":"KC",
-    "Las Vegas Raiders":"LV","Los Angeles Chargers":"LAC","Los Angeles Rams":"LAR","Miami Dolphins":"MIA",
-    "Minnesota Vikings":"MIN","New England Patriots":"NE","New Orleans Saints":"NO","New York Giants":"NYG",
-    "New York Jets":"NYJ","Philadelphia Eagles":"PHI","Pittsburgh Steelers":"PIT","San Francisco 49ers":"SF",
-    "Seattle Seahawks":"SEA","Tampa Bay Buccaneers":"TB","Tennessee Titans":"TEN","Washington Commanders":"WAS",
-}
 
-# MLB (BR codes to names)
+# ----------------------------- constants --------------------------------------
+SIM_TRIALS = 10000
+HOME_EDGE_NFL = 0.6    # small NFL home bump
+EPS = 1e-9
+
+# Stable Baseball-Reference team IDs for 2025 (BR codes)
 MLB_TEAMS_2025: Dict[str, str] = {
     "ARI": "Arizona Diamondbacks","ATL": "Atlanta Braves","BAL": "Baltimore Orioles",
     "BOS": "Boston Red Sox","CHC": "Chicago Cubs","CHW": "Chicago White Sox",
@@ -140,230 +146,8 @@ MLB_TEAMS_2025: Dict[str, str] = {
     "TEX": "Texas Rangers","TOR": "Toronto Blue Jays","WSN": "Washington Nationals",
 }
 
-# Injury → multiplier
-INJURY_MULTIPLIERS = {
-    "Out": 0.0,
-    "IR": 0.0,
-    "Doubtful": 0.25,
-    "DNP": 0.35,  # practice DNP
-    "Questionable": 0.60,
-    "Limited": 0.75,
-    "Full": 1.0,
-    "-": 1.0,
-    "": 1.0,
-    None: 1.0,
-}
 
-# Positional “impact” weights (team offense scaling)
-POS_WEIGHTS = {
-    "QB": 0.35,
-    "WR": 0.12,
-    "RB": 0.12,
-    "TE": 0.08,
-    # lump OL positions
-    "T": 0.10, "G": 0.10, "C": 0.10, "OL": 0.10,
-    # default small
-    "_DEFAULT": 0.05,
-}
-
-
-# ============================================================================
-# 3) DEFENSE CSV PARSING → EPA map → multiplicative factor (~0.85..1.15)
-# ============================================================================
-def _name_to_code(s: str) -> Optional[str]:
-    s = str(s).strip()
-    if not s: return None
-    if s in TEAM_NAME_TO_CODE: return TEAM_NAME_TO_CODE[s]
-    if s.upper() in TEAM_NAME_TO_CODE.values(): return s.upper()
-    # loose match
-    for name, code in TEAM_NAME_TO_CODE.items():
-        if s.lower() == name.lower(): return code
-    return None
-
-def _robust_read_csv(text: str) -> pd.DataFrame:
-    # tolerate odd commas/widths; treat '#' as comments
-    return pd.read_csv(io.StringIO(text), sep=",", engine="python", comment="#", header=0, dtype=str)
-
-def defense_text_to_epa_map(text: str) -> Dict[str, float]:
-    """
-    Handles tidy 'Team,EPA/PLAY' or alternating '2025,epa,...' then 'Team Name' lines.
-    Returns {TEAM_CODE: epa_per_play}.
-    """
-    text = (text or "").strip()
-    if not text:
-        return {}
-
-    df = _robust_read_csv(text)
-    if df.empty:
-        return {}
-
-    # Case A: tidy columns present
-    cols = {c.lower(): c for c in df.columns}
-    team_col = None
-    epa_col = None
-    for k in ["team", "team_code", "def_team", "abbr"]:
-        if k in cols: team_col = cols[k]; break
-    for k in ["epa/play", "epa per play", "epa", "epa_play"]:
-        if k in cols: epa_col = cols[k]; break
-    epa_map: Dict[str, float] = {}
-
-    if team_col and epa_col:
-        tmp = df[[team_col, epa_col]].copy()
-        for _, r in tmp.dropna().iterrows():
-            code = _name_to_code(r[team_col]) or norm_code(str(r[team_col]))
-            try:
-                val = float(str(r[epa_col]).strip())
-            except Exception:
-                continue
-            if code:
-                epa_map[code] = val
-        if epa_map:
-            return epa_map
-
-    # Case B: alternating season/stat rows followed by a single-field team name
-    # Expect first numeric token line is EPA, then the next single string line is team.
-    epa_last: Optional[float] = None
-    for raw in text.splitlines():
-        raw = raw.strip()
-        if not raw or raw.startswith("#"): 
-            continue
-        parts = [p.strip() for p in raw.split(",")]
-        # line with numeric in second field? ex: "2025,-0.17,...."
-        if len(parts) >= 2 and re.fullmatch(r"-?\d+(\.\d+)?", parts[1] or ""):
-            try:
-                epa_last = float(parts[1])
-            except Exception:
-                epa_last = None
-            continue
-        # otherwise, treat as team name line
-        code = _name_to_code(parts[0])
-        if code and epa_last is not None:
-            epa_map[code] = epa_last
-            epa_last = None
-
-    return epa_map
-
-def build_def_factor_map(epa_map: Dict[str, float]) -> Dict[str, float]:
-    """Lower EPA (better D) → lower factor. Clamp ±2σ to ~0.85..1.15."""
-    if not epa_map:
-        return {}
-    s = pd.Series(epa_map, dtype=float)
-    mu, sd = float(s.mean()), float(s.std(ddof=0) or 1.0)
-    z = (s - mu) / (sd if sd > 1e-9 else 1.0)
-    factors = 1.0 + np.clip(z, -2.0, 2.0) * 0.075
-    return {k: float(v) for k, v in factors.items()}
-
-
-# ============================================================================
-# 4) INJURY REPORT HANDLING
-# ============================================================================
-def _read_any_table(upload) -> pd.DataFrame:
-    if upload is None:
-        return pd.DataFrame()
-    name = (upload.name or "").lower()
-    try:
-        if name.endswith(".csv"):
-            return pd.read_csv(upload, sep=None, engine="python")
-        if name.endswith(".xlsx") or name.endswith(".xls"):
-            return pd.read_excel(upload)
-        return pd.read_csv(upload, sep=None, engine="python")
-    except Exception:
-        return pd.DataFrame()
-
-def _pos_bucket(pos: str) -> str:
-    p = (pos or "").upper().strip()
-    if p in POS_WEIGHTS: return p
-    if p in {"LT","RT","LG","RG","C","OL"}: return "OL"
-    if p.startswith("WR"): return "WR"
-    if p.startswith("RB"): return "RB"
-    if p.startswith("TE"): return "TE"
-    if p.startswith("QB"): return "QB"
-    return "_DEFAULT"
-
-def parse_injury_file(upload) -> pd.DataFrame:
-    """
-    Expect columns like:
-      Team, Player, Pos, Game Status
-    but will also infer from 'Participation *' columns when 'Game Status' absent.
-    Returns a tidy df with columns: team_code, player, pos_bucket, status, mult, team_name
-    """
-    df = _read_any_table(upload)
-    if df.empty:
-        return df
-
-    cols = {c.lower(): c for c in df.columns}
-
-    def _col(*names: Iterable[str]) -> Optional[str]:
-        for n in names:
-            if n.lower() in cols: return cols[n.lower()]
-        return None
-
-    c_team = _col("Team","team")
-    c_player = _col("Player","player","name")
-    c_pos = _col("Pos","Position","pos")
-    c_status = _col("Game Status","Status","game status")
-
-    # fallback: derive status from participation columns
-    if c_status is None:
-        for day in ["Wednesday","Thursday","Friday","Tuesday","Monday"]:
-            c = _col(f"Participation {day}", f"Participation_{day}")
-            if c and c in df.columns:
-                df["__status_tmp__"] = df[c]
-                c_status = "__status_tmp__"
-                break
-
-    out_rows = []
-    for _, r in df.iterrows():
-        team_name = str(r.get(c_team, "")).strip() if c_team else ""
-        team_code = _name_to_code(team_name) or norm_code(team_name)
-        player = str(r.get(c_player, "")).strip() if c_player else ""
-        pos_bucket = _pos_bucket(str(r.get(c_pos, "")))
-        raw_status = str(r.get(c_status, "")).strip() if c_status else ""
-
-        # normalize status tokens
-        tok = raw_status.title()
-        if tok.upper() in {"DNP","DID NOT PRACTICE"}: tok = "DNP"
-        mult = INJURY_MULTIPLIERS.get(tok, 1.0)
-
-        out_rows.append({
-            "team_name": team_name,
-            "team_code": team_code,
-            "player": player,
-            "pos_bucket": pos_bucket,
-            "status": tok,
-            "mult": mult,
-        })
-
-    tidy = pd.DataFrame(out_rows)
-    return tidy
-
-
-def team_offense_multiplier(inj_df: pd.DataFrame, team_name_or_code: str) -> float:
-    """Combine player-level multipliers into a single team offense factor."""
-    if inj_df is None or inj_df.empty:
-        return 1.0
-    # match by either full name or code
-    code = _name_to_code(team_name_or_code) or norm_code(team_name_or_code)
-    name = None
-    for n, c in TEAM_NAME_TO_CODE.items():
-        if c == code: name = n; break
-
-    sub = inj_df[(inj_df["team_code"] == code) | (inj_df["team_name"] == name)]
-    if sub.empty:
-        return 1.0
-
-    factor = 1.0
-    for _, r in sub.iterrows():
-        w = POS_WEIGHTS.get(r["pos_bucket"], POS_WEIGHTS["_DEFAULT"])
-        m = float(r["mult"])
-        # convex blend: (1-w) + w*m
-        factor *= (1.0 - w) + w * m
-    return float(np.clip(factor, 0.60, 1.05))  # clamp a bit
-
-
-# ============================================================================
-# 5) GENERIC HELPERS
-# ============================================================================
+# -------------------------- generic helpers -----------------------------------
 def _poisson_sim(mu_home: float, mu_away: float, trials: int = SIM_TRIALS):
     mu_home = max(0.1, float(mu_home))
     mu_away = max(0.1, float(mu_away))
@@ -372,47 +156,114 @@ def _poisson_sim(mu_home: float, mu_away: float, trials: int = SIM_TRIALS):
     wins_home = (h > a).astype(np.float64)
     ties = (h == a)
     if ties.any():
-        wins_home[ties] = 0.53  # small OT tilt
+        wins_home[ties] = 0.53  # tiny home tiebreak
     p_home = float(wins_home.mean())
     return p_home, 1.0 - p_home, float(h.mean()), float(a.mean())
 
-def _yardage_col_guess(df: pd.DataFrame, pos: str) -> str:
-    prefer = ["Y/G","Yds/G","YDS/G","Yards/G","PY/G","RY/G","Rec Y/G",
-              "Yds","Yards","yds","yards"]
-    low = [c.lower() for c in df.columns]
-    for wanted in [p.lower() for p in prefer]:
-        if wanted in low: return df.columns[low.index(wanted)]
-    # fallback: first numeric
-    for c in df.columns:
-        if pd.api.types.is_numeric_dtype(df[c]): return c
-    return df.columns[-1]
 
-def _player_col_guess(df: pd.DataFrame) -> str:
-    for c in df.columns:
-        if str(c).lower() in ("player","name"): return c
-    return df.columns[0]
+# ---------------------- Defense loading + factor map --------------------------
+def build_def_factor_map(epa_map: Dict[str, float]) -> Dict[str, float]:
+    """
+    Convert EPA/play (lower = tougher defense) to a multiplicative factor (~0.85..1.15).
+    We z-score each team, clamp to ±2σ, and map via 1 + z*0.075.
+    Lower EPA → negative z → factor < 1 (harder matchup).
+    """
+    if not epa_map:
+        return {}
+    series = pd.Series(epa_map, dtype=float)
+    mu, sd = float(series.mean()), float(series.std(ddof=0) or 1.0)
+    z = (series - mu) / (sd if sd > 1e-9 else 1.0)
+    factors = 1.0 + np.clip(z, -2.0, 2.0) * 0.075
+    return {k: float(v) for k, v in factors.items()}
 
-def _estimate_sd(mean_val: float, pos: str) -> float:
-    mean_val = float(mean_val)
-    if pos == "QB": return max(35.0, 0.60 * mean_val)
-    if pos == "RB": return max(20.0, 0.75 * mean_val)
-    return max(22.0, 0.85 * mean_val)  # WR
+def _def_epa_from_df(df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Try to extract {TEAM_CODE: epa_per_play} from messy CSV.
+    Accepts columns like: Team / TEAM / team_code AND EPA/PLAY / epa_play / epa.
+    Also handles two-line-per-team "value, Team Name" patterns by forward filling.
+    """
+    if df.empty:
+        return {}
 
-def run_prop_sim(mean_yards: float, line: float, sd: float) -> Tuple[float,float]:
-    sd = max(5.0, float(sd))
-    z = (line - mean_yards) / sd
-    p_over = float(1.0 - 0.5*(1.0 + math.erf(z / math.sqrt(2))))
-    return np.clip(p_over, 0.0, 1.0), np.clip(1.0 - p_over, 0.0, 1.0)
+    # If your CSV is in two-line pairs (value row followed by team name row),
+    # try to reshape: detect numeric-only lines vs text-only lines.
+    if df.shape[1] == 1:
+        col = df.columns[0]
+        vals = []
+        teams = []
+        last_val = None
+        for x in df[col].astype(str):
+            xs = x.strip()
+            # crude: if it parses as float, treat as EPA; else treat as team name
+            try:
+                last_val = float(xs)
+            except Exception:
+                if xs and last_val is not None:
+                    teams.append(xs)
+                    vals.append(last_val)
+                    last_val = None
+        if teams and vals and len(teams) == len(vals):
+            return {norm_team_code(t): float(v) for t, v in zip(teams, vals)}
+
+    # Normal header-based parse
+    cols_low = {str(c).strip().lower(): c for c in df.columns}
+    team_candidates = ["team", "team_code", "def_team", "abbr", "tm", "defense", "opponent", "opp", "code"]
+    epa_candidates  = ["epa/play", "epa per play", "epa_play", "def_epa", "def epa", "epa"]
+
+    team_col = next((cols_low[k] for k in team_candidates if k in cols_low), None)
+    if team_col is None:
+        # fallback: first non-numeric column
+        for c in df.columns:
+            if not pd.api.types.is_numeric_dtype(df[c]):
+                team_col = c; break
+
+    epa_col = next((cols_low[k] for k in epa_candidates if k in cols_low), None)
+    if epa_col is None:
+        # fallback: last numeric column
+        num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        epa_col = num_cols[-1] if num_cols else None
+
+    if team_col is None or epa_col is None:
+        return {}
+
+    out = {}
+    for _, r in df[[team_col, epa_col]].dropna().iterrows():
+        code = norm_team_code(str(r[team_col]))
+        try:
+            out[code] = float(r[epa_col])
+        except Exception:
+            continue
+    return out
+
+def load_embedded_defense() -> Tuple[Dict[str,float], Dict[str,float], str]:
+    """
+    Parse DEFENSE_CSV_TEXT if present; else use fallback.
+    Returns: (def_factor_map, def_epa_map_used, source_label)
+    """
+    text = (DEFENSE_CSV_TEXT or "").strip()
+    # If the user left the template header, skip parse and use fallback
+    if not text or text.startswith("Team,EPA/PLAY\n# PASTE"):
+        return build_def_factor_map(DEF_EPA_2025_FALLBACK), DEF_EPA_2025_FALLBACK, "Embedded fallback"
+
+    try:
+        df = pd.read_csv(io.StringIO(text))
+        epa_map = _def_epa_from_df(df)
+        if epa_map:
+            return build_def_factor_map(epa_map), epa_map, "Embedded CSV (in script)"
+    except Exception:
+        pass
+
+    return build_def_factor_map(DEF_EPA_2025_FALLBACK), DEF_EPA_2025_FALLBACK, "Embedded fallback"
 
 
-# ============================================================================
-# 6) NFL TEAM RATES (2025)
-# ============================================================================
+# ==============================================================================
+# NFL (2025) — team PF/PA + upcoming matchups (simple UI)
+# ==============================================================================
 @st.cache_data(show_spinner=False)
 def nfl_team_rates_2025():
     sched = nfl.import_schedules([2025])
 
-    # date-ish column
+    # a date-like column if present
     date_col: Optional[str] = None
     for c in ("gameday", "game_date", "start_time"):
         if c in sched.columns:
@@ -429,8 +280,17 @@ def nfl_team_rates_2025():
     long = pd.concat([home, away], ignore_index=True)
 
     if long.empty:
-        per = 45.0/2.0
-        teams32 = list(TEAM_NAME_TO_CODE.keys())
+        per = 45.0 / 2.0
+        teams32 = [
+            "Arizona Cardinals","Atlanta Falcons","Baltimore Ravens","Buffalo Bills",
+            "Carolina Panthers","Chicago Bears","Cincinnati Bengals","Cleveland Browns",
+            "Dallas Cowboys","Denver Broncos","Detroit Lions","Green Bay Packers",
+            "Houston Texans","Indianapolis Colts","Jacksonville Jaguars","Kansas City Chiefs",
+            "Las Vegas Raiders","Los Angeles Chargers","Los Angeles Rams","Miami Dolphins",
+            "Minnesota Vikings","New England Patriots","New Orleans Saints","New York Giants",
+            "New York Jets","Philadelphia Eagles","Pittsburgh Steelers","San Francisco 49ers",
+            "Seattle Seahawks","Tampa Bay Buccaneers","Tennessee Titans","Washington Commanders",
+        ]
         rates = pd.DataFrame({"team": teams32, "PF_pg": per, "PA_pg": per})
     else:
         team = long.groupby("team", as_index=False).agg(
@@ -447,6 +307,7 @@ def nfl_team_rates_2025():
         rates["PF_pg"] = (1 - shrink) * rates["PF_pg"] + shrink * prior
         rates["PA_pg"] = (1 - shrink) * rates["PA_pg"] + shrink * prior
 
+    # upcoming games list (defensive guard for missing cols)
     if {"home_team","away_team"}.issubset(set(sched.columns)):
         filt = sched["home_score"].isna() & sched["away_score"].isna()
         upcoming = sched.loc[filt, ["home_team","away_team"]].copy()
@@ -471,9 +332,9 @@ def nfl_matchup_mu(rates: pd.DataFrame, home: str, away: str) -> Tuple[float,flo
     return mu_home, mu_away
 
 
-# ============================================================================
-# 7) MLB TEAM RATES (2025)
-# ============================================================================
+# ==============================================================================
+# MLB (2025) — team RS/RA from BR
+# ==============================================================================
 @st.cache_data(show_spinner=False)
 def mlb_team_rates_2025() -> pd.DataFrame:
     rows = []
@@ -502,39 +363,139 @@ def mlb_team_rates_2025() -> pd.DataFrame:
     return df
 
 
-# ============================================================================
-# 8) STREAMLIT UI
-# ============================================================================
-st.set_page_config(page_title="NFL + MLB Predictor — 2025 (stats only)", layout="wide")
-st.title("🏈⚾ NFL + MLB Predictor — 2025 (stats only)")
+# ==============================================================================
+# CFB (College Football) — this season PF/PA via CollegeFootballData
+# ==============================================================================
+def _cfbd_key():
+    # Try Streamlit secret first; fallback to env; else None
+    key = None
+    try:
+        key = st.secrets.get("CFBD_API_KEY")
+    except Exception:
+        pass
+    return key or os.environ.get("CFBD_API_KEY")
+
+@st.cache_data(show_spinner=False)
+def cfb_games_df(year: int) -> pd.DataFrame:
+    """
+    Pull all regular-season games from CFBD and return a clean DataFrame.
+    Uses raw HTTP (robust across cfbd-client versions).
+    """
+    key = _cfbd_key()
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    url = f"https://api.collegefootballdata.com/games?year={year}&seasonType=regular"
+    r = requests.get(url, headers=headers, timeout=30)
+    r.raise_for_status()
+    data = r.json() or []
+    if not data:
+        return pd.DataFrame(columns=["season","week","homeTeam","homePoints","awayTeam","awayPoints","completed","startDate"])
+    df = pd.DataFrame(data)
+    # Ensure columns exist
+    for c in ["season","week","homeTeam","homePoints","awayTeam","awayPoints","startDate","completed"]:
+        if c not in df.columns:
+            df[c] = None
+    if df["completed"].isna().all():
+        df["completed"] = df["homePoints"].notna() & df["awayPoints"].notna()
+    return df
+
+@st.cache_data(show_spinner=False)
+def cfb_team_rates(year: int) -> pd.DataFrame:
+    """
+    Compute PF/PA per game from completed games (regular season only).
+    """
+    g = cfb_games_df(year)
+    done = g[g["completed"] == True].copy()
+    if done.empty:
+        return pd.DataFrame(columns=["team","PF_pg","PA_pg"])
+
+    home = done.rename(columns={"homeTeam":"team", "awayTeam":"opp", "homePoints":"pf", "awayPoints":"pa"})[["team","opp","pf","pa"]]
+    away = done.rename(columns={"awayTeam":"team", "homeTeam":"opp", "awayPoints":"pf", "homePoints":"pa"})[["team","opp","pf","pa"]]
+    long = pd.concat([home, away], ignore_index=True).dropna(subset=["pf","pa"])
+    long["pf"] = pd.to_numeric(long["pf"], errors="coerce")
+    long["pa"] = pd.to_numeric(long["pa"], errors="coerce")
+    long = long.dropna(subset=["pf","pa"])
+
+    team = long.groupby("team", as_index=False).agg(
+        games=("pf","size"), PF=("pf","sum"), PA=("pa","sum")
+    )
+    rates = pd.DataFrame({
+        "team": team["team"],
+        "PF_pg": team["PF"] / team["games"],
+        "PA_pg": team["PA"] / team["games"],
+    })
+
+    # Small early-season shrink toward league average
+    league_total = float((long["pf"] + long["pa"]).mean())
+    prior = league_total / 2.0
+    shrink = np.clip(1.0 - team["games"]/4.0, 0.0, 1.0)
+    rates["PF_pg"] = (1 - shrink) * rates["PF_pg"] + shrink * prior
+    rates["PA_pg"] = (1 - shrink) * rates["PA_pg"] + shrink * prior
+    return rates
+
+def cfb_matchup_mu(rates: pd.DataFrame, home: str, away: str) -> Tuple[float,float]:
+    rH = rates.loc[rates["team"].str.lower() == home.lower()]
+    rA = rates.loc[rates["team"].str.lower() == away.lower()]
+    if rH.empty or rA.empty:
+        raise ValueError(f"Unknown CFB teams: {home}, {away}")
+    H, A = rH.iloc[0], rA.iloc[0]
+    mu_home = max(EPS, (H["PF_pg"] + A["PA_pg"]) / 2.0)
+    mu_away = max(EPS, (A["PF_pg"] + H["PA_pg"]) / 2.0)
+    return mu_home, mu_away
+
+
+# ==============================================================================
+# Player Props helpers
+# ==============================================================================
+def _yardage_column_guess(df: pd.DataFrame, pos: str) -> str:
+    prefer = ["Y/G","Yds/G","YDS/G","Yards/G","PY/G","RY/G","Rec Y/G",
+              "Yds","Yards","yds","yards"]
+    low = [c.lower() for c in df.columns]
+    for wanted in [p.lower() for p in prefer]:
+        if wanted in low:
+            return df.columns[low.index(wanted)]
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            return c
+    return df.columns[-1]
+
+def _player_column_guess(df: pd.DataFrame) -> str:
+    for c in df.columns:
+        if str(c).lower() in ("player","name"):
+            return c
+    return df.columns[0]
+
+def _estimate_sd(mean_val: float, pos: str) -> float:
+    mean_val = float(mean_val)
+    if pos == "QB": return max(35.0, 0.60 * mean_val)
+    if pos == "RB": return max(20.0, 0.75 * mean_val)
+    return max(22.0, 0.85 * mean_val)  # WR
+
+def run_prop_sim(mean_yards: float, line: float, sd: float) -> Tuple[float,float]:
+    sd = max(5.0, float(sd))
+    z = (line - mean_yards) / sd
+    p_over = float(1.0 - 0.5*(1.0 + math.erf(z / math.sqrt(2))))
+    return np.clip(p_over, 0.0, 1.0), np.clip(1.0 - p_over, 0.0, 1.0)
+
+
+# ==============================================================================
+# UI
+# ==============================================================================
+st.set_page_config(page_title="All-in-One Predictor — NFL / MLB / Props / CFB", layout="wide")
+st.title("🏈⚾🎯🎓 All-in-One Predictor (2025) — NFL, MLB, Player Props, CFB")
 st.caption(
-    "• NFL & MLB pages: win probs from 2025 scoring rates only (no betting data).  \n"
-    "• Player Props: upload your QB/RB/WR CSVs, pick a player, set a line.  \n"
-    "• Defense effects come from the embedded EPA/Play CSV.  \n"
-    "• Optional: upload an **Injury Report** to adjust team offense and player props."
+    "NFL & MLB team pages: 2025 scoring rates only (PF/PA, RS/RA → Poisson sim).  \n"
+    "Player Props: upload your QB/RB/WR CSVs, pick a **player (name only)**, set a line; "
+    "opponent defense is built-in from your embedded EPA/play table.  \n"
+    "CFB: pulls this season’s games from CollegeFootballData (PF/PA → Poisson sim)."
 )
 
-page = st.radio("Pick a page", ["NFL", "MLB", "Player Props"], horizontal=True)
+page = st.radio("Pick a page", ["NFL", "MLB", "Player Props", "CFB"], horizontal=True)
 
 
 # -------------------------- NFL page --------------------------
 if page == "NFL":
     st.subheader("🏈 NFL — 2025 REG season")
     rates, upcoming = nfl_team_rates_2025()
-
-    # Defense factors (from embedded CSV)
-    EPA_MAP = defense_text_to_epa_map(DEFENSE_CSV_TEXT)
-    DEF_FACTORS = build_def_factor_map(EPA_MAP)
-    with st.expander("Defense table in use", expanded=False):
-        st.dataframe(pd.DataFrame({
-            "TEAM": list(EPA_MAP.keys()),
-            "EPA/play": list(EPA_MAP.values()),
-            "DEF_FACTOR": [DEF_FACTORS[k] for k in EPA_MAP.keys()]
-        }).sort_values("DEF_FACTOR").reset_index(drop=True))
-
-    # Optional injury file (team-level impact)
-    inj_up = st.file_uploader("Injury Report (optional) — CSV/XLSX", type=["csv","xlsx"], key="inj_nfl")
-    inj_df = parse_injury_file(inj_up) if inj_up else pd.DataFrame()
 
     if not upcoming.empty and {"home_team","away_team"}.issubset(set(upcoming.columns)):
         labels = [f"{r['home_team']} vs {r['away_team']} — {r.get('date','')}" for _, r in upcoming.iterrows()]
@@ -555,37 +516,12 @@ if page == "NFL":
     if home and away:
         try:
             mu_h, mu_a = nfl_matchup_mu(rates, home, away)
-
-            # Apply OFFENSIVE injury multipliers (reduce PF side), then DEFENSE factor:
-            # For simplicity, map defense to opponent factor acting on offense mean.
-            home_code = TEAM_NAME_TO_CODE.get(home, "")
-            away_code = TEAM_NAME_TO_CODE.get(away, "")
-
-            # injury
-            inj_home = team_offense_multiplier(inj_df, home) if not inj_df.empty else 1.0
-            inj_away = team_offense_multiplier(inj_df, away) if not inj_df.empty else 1.0
-
-            # defense factors (opponent defense affects this side's mean)
-            def_vs_home = DEF_FACTORS.get(away_code, 1.0)
-            def_vs_away = DEF_FACTORS.get(home_code, 1.0)
-
-            mu_h_adj = max(EPS, mu_h * inj_home * def_vs_home)
-            mu_a_adj = max(EPS, mu_a * inj_away * def_vs_away)
-
-            pH, pA, mH, mA = _poisson_sim(mu_h_adj, mu_a_adj)
-
+            pH, pA, mH, mA = _poisson_sim(mu_h, mu_a)
             st.markdown(
                 f"**{home}** vs **{away}** — "
                 f"Expected points: {mH:.1f}–{mA:.1f} · "
                 f"P({home} win) = **{100*pH:.1f}%**, P({away} win) = **{100*pA:.1f}%**"
             )
-            with st.expander("Adjustments used"):
-                st.write({
-                    "home_off_injury_mult": round(inj_home, 3),
-                    "away_off_injury_mult": round(inj_away, 3),
-                    "def_factor_vs_home_off": round(def_vs_home, 3),
-                    "def_factor_vs_away_off": round(def_vs_away, 3),
-                })
         except Exception as e:
             st.error(str(e))
 
@@ -614,10 +550,14 @@ elif page == "MLB":
 
 
 # -------------------------- Player Props page --------------------------
-else:
-    st.subheader("🎯 Player Props — upload your CSVs")
+elif page == "Player Props":
+    st.subheader("🎯 Player Props — drop in your CSVs")
 
-    # Player CSVs
+    # Build defense factors from embedded CSV (or fallback)
+    DEF_FACTOR_2025, DEF_EPA_USED, DEF_SOURCE = load_embedded_defense()
+    st.caption(f"Defense source in use: **{DEF_SOURCE}**")
+
+    # Player CSV uploads
     c1, c2, c3 = st.columns(3)
     with c1:
         qb_up = st.file_uploader("QB CSV", type=["csv","xlsx"], key="qb")
@@ -626,22 +566,23 @@ else:
     with c3:
         wr_up = st.file_uploader("WR CSV", type=["csv","xlsx"], key="wr")
 
-    dfs: Dict[str, pd.DataFrame] = {}
-    if qb_up is not None: dfs["QB"] = _read_any_table(qb_up).copy()
-    if rb_up is not None: dfs["RB"] = _read_any_table(rb_up).copy()
-    if wr_up is not None: dfs["WR"] = _read_any_table(wr_up).copy()
+    def _read_any_table(up):
+        if up is None: return pd.DataFrame()
+        name = (up.name or "").lower()
+        if name.endswith(".csv"):
+            return pd.read_csv(up)
+        if name.endswith(".xlsx") or name.endswith(".xls"):
+            return pd.read_excel(up)
+        return pd.read_csv(up)
+
+    dfs = {}
+    if qb_up: dfs["QB"] = _read_any_table(qb_up).copy()
+    if rb_up: dfs["RB"] = _read_any_table(rb_up).copy()
+    if wr_up: dfs["WR"] = _read_any_table(wr_up).copy()
 
     if not dfs:
         st.info("Upload at least one of QB/RB/WR CSVs to begin.")
         st.stop()
-
-    # Optional injury file (player-level impact)
-    inj_up_props = st.file_uploader("Injury Report (optional) — CSV/XLSX", type=["csv","xlsx"], key="inj_props")
-    inj_df_props = parse_injury_file(inj_up_props) if inj_up_props else pd.DataFrame()
-
-    # Defense factors for props (opponent code input)
-    EPA_MAP = defense_text_to_epa_map(DEFENSE_CSV_TEXT)
-    DEF_FACTORS = build_def_factor_map(EPA_MAP)
 
     pos = st.selectbox("Market", ["QB","RB","WR"])
     df = dfs.get(pos, pd.DataFrame())
@@ -649,46 +590,29 @@ else:
         st.warning(f"No {pos} CSV uploaded yet.")
         st.stop()
 
-    # Find name + yardage columns
-    name_col = _player_col_guess(df)
-    yard_col = _yardage_col_guess(df, pos)
+    # Build "names only" options
+    name_col = _player_column_guess(df)
+    yard_col = _yardage_column_guess(df, pos)
+    name_series = df[name_col].astype(str)
+    player = st.selectbox("Player", sorted(name_series.unique().tolist()))
 
-    # Players list = clean names only
-    players = df[name_col].astype(str).str.strip().tolist()
-    player = st.selectbox("Player", players)
+    opp_in = st.text_input("Opponent team code (e.g., DAL, PHI). Aliases like KAN/NOR/GNB/SFO are OK.", value="")
+    opp = norm_team_code(opp_in)
 
-    # Opponent defense (code)
-    opp_code_in = st.text_input("Opponent team code (e.g., DAL, PHI). Aliases like KAN/NOR/GNB/SFO are OK.", value="")
-    opp_code = norm_code(opp_code_in)
-
-    # CSV mean from that row
-    row = df.loc[df[name_col].astype(str).str.strip() == player].head(1)
+    row = df.loc[name_series == player].head(1)
     csv_mean = float(pd.to_numeric(row[yard_col], errors="coerce").fillna(0).mean()) if not row.empty else 0.0
+    line = st.number_input("Yardage line", value=round(csv_mean or 0.0, 2), step=0.5)
 
-    # Default line = CSV mean
-    line = st.number_input("Yardage line", value=round(csv_mean, 1), step=0.5)
-
-    # SD by position
     est_sd = _estimate_sd(csv_mean, pos)
 
-    # Defense factor
-    def_factor = DEF_FACTORS.get(opp_code, 1.00) if opp_code else 1.00
-
-    # Player-level injury multiplier (match by name, any team)
-    inj_mult = 1.0
-    if not inj_df_props.empty:
-        match = inj_df_props.loc[inj_df_props["player"].str.lower() == player.lower()]
-        if not match.empty:
-            inj_mult = float(match.iloc[0]["mult"])
-
-    adj_mean = csv_mean * def_factor * inj_mult
+    def_factor = DEF_FACTOR_2025.get(opp, 1.00) if opp else 1.00
+    adj_mean = csv_mean * def_factor
     p_over, p_under = run_prop_sim(adj_mean, line, est_sd)
 
     st.success(
-        f"**{player} — {('Passing' if pos=='QB' else 'Rushing' if pos=='RB' else 'Receiving')} Yards**\n"
-        f"CSV mean: **{csv_mean:.1f}** · "
-        f"Defense factor ({opp_code or 'AVG'}): **×{def_factor:.3f}** · "
-        f"Injury: **×{inj_mult:.3f}** → Adjusted mean: **{adj_mean:.1f}**\n"
+        f"**{player} — {('Passing' if pos=='QB' else 'Rush' if pos=='RB' else 'Receiving')} Yards**  \n"
+        f"CSV mean: **{csv_mean:.1f}** · Defense factor ({opp or 'AVG'}): **×{def_factor:.3f}** → "
+        f"Adjusted mean: **{adj_mean:.1f}**  \n"
         f"Line: **{line:.1f}** → **P(over) = {100*p_over:.1f}%**, **P(under) = {100*p_under:.1f}%**"
     )
 
@@ -696,101 +620,52 @@ else:
         st.dataframe(row if not row.empty else df.head(5))
 
     with st.expander("Defense factors in use"):
-        st.dataframe(pd.DataFrame({
-            "TEAM": list(EPA_MAP.keys()),
-            "EPA/play": list(EPA_MAP.values()),
-            "DEF_FACTOR": [DEF_FACTORS[k] for k in EPA_MAP.keys()],
-        }).sort_values("DEF_FACTOR").reset_index(drop=True))
+        if DEF_EPA_USED:
+            ff = build_def_factor_map(DEF_EPA_USED)
+            show = pd.DataFrame({
+                "TEAM": list(DEF_EPA_USED.keys()),
+                "EPA/play": list(DEF_EPA_USED.values()),
+                "DEF_FACTOR": [ff[k] for k in DEF_EPA_USED.keys()],
+            }).sort_values("DEF_FACTOR")
+            st.dataframe(show.reset_index(drop=True))
+        else:
+            st.write("No defense table parsed; using fallback.")
 
-    if not inj_df_props.empty:
-        with st.expander("Parsed injury report (props)"):
-            st.dataframe(inj_df_props)
-        # ===== CFB (college football) helpers =========================================
-import os
-import requests
 
-def _cfbd_key():
-    # Try Streamlit secret first; fallback to env; else None
-    key = None
-    try:
-        key = st.secrets.get("CFBD_API_KEY")
-    except Exception:
-        pass
-    return key or os.environ.get("CFBD_API_KEY")
+# -------------------------- CFB page --------------------------
+else:  # "CFB"
+    st.subheader("🏈 College Football — this season (PF/PA model)")
+    yr_default = date.today().year
+    year = st.number_input("Season", value=yr_default, step=1)
 
-@st.cache_data(show_spinner=False)
-def cfb_games_df(year: int) -> pd.DataFrame:
-    """
-    Pull *all* games for the season from CFBD and return a clean DataFrame.
-    Works with either the official 'cfbd' client or plain requests.
-    """
+    # API key handling
     key = _cfbd_key()
-    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    if not key:
+        key = st.text_input("Paste your CFBD API key (one time)", type="password")
+        if key:
+            st.info("Thanks! (Tip: add CFBD_API_KEY to Streamlit Secrets to skip this step.)")
 
-    # Raw HTTP fallback (robust across cfbd client versions)
-    url = f"https://api.collegefootballdata.com/games?year={year}&seasonType=regular"
-    r = requests.get(url, headers=headers, timeout=30)
-    r.raise_for_status()
-    data = r.json()
+    try:
+        rates = cfb_team_rates(int(year))
+    except Exception as e:
+        st.error(f"Could not load CFB data: {e}")
+        st.stop()
 
-    if not data:
-        return pd.DataFrame(columns=["season","week","homeTeam","homePoints","awayTeam","awayPoints","completed","startDate"])
+    if rates.empty:
+        st.info("No completed games yet. Once there are results, PF/PA will populate.")
+        st.stop()
 
-    df = pd.DataFrame(data)
-    # Ensure columns exist
-    for c in ["season","week","homeTeam","homePoints","awayTeam","awayPoints","startDate","completed"]:
-        if c not in df.columns:
-            df[c] = None
+    home = st.selectbox("Home team", sorted(rates["team"].unique().tolist()))
+    away = st.selectbox("Away team", sorted([t for t in rates["team"].unique().tolist() if t != home]))
 
-    # completed flag: some payloads use 'completed', else infer from points present
-    if df["completed"].isna().all():
-        df["completed"] = df["homePoints"].notna() & df["awayPoints"].notna()
+    mu_h, mu_a = cfb_matchup_mu(rates, home, away)
+    pH, pA, mH, mA = _poisson_sim(mu_h, mu_a)
 
-    return df
-
-@st.cache_data(show_spinner=False)
-def cfb_team_rates(year: int) -> pd.DataFrame:
-    """
-    Compute PF/PA per game from completed games (regular season only).
-    """
-    g = cfb_games_df(year)
-    done = g[g["completed"] == True].copy()
-    if done.empty:
-        return pd.DataFrame(columns=["team","PF_pg","PA_pg"])
-
-    # build long form (home rows + away rows)
-    home = done.rename(columns={"homeTeam":"team", "awayTeam":"opp", "homePoints":"pf", "awayPoints":"pa"})[["team","opp","pf","pa"]]
-    away = done.rename(columns={"awayTeam":"team", "homeTeam":"opp", "awayPoints":"pf", "homePoints":"pa"})[["team","opp","pf","pa"]]
-    long = pd.concat([home, away], ignore_index=True)
-    long = long.dropna(subset=["pf","pa"])
-    long["pf"] = pd.to_numeric(long["pf"], errors="coerce")
-    long["pa"] = pd.to_numeric(long["pa"], errors="coerce")
-    long = long.dropna(subset=["pf","pa"])
-
-    team = long.groupby("team", as_index=False).agg(
-        games=("pf","size"), PF=("pf","sum"), PA=("pa","sum")
+    st.markdown(
+        f"**{home}** vs **{away}** — "
+        f"Expected points: {mH:.1f}–{mA:.1f} · "
+        f"P({home} win) = **{100*pH:.1f}%**, P({away} win) = **{100*pA:.1f}%**"
     )
-    rates = pd.DataFrame({
-        "team": team["team"],
-        "PF_pg": team["PF"] / team["games"],
-        "PA_pg": team["PA"] / team["games"],
-    })
 
-    # Small early-season shrink toward league average
-    league_total = float((long["pf"] + long["pa"]).mean())
-    prior = league_total / 2.0
-    shrink = np.clip(1.0 - team["games"]/4.0, 0.0, 1.0)
-    rates["PF_pg"] = (1 - shrink) * rates["PF_pg"] + shrink * prior
-    rates["PA_pg"] = (1 - shrink) * rates["PA_pg"] + shrink * prior
-    return rates
-
-def cfb_matchup_mu(rates: pd.DataFrame, home: str, away: str) -> Tuple[float,float]:
-    rH = rates.loc[rates["team"].str.lower() == home.lower()]
-    rA = rates.loc[rates["team"].str.lower() == away.lower()]
-    if rH.empty or rA.empty:
-        raise ValueError(f"Unknown CFB teams: {home}, {away}")
-    H, A = rH.iloc[0], rA.iloc[0]
-    # No explicit home-field baked yet; you can add a small bump if you like
-    mu_home = max(EPS, (H["PF_pg"] + A["PA_pg"]) / 2.0)
-    mu_away = max(EPS, (A["PF_pg"] + H["PA_pg"]) / 2.0)
-    return mu_home, mu_away
+    with st.expander("Team PF/PA per game (this season)"):
+        st.dataframe(rates.sort_values("team").reset_index(drop=True))
