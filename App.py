@@ -705,3 +705,92 @@ else:
     if not inj_df_props.empty:
         with st.expander("Parsed injury report (props)"):
             st.dataframe(inj_df_props)
+        # ===== CFB (college football) helpers =========================================
+import os
+import requests
+
+def _cfbd_key():
+    # Try Streamlit secret first; fallback to env; else None
+    key = None
+    try:
+        key = st.secrets.get("CFBD_API_KEY")
+    except Exception:
+        pass
+    return key or os.environ.get("CFBD_API_KEY")
+
+@st.cache_data(show_spinner=False)
+def cfb_games_df(year: int) -> pd.DataFrame:
+    """
+    Pull *all* games for the season from CFBD and return a clean DataFrame.
+    Works with either the official 'cfbd' client or plain requests.
+    """
+    key = _cfbd_key()
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+
+    # Raw HTTP fallback (robust across cfbd client versions)
+    url = f"https://api.collegefootballdata.com/games?year={year}&seasonType=regular"
+    r = requests.get(url, headers=headers, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+
+    if not data:
+        return pd.DataFrame(columns=["season","week","homeTeam","homePoints","awayTeam","awayPoints","completed","startDate"])
+
+    df = pd.DataFrame(data)
+    # Ensure columns exist
+    for c in ["season","week","homeTeam","homePoints","awayTeam","awayPoints","startDate","completed"]:
+        if c not in df.columns:
+            df[c] = None
+
+    # completed flag: some payloads use 'completed', else infer from points present
+    if df["completed"].isna().all():
+        df["completed"] = df["homePoints"].notna() & df["awayPoints"].notna()
+
+    return df
+
+@st.cache_data(show_spinner=False)
+def cfb_team_rates(year: int) -> pd.DataFrame:
+    """
+    Compute PF/PA per game from completed games (regular season only).
+    """
+    g = cfb_games_df(year)
+    done = g[g["completed"] == True].copy()
+    if done.empty:
+        return pd.DataFrame(columns=["team","PF_pg","PA_pg"])
+
+    # build long form (home rows + away rows)
+    home = done.rename(columns={"homeTeam":"team", "awayTeam":"opp", "homePoints":"pf", "awayPoints":"pa"})[["team","opp","pf","pa"]]
+    away = done.rename(columns={"awayTeam":"team", "homeTeam":"opp", "awayPoints":"pf", "homePoints":"pa"})[["team","opp","pf","pa"]]
+    long = pd.concat([home, away], ignore_index=True)
+    long = long.dropna(subset=["pf","pa"])
+    long["pf"] = pd.to_numeric(long["pf"], errors="coerce")
+    long["pa"] = pd.to_numeric(long["pa"], errors="coerce")
+    long = long.dropna(subset=["pf","pa"])
+
+    team = long.groupby("team", as_index=False).agg(
+        games=("pf","size"), PF=("pf","sum"), PA=("pa","sum")
+    )
+    rates = pd.DataFrame({
+        "team": team["team"],
+        "PF_pg": team["PF"] / team["games"],
+        "PA_pg": team["PA"] / team["games"],
+    })
+
+    # Small early-season shrink toward league average
+    league_total = float((long["pf"] + long["pa"]).mean())
+    prior = league_total / 2.0
+    shrink = np.clip(1.0 - team["games"]/4.0, 0.0, 1.0)
+    rates["PF_pg"] = (1 - shrink) * rates["PF_pg"] + shrink * prior
+    rates["PA_pg"] = (1 - shrink) * rates["PA_pg"] + shrink * prior
+    return rates
+
+def cfb_matchup_mu(rates: pd.DataFrame, home: str, away: str) -> Tuple[float,float]:
+    rH = rates.loc[rates["team"].str.lower() == home.lower()]
+    rA = rates.loc[rates["team"].str.lower() == away.lower()]
+    if rH.empty or rA.empty:
+        raise ValueError(f"Unknown CFB teams: {home}, {away}")
+    H, A = rH.iloc[0], rA.iloc[0]
+    # No explicit home-field baked yet; you can add a small bump if you like
+    mu_home = max(EPS, (H["PF_pg"] + A["PA_pg"]) / 2.0)
+    mu_away = max(EPS, (A["PF_pg"] + H["PA_pg"]) / 2.0)
+    return mu_home, mu_away
