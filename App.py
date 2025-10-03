@@ -1,109 +1,73 @@
-# app.py — NFL + MLB + Player Props (with embedded defense) + College Football
-# - NFL & MLB pages unchanged in spirit (PF/PA & RS/RA → Poisson sim)
-# - Player Props: upload QB/RB/WR CSVs, select player (names only), set line
-# - Defense: EMBEDDED CSV is parsed into opponent multipliers (fallback provided)
-# - CFB: pulls this season's games from CFBD (PF/PA → Poisson sim)
+# app.py — NFL + MLB + College Football Predictor (2025, stats-only) + Player Props
+# - NFL/MLB pages: unchanged Poisson sim using 2025 team scoring rates.
+# - Player Props: upload QB/RB/WR CSVs; opponent defense strength is embedded below.
+# - College Football: upload a CSV with offense/defense PPG; sim runs from that.
+#
+# CSV formats the app can tolerate are flexible (columns are auto-detected).
 
 from __future__ import annotations
 import io
-import os
 import math
-from datetime import date
 from typing import Optional, Tuple, Dict
 
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
 
-# ---- NFL team pages ----
+# ---- NFL (team pages) ----
 import nfl_data_py as nfl
 
 # ---- MLB team records (BR) ----
 from pybaseball import schedule_and_record
 
-
-# ======================= PASTE YOUR DEFENSE CSV HERE ==========================
-# Acceptable headers include something like:
+# ==============================================================================
+# EMBED YOUR DEFENSE CSV HERE (EPA/play by team). If left as-is, we fall back
+# to the last embedded EPA table.
+#
+# Examples of acceptable headers:
 #   Team,EPA/PLAY
 #   TEAM,epa_play
 #   team_code,epa
 #
-# Replace ONLY the "..." content with your full CSV text (including header row).
-# If left blank or unparsable, the fallback table below is used.
-
+# Paste the WHOLE CSV (including header) between the triple quotes.
+# ==============================================================================
 DEFENSE_CSV_TEXT = """\
 Team,EPA/PLAY
-# Team	Season	EPA/Play	Total EPA	Success %	EPA/Pass	EPA/Rush	Pass Yards	Comp %	Pass TD	Rush Yards	Rush TD	ADoT	Sack %	Scramble %	Int %
-2025	-0.17	-38.71	0.4174	-0.37	0.06	685	0.6762	3	521	4	5.8	0.0813	0.065	0.0163
-Minnesota Vikings
-2025	-0.13	-33.41	0.379	-0.17	-0.05	984	0.5962	7	331	1	8.15	0.0409	0.0468	0.0526
-Jacksonville Jaguars
-2025	-0.11	-26.37	0.3796	-0.1	-0.12	853	0.5746	2	397	2	9.94	0.0974	0.0325	0.0065
-Denver Broncos
-2025	-0.11	-25.57	0.3667	-0.17	0.01	710	0.5938	3	445	3	7.69	0.0823	0.1076	0.019
-Los Angeles Chargers
-2025	-0.09	-21.51	0.3783	0	-0.22	894	0.6271	7	376	4	10.44	0.1	0.0571	0.0214
-Detroit Lions
-2025	-0.08	-20.49	0.4291	-0.11	-0.04	860	0.5693	5	504	3	8.43	0.0329	0.0658	0.0197
-Philadelphia Eagles
-2025	-0.08	-19.59	0.4149	-0.16	0.04	790	0.5714	3	409	4	8.3	0.0733	0.04	0.0133
-Houston Texans
-2025	-0.08	-18.57	0.4042	-0.12	0	851	0.664	5	394	2	8.12	0.0952	0.0544	0.0204
-Los Angeles Rams
-2025	-0.07	-18.65	0.4075	0	-0.19	910	0.6645	6	359	0	7.03	0.069	0.0575	0.0402
-Seattle Seahawks
-2025	-0.06	-14.94	0.4344	-0.09	-0.03	690	0.6829	5	462	2	7.02	0.0368	0.0588	0
-San Francisco 49ers
-2025	-0.06	-13.91	0.4202	-0.02	-0.11	832	0.6429	6	340	3	6.54	0.0645	0.1226	0.0065
-Tampa Bay Buccaneers
-2025	-0.05	-11.24	0.4279	-0.13	0.05	602	0.5769	5	436	2	10.08	0.0806	0.0806	0.0242
-Atlanta Falcons
-2025	-0.05	-10.73	0.379	0.06	-0.17	689	0.6442	8	281	2	7.95	0.0924	0.0336	0.0168
-Cleveland Browns
-2025	-0.05	-11.02	0.4638	-0.04	-0.05	946	0.6643	8	384	2	6.69	0.0633	0.0506	0.0253
-Indianapolis Colts
-2025	-0.02	-3.64	0.4487	-0.09	0.09	778	0.6694	4	508	4	8.27	0.0694	0.0903	0.0208
-Kansas City Chiefs
-2025	-0.01	-2.38	0.4559	0.06	-0.14	1068	0.6369	5	384	2	8.06	0.0444	0.0222	0.0111
-Arizona Cardinals
-2025	-0.01	-1.85	0.4315	0.14	-0.22	948	0.6565	5	411	4	7.98	0.0544	0.0544	0.0136
-Las Vegas Raiders
-2025	0	0.2	0.4094	0.03	-0.07	886	0.6815	6	310	3	6.87	0.0632	0.0345	0.0115
-Green Bay Packers
-2025	0	0.89	0.4912	0.01	0	886	0.7368	10	658	4	6.75	0.0407	0.0325	0.0569
-Chicago Bears
-2025	0.02	3.33	0.4208	-0.06	0.1	564	0.6214	6	657	5	6.87	0.0732	0.0894	0.0163
-Buffalo Bills
-2025	0.04	9.13	0.4133	0.03	0.05	802	0.6239	4	517	5	7.5	0.0155	0.0775	0.031
-Carolina Panthers
-2025	0.04	11.09	0.461	0.11	-0.05	1131	0.6957	7	488	4	7.6	0.087	0.0559	0.0311
-Pittsburgh Steelers
-2025	0.04	10.44	0.4183	0.18	-0.12	1062	0.6098	7	430	3	10.83	0.0714	0.05	0.0071
-Washington Commanders
-2025	0.05	12.43	0.4693	0.19	-0.15	1024	0.712	7	310	2	7.68	0.0725	0.0217	0.0217
-New England Patriots
-2025	0.07	18.22	0.4613	-0.01	0.19	1021	0.6375	5	612	6	7.88	0.0562	0.0449	0.0169
-New York Giants
-2025	0.07	17.94	0.4417	0.2	-0.06	884	0.7117	9	475	4	7.4	0.0853	0.0543	0.0078
-New Orleans Saints
-2025	0.1	27.12	0.4731	0.13	0.04	1089	0.6536	8	543	5	6.99	0.0366	0.0305	0.0305
-Cincinnati Bengals
-2025	0.11	25.77	0.3959	0.23	-0.03	834	0.6577	7	522	4	6.11	0.0476	0.0714	0
-New York Jets
-2025	0.12	30.47	0.4435	0.16	0.07	935	0.6984	6	566	7	6.82	0.0294	0.0441	0.0221
-Tennessee Titans
-2025	0.14	39.54	0.4685	0.14	0.12	1084	0.6667	9	565	7	8.04	0.0233	0.0523	0.0058
-Baltimore Ravens
-2025	0.25	65.26	0.4943	0.4	0.06	1237	0.7333	10	493	6	9.19	0.034	0.0476	0.0068
-Dallas Cowboys
-2025	0.25	59.66	0.5397	0.34	0.12	941	0.7757	7	632	5	6.15	0.0615	0.1154	0
-Miami Dolphins
+Minnesota Vikings,-0.27
+Jacksonville Jaguars,-0.15
+Green Bay Packers,-0.13
+San Francisco 49ers,-0.11
+Atlanta Falcons,-0.10
+Indianapolis Colts,-0.08
+Los Angeles Chargers,-0.08
+Denver Broncos,-0.08
+Los Angeles Rams,-0.07
+Seattle Seahawks,-0.07
+Philadelphia Eagles,-0.06
+Tampa Bay Buccaneers,-0.05
+Carolina Panthers,-0.05
+Arizona Cardinals,-0.03
+Cleveland Browns,-0.02
+Washington Commanders,-0.02
+Houston Texans,0.00
+Kansas City Chiefs,0.01
+Detroit Lions,0.01
+Las Vegas Raiders,0.03
+Pittsburgh Steelers,0.05
+Cincinnati Bengals,0.05
+New Orleans Saints,0.05
+Buffalo Bills,0.05
+Chicago Bears,0.06
+New England Patriots,0.09
+New York Jets,0.10
+Tennessee Titans,0.11
+Baltimore Ravens,0.11
+New York Giants,0.13
+Dallas Cowboys,0.21
+Miami Dolphins,0.28
 """
 
-
-# ============================== FALLBACK TABLE =================================
-# Used only if the embedded CSV above is empty/unparsable. Values are EPA/play.
+# Fallback (used only if DEFENSE_CSV_TEXT is empty or unparsable)
 DEF_EPA_2025_FALLBACK = {
     "MIN": -0.27, "JAX": -0.15, "GB": -0.13, "SF": -0.11, "ATL": -0.10,
     "IND": -0.08, "LAC": -0.08, "DEN": -0.08, "LAR": -0.07, "SEA": -0.07,
@@ -114,7 +78,7 @@ DEF_EPA_2025_FALLBACK = {
     "DAL": 0.21, "MIA": 0.28,
 }
 
-# Accept aliases and map to standard keys for defense/opponent input.
+# Accept lots of alias codes and map to our keys above.
 ALIAS_TO_STD = {
     # PFR-style
     "GNB": "GB", "SFO": "SF", "KAN": "KC", "NWE": "NE", "NOR": "NO", "TAM": "TB",
@@ -122,10 +86,10 @@ ALIAS_TO_STD = {
     # common alternates
     "JAC": "JAX", "WSH": "WAS", "LA": "LAR", "OAK": "LV",
 }
+
 def norm_team_code(code: str) -> str:
     c = (code or "").strip().upper()
     return ALIAS_TO_STD.get(c, c)
-
 
 # ----------------------------- constants --------------------------------------
 SIM_TRIALS = 10000
@@ -146,7 +110,6 @@ MLB_TEAMS_2025: Dict[str, str] = {
     "TEX": "Texas Rangers","TOR": "Toronto Blue Jays","WSN": "Washington Nationals",
 }
 
-
 # -------------------------- generic helpers -----------------------------------
 def _poisson_sim(mu_home: float, mu_away: float, trials: int = SIM_TRIALS):
     mu_home = max(0.1, float(mu_home))
@@ -160,53 +123,29 @@ def _poisson_sim(mu_home: float, mu_away: float, trials: int = SIM_TRIALS):
     p_home = float(wins_home.mean())
     return p_home, 1.0 - p_home, float(h.mean()), float(a.mean())
 
-
 # ---------------------- Defense loading + factor map --------------------------
 def build_def_factor_map(epa_map: Dict[str, float]) -> Dict[str, float]:
     """
-    Convert EPA/play (lower = tougher defense) to a multiplicative factor (~0.85..1.15).
-    We z-score each team, clamp to ±2σ, and map via 1 + z*0.075.
-    Lower EPA → negative z → factor < 1 (harder matchup).
+    Convert EPA/play (lower = tougher) to a multiplicative factor (~0.85..1.15).
     """
     if not epa_map:
         return {}
     series = pd.Series(epa_map, dtype=float)
     mu, sd = float(series.mean()), float(series.std(ddof=0) or 1.0)
     z = (series - mu) / (sd if sd > 1e-9 else 1.0)
+    # Lower EPA (better D) => lower factor; clamp ±2σ → 0.85..1.15
     factors = 1.0 + np.clip(z, -2.0, 2.0) * 0.075
     return {k: float(v) for k, v in factors.items()}
 
 def _def_epa_from_df(df: pd.DataFrame) -> Dict[str, float]:
     """
-    Try to extract {TEAM_CODE: epa_per_play} from messy CSV.
-    Accepts columns like: Team / TEAM / team_code AND EPA/PLAY / epa_play / epa.
-    Also handles two-line-per-team "value, Team Name" patterns by forward filling.
+    Extract {TEAM_CODE: epa_per_play} from arbitrary CSV/XLSX.
+    Accept columns like: Team / TEAM / team_code AND EPA/PLAY / epa_play / epa.
     """
     if df.empty:
         return {}
-
-    # If your CSV is in two-line pairs (value row followed by team name row),
-    # try to reshape: detect numeric-only lines vs text-only lines.
-    if df.shape[1] == 1:
-        col = df.columns[0]
-        vals = []
-        teams = []
-        last_val = None
-        for x in df[col].astype(str):
-            xs = x.strip()
-            # crude: if it parses as float, treat as EPA; else treat as team name
-            try:
-                last_val = float(xs)
-            except Exception:
-                if xs and last_val is not None:
-                    teams.append(xs)
-                    vals.append(last_val)
-                    last_val = None
-        if teams and vals and len(teams) == len(vals):
-            return {norm_team_code(t): float(v) for t, v in zip(teams, vals)}
-
-    # Normal header-based parse
     cols_low = {str(c).strip().lower(): c for c in df.columns}
+
     team_candidates = ["team", "team_code", "def_team", "abbr", "tm", "defense", "opponent", "opp", "code"]
     epa_candidates  = ["epa/play", "epa per play", "epa_play", "def_epa", "def epa", "epa"]
 
@@ -241,20 +180,16 @@ def load_embedded_defense() -> Tuple[Dict[str,float], Dict[str,float], str]:
     Returns: (def_factor_map, def_epa_map_used, source_label)
     """
     text = (DEFENSE_CSV_TEXT or "").strip()
-    # If the user left the template header, skip parse and use fallback
-    if not text or text.startswith("Team,EPA/PLAY\n# PASTE"):
-        return build_def_factor_map(DEF_EPA_2025_FALLBACK), DEF_EPA_2025_FALLBACK, "Embedded fallback"
-
-    try:
-        df = pd.read_csv(io.StringIO(text))
-        epa_map = _def_epa_from_df(df)
-        if epa_map:
-            return build_def_factor_map(epa_map), epa_map, "Embedded CSV (in script)"
-    except Exception:
-        pass
-
+    if text:
+        try:
+            df = pd.read_csv(io.StringIO(text))
+            epa_map = _def_epa_from_df(df)
+            if epa_map:
+                return build_def_factor_map(epa_map), epa_map, "Embedded CSV (in script)"
+        except Exception:
+            pass
+    # fallback
     return build_def_factor_map(DEF_EPA_2025_FALLBACK), DEF_EPA_2025_FALLBACK, "Embedded fallback"
-
 
 # ==============================================================================
 # NFL (2025) — team PF/PA + upcoming matchups (simple UI)
@@ -331,7 +266,6 @@ def nfl_matchup_mu(rates: pd.DataFrame, home: str, away: str) -> Tuple[float,flo
     mu_away = max(EPS, (A["PF_pg"] + H["PA_pg"])/2.0)
     return mu_home, mu_away
 
-
 # ==============================================================================
 # MLB (2025) — team RS/RA from BR
 # ==============================================================================
@@ -362,63 +296,92 @@ def mlb_team_rates_2025() -> pd.DataFrame:
         df["RA_pg"] = 0.9 * df["RA_pg"] + 0.1 * league_ra
     return df
 
+# ==============================================================================
+# Player Props — CSVs + embedded defense
+# ==============================================================================
+def _yardage_column_guess(df: pd.DataFrame, pos: str) -> str:
+    prefer = ["Y/G","Yds/G","YDS/G","Yards/G","PY/G","RY/G","Rec Y/G",
+              "Yds","Yards","yds","yards"]
+    low = [c.lower() for c in df.columns]
+    for wanted in [p.lower() for p in prefer]:
+        if wanted in low:
+            return df.columns[low.index(wanted)]
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            return c
+    return df.columns[-1]
+
+def _player_column_guess(df: pd.DataFrame) -> str:
+    # choose a "Player" or "Name" like column, otherwise the first text column
+    for c in df.columns:
+        if str(c).strip().lower() in ("player","name"):
+            return c
+    for c in df.columns:
+        if not pd.api.types.is_numeric_dtype(df[c]):
+            return c
+    return df.columns[0]
+
+def _estimate_sd(mean_val: float, pos: str) -> float:
+    mean_val = float(mean_val)
+    if pos == "QB": return max(35.0, 0.60 * mean_val)
+    if pos == "RB": return max(20.0, 0.75 * mean_val)
+    return max(22.0, 0.85 * mean_val)  # WR
+
+def run_prop_sim(mean_yards: float, line: float, sd: float) -> Tuple[float,float]:
+    sd = max(5.0, float(sd))
+    z = (line - mean_yards) / sd
+    p_over = float(1.0 - 0.5*(1.0 + math.erf(z / math.sqrt(2))))
+    return np.clip(p_over, 0.0, 1.0), np.clip(1.0 - p_over, 0.0, 1.0)
 
 # ==============================================================================
-# CFB (College Football) — this season PF/PA via CollegeFootballData
+# College Football helpers (CSV-based)
+# CSV should include team name plus offense_points_pg and defense_points_pg
+# Column names are flexible; we auto-detect numeric "offense" and "defense" PPG.
 # ==============================================================================
-# ---- College Football ----
-import cfbd
-from cfbd.rest import ApiException
-from pprint import pprint
+def cfb_autoguess_cols(df: pd.DataFrame) -> Tuple[str, str, str]:
+    # team column
+    team_col = None
+    for c in df.columns:
+        if str(c).strip().lower() in ("team","school","name","team_name"):
+            team_col = c; break
+    if team_col is None:
+        for c in df.columns:
+            if not pd.api.types.is_numeric_dtype(df[c]):
+                team_col = c; break
+        if team_col is None:
+            team_col = df.columns[0]
 
-def get_cfbd_client():
-    import streamlit as st
-    configuration = cfbd.Configuration()
-    configuration.api_key['Authorization'] = st.secrets["CFBD_API_KEY"]
-    configuration.api_key_prefix['Authorization'] = 'Bearer'
-    return cfbd.ApiClient(configuration)
+    low = {str(c).lower(): c for c in df.columns}
+    off_col = None
+    for k in ["offense_points_pg","off_ppg","pf_pg","points_per_game","points_for","offense ppg","offense p/g"]:
+        if k in low: off_col = low[k]; break
+    if off_col is None:
+        # fallback: the largest-mean numeric column
+        nums = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        off_col = max(nums, key=lambda c: float(pd.to_numeric(df[c], errors="coerce").mean())) if nums else df.columns[-1]
 
-@st.cache_data(show_spinner=False)
-def cfbd_team_stats(year: int = 2025):
-    client = get_cfbd_client()
-    stats_api = cfbd.StatsApi(client)
-    try:
-        stats = stats_api.get_team_season_stats(year=year)
-        rows = []
-        for team in stats:
-            rows.append({
-                "team": team.team,
-                "offense_points_pg": team.offense.points_per_game if team.offense else None,
-                "defense_points_pg": team.defense.points_per_game if team.defense else None
-            })
-        return pd.DataFrame(rows)
-    except ApiException as e:
-        st.error(f"Exception when calling CFBD API: {e}")
-        return pd.DataFrame()
+    def_col = None
+    for k in ["defense_points_pg","def_ppg","pa_pg","points_allowed_pg","points_allowed","defense ppg","defense p/g","opp_points_pg"]:
+        if k in low: def_col = low[k]; break
+    if def_col is None:
+        # fallback: second best numeric column
+        nums = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c != off_col]
+        def_col = max(nums, key=lambda c: float(pd.to_numeric(df[c], errors="coerce").mean())) if nums else off_col
 
-# ------------------- COLLEGE FOOTBALL PAGE -------------------
-elif page == "College Football":
-    st.subheader("🏈 College Football — 2025 Season")
-    df = cfbd_team_stats(year=2025)
-    if df.empty:
-        st.warning("No CFBD data returned.")
-        st.stop()
+    return team_col, off_col, def_col
 
-    t1 = st.selectbox("Team 1", df["team"].tolist())
-    t2 = st.selectbox("Team 2", [t for t in df["team"].tolist() if t != t1])
+# ==============================================================================
+# UI
+# ==============================================================================
+st.set_page_config(page_title="NFL + MLB + CFB Predictor — 2025 (stats only)", layout="wide")
+st.title("🏈⚾🏈 NFL + MLB + College Football — 2025 (stats only)")
+st.caption(
+    "Team pages use **2025 scoring rates only** (NFL: PF/PA; MLB: RS/RA; CFB: upload CSV with Off/Def PPG). "
+    "Player Props: upload your QB/RB/WR CSVs, pick a player, set a line. "
+    "Defense is **embedded** in this script (EPA/play)."
+)
 
-    H = df.loc[df["team"] == t1].iloc[0]
-    A = df.loc[df["team"] == t2].iloc[0]
-
-    mu_home = (H["offense_points_pg"] + A["defense_points_pg"]) / 2.0
-    mu_away = (A["offense_points_pg"] + H["defense_points_pg"]) / 2.0
-
-    pH, pA, mH, mA = _poisson_sim(mu_home, mu_away)
-    st.markdown(
-        f"**{t1}** vs **{t2}** — "
-        f"Expected points: {mH:.1f}–{mA:.1f} · "
-        f"P({t1} win) = **{100*pH:.1f}%**, P({t2} win) = **{100*pA:.1f}%**"
-    )
+page = st.radio("Pick a page", ["NFL", "MLB", "College Football", "Player Props"], horizontal=True)
 
 # -------------------------- NFL page --------------------------
 if page == "NFL":
@@ -453,7 +416,6 @@ if page == "NFL":
         except Exception as e:
             st.error(str(e))
 
-
 # -------------------------- MLB page --------------------------
 elif page == "MLB":
     st.subheader("⚾ MLB — 2025 REG season (team scoring rates only)")
@@ -476,6 +438,54 @@ elif page == "MLB":
         f"P({t1} win) = **{100*pH:.1f}%**, P({t2} win) = **{100*pA:.1f}%**"
     )
 
+# ------------------- COLLEGE FOOTBALL PAGE (CSV-based) -------------------
+elif page == "College Football":
+    st.subheader("🏈 College Football — 2025 (upload Off/Def PPG CSV)")
+
+    cfb_up = st.file_uploader(
+        "Upload a CSV for CFB teams (must include team name and offense/defense PPG columns).",
+        type=["csv","xlsx"]
+    )
+    if not cfb_up:
+        st.info(
+            "No CSV uploaded yet. Expected columns (names are flexible):\n"
+            "- Team\n- Offense points per game (e.g., off_ppg, offense_points_pg)\n"
+            "- Defense points per game (e.g., def_ppg, defense_points_pg)\n"
+        )
+        st.stop()
+
+    if cfb_up.name.lower().endswith((".xlsx",".xls")):
+        cfb_df = pd.read_excel(cfb_up)
+    else:
+        cfb_df = pd.read_csv(cfb_up)
+
+    if cfb_df.empty:
+        st.error("Couldn't read any rows from that file.")
+        st.stop()
+
+    team_col, off_col, def_col = cfb_autoguess_cols(cfb_df)
+    # Clean numerics
+    cfb_df[off_col] = pd.to_numeric(cfb_df[off_col], errors="coerce")
+    cfb_df[def_col] = pd.to_numeric(cfb_df[def_col], errors="coerce")
+    cfb_df = cfb_df.dropna(subset=[team_col, off_col, def_col])
+
+    st.caption(f"Detected columns → Team: `{team_col}`, Offense PPG: `{off_col}`, Defense PPG: `{def_col}`")
+
+    t1 = st.selectbox("Team 1", cfb_df[team_col].astype(str).tolist())
+    t2 = st.selectbox("Team 2", [t for t in cfb_df[team_col].astype(str).tolist() if t != t1])
+
+    H = cfb_df.loc[cfb_df[team_col].astype(str) == t1].iloc[0]
+    A = cfb_df.loc[cfb_df[team_col].astype(str) == t2].iloc[0]
+
+    mu_home = (float(H[off_col]) + float(A[def_col])) / 2.0
+    mu_away = (float(A[off_col]) + float(H[def_col])) / 2.0
+
+    pH, pA, mH, mA = _poisson_sim(mu_home, mu_away)
+    st.markdown(
+        f"**{t1}** vs **{t2}** — "
+        f"Expected points: {mH:.1f}–{mA:.1f} · "
+        f"P({t1} win) = **{100*pH:.1f}%**, P({t2} win) = **{100*pA:.1f}%**"
+    )
 
 # -------------------------- Player Props page --------------------------
 elif page == "Player Props":
@@ -499,7 +509,7 @@ elif page == "Player Props":
         name = (up.name or "").lower()
         if name.endswith(".csv"):
             return pd.read_csv(up)
-        if name.endswith(".xlsx") or name.endswith(".xls"):
+        if name.endswith((".xlsx",".xls")):
             return pd.read_excel(up)
         return pd.read_csv(up)
 
@@ -518,17 +528,22 @@ elif page == "Player Props":
         st.warning(f"No {pos} CSV uploaded yet.")
         st.stop()
 
-    # Build "names only" options
+    # Clean up player dropdown to show just names
     name_col = _player_column_guess(df)
     yard_col = _yardage_column_guess(df, pos)
-    name_series = df[name_col].astype(str)
-    player = st.selectbox("Player", sorted(name_series.unique().tolist()))
+
+    # Try to coerce yardage numeric
+    df[yard_col] = pd.to_numeric(df[yard_col], errors="coerce")
+    df = df.dropna(subset=[name_col, yard_col])
+
+    players = df[name_col].astype(str).tolist()
+    player = st.selectbox("Player", players)
 
     opp_in = st.text_input("Opponent team code (e.g., DAL, PHI). Aliases like KAN/NOR/GNB/SFO are OK.", value="")
     opp = norm_team_code(opp_in)
 
-    row = df.loc[name_series == player].head(1)
-    csv_mean = float(pd.to_numeric(row[yard_col], errors="coerce").fillna(0).mean()) if not row.empty else 0.0
+    row = df.loc[df[name_col].astype(str)==player].head(1)
+    csv_mean = float(row[yard_col].mean()) if not row.empty else 0.0
     line = st.number_input("Yardage line", value=round(csv_mean or 0.0, 2), step=0.5)
 
     est_sd = _estimate_sd(csv_mean, pos)
@@ -549,51 +564,12 @@ elif page == "Player Props":
 
     with st.expander("Defense factors in use"):
         if DEF_EPA_USED:
-            ff = build_def_factor_map(DEF_EPA_USED)
+            factors = build_def_factor_map(DEF_EPA_USED)
             show = pd.DataFrame({
                 "TEAM": list(DEF_EPA_USED.keys()),
                 "EPA/play": list(DEF_EPA_USED.values()),
-                "DEF_FACTOR": [ff[k] for k in DEF_EPA_USED.keys()],
+                "DEF_FACTOR": [factors[k] for k in DEF_EPA_USED.keys()],
             }).sort_values("DEF_FACTOR")
             st.dataframe(show.reset_index(drop=True))
         else:
             st.write("No defense table parsed; using fallback.")
-
-
-# -------------------------- CFB page --------------------------
-else:  # "CFB"
-    st.subheader("🏈 College Football — this season (PF/PA model)")
-    yr_default = date.today().year
-    year = st.number_input("Season", value=yr_default, step=1)
-
-    # API key handling
-    key = _cfbd_key()
-    if not key:
-        key = st.text_input("Paste your CFBD API key (one time)", type="password")
-        if key:
-            st.info("Thanks! (Tip: add CFBD_API_KEY to Streamlit Secrets to skip this step.)")
-
-    try:
-        rates = cfb_team_rates(int(year))
-    except Exception as e:
-        st.error(f"Could not load CFB data: {e}")
-        st.stop()
-
-    if rates.empty:
-        st.info("No completed games yet. Once there are results, PF/PA will populate.")
-        st.stop()
-
-    home = st.selectbox("Home team", sorted(rates["team"].unique().tolist()))
-    away = st.selectbox("Away team", sorted([t for t in rates["team"].unique().tolist() if t != home]))
-
-    mu_h, mu_a = cfb_matchup_mu(rates, home, away)
-    pH, pA, mH, mA = _poisson_sim(mu_h, mu_a)
-
-    st.markdown(
-        f"**{home}** vs **{away}** — "
-        f"Expected points: {mH:.1f}–{mA:.1f} · "
-        f"P({home} win) = **{100*pH:.1f}%**, P({away} win) = **{100*pA:.1f}%**"
-    )
-
-    with st.expander("Team PF/PA per game (this season)"):
-        st.dataframe(rates.sort_values("team").reset_index(drop=True))
