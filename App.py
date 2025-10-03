@@ -366,131 +366,59 @@ def mlb_team_rates_2025() -> pd.DataFrame:
 # ==============================================================================
 # CFB (College Football) — this season PF/PA via CollegeFootballData
 # ==============================================================================
-def _cfbd_key():
-    # Try Streamlit secret first; fallback to env; else None
-    key = None
+# ---- College Football ----
+import cfbd
+from cfbd.rest import ApiException
+from pprint import pprint
+
+def get_cfbd_client():
+    import streamlit as st
+    configuration = cfbd.Configuration()
+    configuration.api_key['Authorization'] = st.secrets["CFBD_API_KEY"]
+    configuration.api_key_prefix['Authorization'] = 'Bearer'
+    return cfbd.ApiClient(configuration)
+
+@st.cache_data(show_spinner=False)
+def cfbd_team_stats(year: int = 2025):
+    client = get_cfbd_client()
+    stats_api = cfbd.StatsApi(client)
     try:
-        key = st.secrets.get("CFBD_API_KEY")
-    except Exception:
-        pass
-    return key or os.environ.get("CFBD_API_KEY")
+        stats = stats_api.get_team_season_stats(year=year)
+        rows = []
+        for team in stats:
+            rows.append({
+                "team": team.team,
+                "offense_points_pg": team.offense.points_per_game if team.offense else None,
+                "defense_points_pg": team.defense.points_per_game if team.defense else None
+            })
+        return pd.DataFrame(rows)
+    except ApiException as e:
+        st.error(f"Exception when calling CFBD API: {e}")
+        return pd.DataFrame()
 
-@st.cache_data(show_spinner=False)
-def cfb_games_df(year: int) -> pd.DataFrame:
-    """
-    Pull all regular-season games from CFBD and return a clean DataFrame.
-    Uses raw HTTP (robust across cfbd-client versions).
-    """
-    key = _cfbd_key()
-    headers = {"Authorization": f"Bearer {key}"} if key else {}
-    url = f"https://api.collegefootballdata.com/games?year={year}&seasonType=regular"
-    r = requests.get(url, headers=headers, timeout=30)
-    r.raise_for_status()
-    data = r.json() or []
-    if not data:
-        return pd.DataFrame(columns=["season","week","homeTeam","homePoints","awayTeam","awayPoints","completed","startDate"])
-    df = pd.DataFrame(data)
-    # Ensure columns exist
-    for c in ["season","week","homeTeam","homePoints","awayTeam","awayPoints","startDate","completed"]:
-        if c not in df.columns:
-            df[c] = None
-    if df["completed"].isna().all():
-        df["completed"] = df["homePoints"].notna() & df["awayPoints"].notna()
-    return df
+# ------------------- COLLEGE FOOTBALL PAGE -------------------
+elif page == "College Football":
+    st.subheader("🏈 College Football — 2025 Season")
+    df = cfbd_team_stats(year=2025)
+    if df.empty:
+        st.warning("No CFBD data returned.")
+        st.stop()
 
-@st.cache_data(show_spinner=False)
-def cfb_team_rates(year: int) -> pd.DataFrame:
-    """
-    Compute PF/PA per game from completed games (regular season only).
-    """
-    g = cfb_games_df(year)
-    done = g[g["completed"] == True].copy()
-    if done.empty:
-        return pd.DataFrame(columns=["team","PF_pg","PA_pg"])
+    t1 = st.selectbox("Team 1", df["team"].tolist())
+    t2 = st.selectbox("Team 2", [t for t in df["team"].tolist() if t != t1])
 
-    home = done.rename(columns={"homeTeam":"team", "awayTeam":"opp", "homePoints":"pf", "awayPoints":"pa"})[["team","opp","pf","pa"]]
-    away = done.rename(columns={"awayTeam":"team", "homeTeam":"opp", "awayPoints":"pf", "homePoints":"pa"})[["team","opp","pf","pa"]]
-    long = pd.concat([home, away], ignore_index=True).dropna(subset=["pf","pa"])
-    long["pf"] = pd.to_numeric(long["pf"], errors="coerce")
-    long["pa"] = pd.to_numeric(long["pa"], errors="coerce")
-    long = long.dropna(subset=["pf","pa"])
+    H = df.loc[df["team"] == t1].iloc[0]
+    A = df.loc[df["team"] == t2].iloc[0]
 
-    team = long.groupby("team", as_index=False).agg(
-        games=("pf","size"), PF=("pf","sum"), PA=("pa","sum")
+    mu_home = (H["offense_points_pg"] + A["defense_points_pg"]) / 2.0
+    mu_away = (A["offense_points_pg"] + H["defense_points_pg"]) / 2.0
+
+    pH, pA, mH, mA = _poisson_sim(mu_home, mu_away)
+    st.markdown(
+        f"**{t1}** vs **{t2}** — "
+        f"Expected points: {mH:.1f}–{mA:.1f} · "
+        f"P({t1} win) = **{100*pH:.1f}%**, P({t2} win) = **{100*pA:.1f}%**"
     )
-    rates = pd.DataFrame({
-        "team": team["team"],
-        "PF_pg": team["PF"] / team["games"],
-        "PA_pg": team["PA"] / team["games"],
-    })
-
-    # Small early-season shrink toward league average
-    league_total = float((long["pf"] + long["pa"]).mean())
-    prior = league_total / 2.0
-    shrink = np.clip(1.0 - team["games"]/4.0, 0.0, 1.0)
-    rates["PF_pg"] = (1 - shrink) * rates["PF_pg"] + shrink * prior
-    rates["PA_pg"] = (1 - shrink) * rates["PA_pg"] + shrink * prior
-    return rates
-
-def cfb_matchup_mu(rates: pd.DataFrame, home: str, away: str) -> Tuple[float,float]:
-    rH = rates.loc[rates["team"].str.lower() == home.lower()]
-    rA = rates.loc[rates["team"].str.lower() == away.lower()]
-    if rH.empty or rA.empty:
-        raise ValueError(f"Unknown CFB teams: {home}, {away}")
-    H, A = rH.iloc[0], rA.iloc[0]
-    mu_home = max(EPS, (H["PF_pg"] + A["PA_pg"]) / 2.0)
-    mu_away = max(EPS, (A["PF_pg"] + H["PA_pg"]) / 2.0)
-    return mu_home, mu_away
-
-
-# ==============================================================================
-# Player Props helpers
-# ==============================================================================
-def _yardage_column_guess(df: pd.DataFrame, pos: str) -> str:
-    prefer = ["Y/G","Yds/G","YDS/G","Yards/G","PY/G","RY/G","Rec Y/G",
-              "Yds","Yards","yds","yards"]
-    low = [c.lower() for c in df.columns]
-    for wanted in [p.lower() for p in prefer]:
-        if wanted in low:
-            return df.columns[low.index(wanted)]
-    for c in df.columns:
-        if pd.api.types.is_numeric_dtype(df[c]):
-            return c
-    return df.columns[-1]
-
-def _player_column_guess(df: pd.DataFrame) -> str:
-    for c in df.columns:
-        if str(c).lower() in ("player","name"):
-            return c
-    return df.columns[0]
-
-def _estimate_sd(mean_val: float, pos: str) -> float:
-    mean_val = float(mean_val)
-    if pos == "QB": return max(35.0, 0.60 * mean_val)
-    if pos == "RB": return max(20.0, 0.75 * mean_val)
-    return max(22.0, 0.85 * mean_val)  # WR
-
-def run_prop_sim(mean_yards: float, line: float, sd: float) -> Tuple[float,float]:
-    sd = max(5.0, float(sd))
-    z = (line - mean_yards) / sd
-    p_over = float(1.0 - 0.5*(1.0 + math.erf(z / math.sqrt(2))))
-    return np.clip(p_over, 0.0, 1.0), np.clip(1.0 - p_over, 0.0, 1.0)
-
-
-# ==============================================================================
-# UI
-# ==============================================================================
-st.set_page_config(page_title="All-in-One Predictor — NFL / MLB / Props / CFB", layout="wide")
-st.title("🏈⚾🎯🎓 All-in-One Predictor (2025) — NFL, MLB, Player Props, CFB")
-st.caption(
-    "NFL & MLB team pages: 2025 scoring rates only (PF/PA, RS/RA → Poisson sim).  \n"
-    "Player Props: upload your QB/RB/WR CSVs, pick a **player (name only)**, set a line; "
-    "opponent defense is built-in from your embedded EPA/play table.  \n"
-    "CFB: pulls this season’s games from CollegeFootballData (PF/PA → Poisson sim)."
-)
-
-page = st.radio("Pick a page", ["NFL", "MLB", "Player Props", "CFB"], horizontal=True)
-
 
 # -------------------------- NFL page --------------------------
 if page == "NFL":
