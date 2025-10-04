@@ -1,102 +1,114 @@
 import streamlit as st
+import requests
 import pandas as pd
 import numpy as np
-import requests
 
-st.set_page_config(page_title="🏈 College Football Predictor", layout="centered")
-st.title("🏈 College Football — 2025 (auto from CFBD)")
+st.set_page_config(page_title="College Football Predictor", layout="centered")
+st.title("🏈 College Football — Predictor (CFBD)")
 
-# --- API Key ---
-CFBD_API_KEY = st.secrets.get("CFBD_API_KEY", None)
+# --- Load API Key ---
+CFBD_API_KEY = st.secrets.get("CFBD_API_KEY")
 if not CFBD_API_KEY:
     st.error("⚠️ Missing CFBD API key in Streamlit secrets.")
     st.stop()
 
 headers = {"Authorization": f"Bearer {CFBD_API_KEY}"}
 
-# --- Pull team stats (using teams/season endpoint for reliability) ---
+# --- Fetch team stats via /teams/season, fallback logic ---
 @st.cache_data(ttl=3600)
-def get_cfb_team_stats(year=2024):
-    """Pulls team-level stats (points for/against per game)"""
-    url = f"https://api.collegefootballdata.com/teams/season?year={year}"
-    r = requests.get(url, headers=headers)
-
-    if r.status_code != 200:
-        st.error(f"❌ CFBD API error: {r.status_code}")
-        return pd.DataFrame()
-
-    try:
-        data = r.json()
-    except Exception as e:
-        st.error(f"JSON error: {e}")
-        return pd.DataFrame()
-
-    if not data:
-        st.warning("⚠️ No data returned for this year.")
-        return pd.DataFrame()
-
-    # Convert to DataFrame
-    teams = []
-    for team in data:
+def get_cfb_team_stats(season: int) -> pd.DataFrame:
+    """
+    Fetch team stats (points for / points against) from CFBD /teams/season.
+    If the chosen season returns no data, fallback to 2024.
+    """
+    def fetch(year):
+        url = f"https://api.collegefootballdata.com/teams/season?year={year}"
+        r = requests.get(url, headers=headers, timeout=30)
+        if r.status_code != 200:
+            return None
         try:
-            pts_for = team.get("pointsFor", 0)
-            pts_against = team.get("pointsAgainst", 0)
-            games = team.get("games", 1)
-            off_ppg = pts_for / games if games > 0 else 0
-            def_ppg = pts_against / games if games > 0 else 0
-            teams.append({
-                "team": team["team"]["school"],
-                "conference": team.get("conference", ""),
-                "off_ppg": round(off_ppg, 2),
-                "def_ppg": round(def_ppg, 2)
-            })
-        except Exception:
-            continue
+            return r.json()
+        except:
+            return None
 
-    df = pd.DataFrame(teams)
-    if df.empty:
-        st.error("❌ Could not extract scoring stats. Check CFBD API format.")
+    data = fetch(season)
+    used = season
+    if not data:
+        st.warning(f"No data for {season}, falling back to 2024.")
+        data = fetch(2024)
+        used = 2024
+    if not data:
+        st.error("No CFBD data available (even fallback).")
+        return pd.DataFrame()
+
+    rows = []
+    for team in data:
+        # team["team"] is dict with school & team info
+        school = team.get("team", {}).get("school") or team.get("team", "")
+        games = team.get("games", 0)
+        pts_for = team.get("pointsFor", 0)
+        pts_against = team.get("pointsAgainst", 0)
+        if games > 0:
+            off_ppg = pts_for / games
+            def_ppg = pts_against / games
+        else:
+            off_ppg = None
+            def_ppg = None
+        rows.append({
+            "team": school,
+            "off_ppg": off_ppg,
+            "def_ppg": def_ppg
+        })
+
+    df = pd.DataFrame(rows)
+    df = df.dropna(subset=["off_ppg", "def_ppg"])
     return df
 
-# --- Game simulation ---
-def simulate_game(home, away, df, sims=10000):
-    """Simulate a game using Poisson scoring model"""
+# --- Simulation logic ---
+def simulate_matchup(home: str, away: str, df: pd.DataFrame, trials: int = 10000):
     h = df[df["team"] == home].iloc[0]
     a = df[df["team"] == away].iloc[0]
 
-    home_exp = (h["off_ppg"] + a["def_ppg"]) / 2
-    away_exp = (a["off_ppg"] + h["def_ppg"]) / 2
+    mu_home = (h["off_ppg"] + a["def_ppg"]) / 2.0
+    mu_away = (a["off_ppg"] + h["def_ppg"]) / 2.0
 
-    home_scores = np.random.poisson(home_exp, sims)
-    away_scores = np.random.poisson(away_exp, sims)
+    # safety floor
+    mu_home = max(mu_home, 0.1)
+    mu_away = max(mu_away, 0.1)
 
-    home_win = np.mean(home_scores > away_scores) * 100
-    away_win = np.mean(away_scores > home_scores) * 100
+    home_scores = np.random.poisson(mu_home, trials)
+    away_scores = np.random.poisson(mu_away, trials)
 
-    return home_exp, away_exp, home_win, away_win
+    home_win = float((home_scores > away_scores).mean())
+    away_win = float((away_scores > home_scores).mean())
 
-# --- Streamlit UI ---
-year = st.number_input("Season", min_value=2023, max_value=2025, value=2024)
-st.info("Using CFBD `/teams/season` API to load real offensive & defensive stats per game.")
+    avg_home = float(home_scores.mean())
+    avg_away = float(away_scores.mean())
+
+    return avg_home, avg_away, home_win, away_win
+
+# --- UI ---
+st.subheader("Select Season & Teams")
+
+season = st.number_input("Season", min_value=2023, max_value=2025, value=2025, step=1)
 
 with st.spinner("Loading team stats..."):
-    df = get_cfb_team_stats(year)
+    df = get_cfb_team_stats(int(season))
 
 if df.empty:
     st.stop()
 
 teams = sorted(df["team"].unique())
-col1, col2 = st.columns(2)
-home_team = col1.selectbox("🏠 Home Team", teams)
-away_team = col2.selectbox("✈️ Away Team", teams)
+home = st.selectbox("Home team", teams)
+away = st.selectbox("Away team", [t for t in teams if t != home], index=0)
 
 if st.button("Run Simulation"):
-    home_exp, away_exp, home_win, away_win = simulate_game(home_team, away_team, df)
+    avg_h, avg_a, p_h, p_a = simulate_matchup(home, away, df)
     st.markdown(f"""
-    ## 🏈 {home_team} vs {away_team}
-    **Expected Points:** {home_team} {home_exp:.1f} — {away_team} {away_exp:.1f}  
-    **Win Probabilities:**  
-    - {home_team}: {home_win:.2f}%  
-    - {away_team}: {away_win:.2f}%
+    **{home} vs {away}**  
+    Expected points: **{home} {avg_h:.1f} – {away} {avg_a:.1f}**  
+    Win probabilities: **{home} {100 * p_h:.1f}%**, **{away} {100 * p_a:.1f}%**
     """)
-    st.dataframe(df.sort_values("off_ppg", ascending=False).reset_index(drop=True))
+
+with st.expander("Team stats table"):
+    st.dataframe(df.sort_values("off_ppg", ascending=False))
