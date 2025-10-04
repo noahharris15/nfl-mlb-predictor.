@@ -1,370 +1,349 @@
-import time, math, json, random
-import pandas as pd
+# streamlit_app.py
+# One script with 3 pages: NFL Sim, MLB Sim, Player Props (CSV-driven).
+# - NFL/MLB: simple team-vs-team Poisson simulation using uploaded team stats
+# - Player Props: upload props CSV (lines) + optional player-averages CSV, simulate P(Over/Under)
+
+import io
+import math
+import random
+from typing import List, Optional, Dict
+
 import numpy as np
-import requests
+import pandas as pd
 import streamlit as st
-from scipy.stats import norm
+from scipy.stats import norm, poisson
 from rapidfuzz import fuzz
-from tenacity import retry, stop_after_attempt, wait_exponential_jitter
 
-st.set_page_config(page_title="All-Sports PrizePicks Simulator", layout="wide")
-st.title("📊 All-Sports PrizePicks Simulator (Real stats + Auto Simulation)")
+# --------------------------------------------------
+# Page config
+# --------------------------------------------------
+st.set_page_config(page_title="NFL/MLB Sims + Player Props", layout="wide")
+st.title("🏈⚾️ NFL / MLB Sims + Player Props (CSV)")
 
-# ---------------- UI ----------------
-league = st.selectbox("League", ["NFL", "NBA", "MLB", "Soccer"])
-season_default = {"NFL": 2024, "NBA": 2024, "MLB": 2024, "Soccer": 2024}[league]
-season = st.number_input("Season", 2018, 2025, value=season_default, step=1)
+page = st.sidebar.radio("Pages", ["NFL Sim", "MLB Sim", "Player Props"])
 
-st.caption(
-    "We fetch the PrizePicks board → filter to the chosen league → fetch real per-game "
-    "averages → fuzzy-match players/stat → simulate with a conservative normal model."
-)
-
-# ---------------- Utilities ----------------
+# --------------------------------------------------
+# Utilities (shared)
+# --------------------------------------------------
 def clean_name(s: str) -> str:
-    return (s or "").replace(".", "").replace("-", " ").strip().lower()
+    return (s or "").replace(".", "").replace("-", " ").replace("'", "").strip().lower()
+
+def best_name_match(name: str, candidates: List[str], score_cut=82) -> Optional[str]:
+    nm = clean_name(name); best=None; best_sc=-1
+    for c in candidates:
+        sc = fuzz.token_sort_ratio(nm, clean_name(c))
+        if sc > best_sc:
+            best, best_sc = c, sc
+    return best if best_sc >= score_cut else None
 
 def conservative_sd(avg, minimum=0.75, frac=0.30):
     if pd.isna(avg): return 1.25
     if avg <= 0:     return 1.0
-    sd = max(frac * float(avg), minimum)
-    return max(sd, 0.5)
+    return max(max(frac * float(avg), minimum), 0.5)
 
 def simulate_prob(avg, line):
     sd = conservative_sd(avg)
-    p_over = float(1 - norm.cdf(line, loc=avg, scale=sd))
+    p_over  = float(1 - norm.cdf(line, loc=avg, scale=sd))
     p_under = float(norm.cdf(line, loc=avg, scale=sd))
-    return round(p_over * 100, 2), round(p_under * 100, 2), round(sd, 3)
+    return round(p_over*100, 2), round(p_under*100, 2), round(sd, 3)
 
-# ---------------- PrizePicks fetch (robust) ----------------
-PP_ENDPOINTS = [
-    # official app endpoints sometimes swap; we try both
-    "https://api.prizepicks.com/projections",
-    "https://site.api.prizepicks.com/api/v1/projections",
-]
+def poisson_match_sim(lambda_home: float, lambda_away: float, sims: int = 20000, home_edge: float = 0.0):
+    """
+    Simple Poisson match simulator. Optionally add a small home_edge (in runs/points) to home team lambda.
+    Returns arrays of (home_score, away_score).
+    """
+    lam_h = max(lambda_home + home_edge, 0.01)
+    lam_a = max(lambda_away, 0.01)
+    home = np.random.poisson(lam=lam_h, size=sims)
+    away = np.random.poisson(lam=lam_a, size=sims)
+    return home, away
 
-BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Origin": "https://www.prizepicks.com",
-    "Referer": "https://www.prizepicks.com/",
-}
+def ensure_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    for c in cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
 
-def league_param(league: str) -> str:
-    return {
-        "NFL": "nfl",
-        "NBA": "nba",
-        "MLB": "mlb",
-        "Soccer": "soc",
-    }[league]
+# --------------------------------------------------
+# NFL SIM PAGE
+# --------------------------------------------------
+if page == "NFL Sim":
+    st.header("🏈 NFL Team Simulator (CSV)")
+    st.caption(
+        "Upload a team stats CSV with columns at minimum: **team, off_ppg, def_ppg**. "
+        "We estimate team scoring rates and simulate a game (Poisson)."
+    )
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=1, max=8))
-def _get(url, params):
-    r = requests.get(url, params=params, headers=BROWSER_HEADERS, timeout=15)
-    if r.status_code != 200:
-        # raise to trigger retry/backoff
-        raise requests.HTTPError(f"{r.status_code}: {r.text[:200]}")
-    return r
-
-@st.cache_data(ttl=180, show_spinner=False)  # 3 min cache to avoid repeat hits
-def fetch_prizepicks_board(league: str) -> pd.DataFrame:
-    params = {"per_page": 250, "single_stat": "true", "league": league_param(league)}
-    last_err = None
-    # try each endpoint with retries (handled inside _get)
-    for base in PP_ENDPOINTS:
-        try:
-            r = _get(base, params=params)
-            data = r.json()
-            df = pd.json_normalize(data.get("data", []))
-            # Expected fields
-            cols = {
-                "attributes.league": "league",
-                "attributes.display_stat": "stat",
-                "attributes.stat_type": "stat_type",
-                "attributes.line_score": "line",
-                "attributes.player_name": "player",
-                "attributes.team": "pp_team",
-            }
-            keep = [c for c in cols if c in df.columns]
-            if not keep:
-                raise ValueError("Unexpected PrizePicks schema.")
-            out = df[keep].rename(columns=cols)
-            out["line"] = pd.to_numeric(out["line"], errors="coerce")
-            return out.dropna(subset=["line"]).reset_index(drop=True)
-        except Exception as e:
-            last_err = e
-            # random small sleep between endpoints
-            time.sleep(0.5 + random.random())
-            continue
-    raise RuntimeError(f"PrizePicks fetch failed: {last_err}")
-
-# -------------- Real stats providers --------------
-def load_nfl_stats(season: int):
-    import nfl_data_py as nfl
-    st.info("Loading NFL season data…")
-    df = nfl.import_seasonal_data([season])
-    g = df["games"].replace(0, np.nan) if "games" in df.columns else np.nan
-    out = pd.DataFrame({
-        "player": df.get("player_display_name"),
-        "team": df.get("recent_team"),
-        "pass_yards": df.get("passing_yards") / g if "games" in df else df.get("passing_yards"),
-        "rush_yards": df.get("rushing_yards") / g if "games" in df else df.get("rushing_yards"),
-        "rec_yards":  df.get("receiving_yards") / g if "games" in df else df.get("receiving_yards"),
-        "receptions": df.get("receptions") / g if "games" in df else df.get("receptions"),
-        "pass_tds":   df.get("passing_tds") / g if "games" in df else df.get("passing_tds"),
-        "rush_tds":   df.get("rushing_tds") / g if "games" in df else df.get("rushing_tds"),
-        "rec_tds":    df.get("receiving_tds") / g if "games" in df else df.get("receiving_tds"),
-        "ints":       df.get("interceptions") / g if "games" in df else df.get("interceptions"),
-    }).dropna(subset=["player"])
-    mapping = {
-        "Pass Yards": "pass_yards", "Passing Yards": "pass_yards",
-        "Rush Yards": "rush_yards", "Rushing Yards": "rush_yards",
-        "Receiving Yards": "rec_yards",
-        "Receptions": "receptions",
-        "Pass TDs": "pass_tds", "Rush TDs": "rush_tds", "Receiving TDs": "rec_tds",
-        "Interceptions": "ints",
-        "Pass+Rush Yds": ["pass_yards", "rush_yards"],
-        "Rush+Rec Yds": ["rush_yards", "rec_yards"],
-        "Pass+Rush+Rec Yds": ["pass_yards", "rush_yards", "rec_yards"],
-    }
-    return out, mapping
-
-def load_nba_stats(season: int):
-    st.info("Loading NBA season averages (balldontlie)…")
-    rows, page = [], 1
-    while True:
-        url = f"https://www.balldontlie.io/api/v1/season_averages?season={season}&per_page=100&page={page}"
-        r = requests.get(url, timeout=15)
-        js = r.json(); data = js.get("data", [])
-        if not data: break
-        rows.extend(data); page += 1
-        if page > 40: break
-    df = pd.DataFrame(rows)
-    if df.empty: raise ValueError("No NBA data returned.")
-    out = pd.DataFrame({
-        "player_id": df["player_id"].astype(int),
-        "points": df.get("pts"), "assists": df.get("ast"),
-        "rebounds": df.get("reb"), "threes": df.get("fg3m"),
-    })
-    # map ids -> names
-    ids, id_to_name = list(out["player_id"].unique()), {}
-    for chunk in [ids[i:i+50] for i in range(0, len(ids), 50)]:
-        url = "https://www.balldontlie.io/api/v1/players?per_page=100&" + "&".join([f"ids[]={x}" for x in chunk])
-        rr = requests.get(url, timeout=15)
-        for p in rr.json().get("data", []):
-            id_to_name[int(p["id"])] = f"{p['first_name']} {p['last_name']}"
-    out["player"] = out["player_id"].map(id_to_name)
-    out = out.drop(columns=["player_id"]).dropna(subset=["player"])
-    mapping = {
-        "Points": "points", "Assists": "assists", "Rebounds": "rebounds", "3-PT Made": "threes",
-        "Pts+Reb+Ast": ["points","rebounds","assists"], "Pts+Reb": ["points","rebounds"],
-        "Pts+Ast": ["points","assists"], "Reb+Ast": ["rebounds","assists"],
-    }
-    return out, mapping
-
-def load_mlb_stats(season: int):
-    st.info("Loading MLB season stats (pybaseball)…")
-    from pybaseball import batting_stats, pitching_stats
-    bat = batting_stats(season); pit = pitching_stats(season)
-    bat_out = pd.DataFrame({
-        "player": bat.get("Name"),
-        "hits": bat.get("H"), "hr": bat.get("HR"), "rbi": bat.get("RBI"),
-        "sb": bat.get("SB"), "bb": bat.get("BB"), "so": bat.get("SO"),
-        "pa": bat.get("PA"),
-    }).dropna(subset=["player"])
-    # scale to per-game-ish using PA proxy (avoid 0/100)
-    bat_out["pa"] = bat_out["pa"].replace(0, np.nan)
-    for c in ["hits","hr","rbi","sb"]:
-        bat_out[c] = bat_out[c] / bat_out["pa"] * 4.2
-    pit_out = pd.DataFrame({
-        "player": pit.get("Name"),
-        "pitch_strikeouts": pit.get("SO"),
-        "innings": pit.get("IP")
-    }).dropna(subset=["player"])
-    out = pd.merge(bat_out.drop(columns=["pa"]), pit_out, on="player", how="outer")
-    mapping = {
-        "Hitter Fantasy Score": ["hits","hr","rbi","sb"],  # proxy
-        "Hits": "hits", "Home Runs": "hr", "RBIs": "rbi", "Stolen Bases": "sb",
-        "Pitcher Strikeouts": "pitch_strikeouts",
-    }
-    return out, mapping
-
-def load_soccer_stats(season: int):
-    st.info("Loading Soccer player stats (FBref via soccerdata)…")
-    import soccerdata as sd
-    # FBref uses the first year of the season; coerce 2025 → 2024 (2024-25)
-    fb_season = season if season <= 2024 else 2024
-    leagues = ["ENG-Premier League","ESP-La Liga","ITA-Serie A","GER-Bundesliga","FRA-Ligue 1"]
-    frames = []
-    for lg in leagues:
-        try:
-            fb = sd.FBref(leagues=lg, seasons=fb_season)
-            df = fb.read_player_season_stats(stat_type="standard").reset_index()
-            name_col = "player" if "player" in df.columns else "Player"
-            team_col = "team" if "team" in df.columns else ("Squad" if "Squad" in df.columns else None)
-            frames.append(pd.DataFrame({
-                "player": df[name_col],
-                "team": df[team_col] if team_col and team_col in df.columns else None,
-                "goals": df["Gls"] if "Gls" in df.columns else np.nan,
-                "shots": df["Sh"] if "Sh" in df.columns else np.nan,
-                "sog":   df["SoT"] if "SoT" in df.columns else np.nan,
-                "assists": df["Ast"] if "Ast" in df.columns else np.nan,
-                "key_passes": df["KP"] if "KP" in df.columns else np.nan,
-            }))
-        except Exception:
-            continue
-    if not frames:
-        raise ValueError("No soccer frames returned.")
-    out = pd.concat(frames, ignore_index=True)
-    mapping = {
-        "Goals": "goals", "Shots": "shots", "Shots On Goal": "sog", "Assists": "assists",
-        "Passes Created": "key_passes", "Shots+SOG": ["shots","sog"], "G+A": ["goals","assists"],
-    }
-    return out, mapping
-
-def provider_for(league: str):
-    return {"NFL": load_nfl_stats, "NBA": load_nba_stats, "MLB": load_mlb_stats, "Soccer": load_soccer_stats}[league]
-
-def best_name_match(name, candidates, score_cut=82):
-    name_c = clean_name(name)
-    best, best_score = None, -1
-    for c in candidates:
-        s = fuzz.token_sort_ratio(name_c, clean_name(c))
-        if s > best_score:
-            best, best_score = c, s
-    return best if best_score >= score_cut else None
-
-def value_from_mapping(row_stats: pd.Series, stat_map):
-    if isinstance(stat_map, list):
-        vals = [row_stats.get(c) for c in stat_map if c in row_stats.index]
-        vals = [v for v in vals if pd.notna(v)]
-        return float(np.sum(vals)) if vals else np.nan
-    return row_stats.get(stat_map)
-
-# -------------- Get board (with fallback uploader) --------------
-with st.expander("Fetch PrizePicks board (debug)"):
-    st.write("Endpoints tried:", PP_ENDPOINTS)
-    st.write("Params:", {"per_page": 250, "single_stat": True, "league": league_param(league)})
-
-board = None
-fetch_error = None
-try:
-    board = fetch_prizepicks_board(league)
-except Exception as e:
-    fetch_error = str(e)
-    st.error(f"PrizePicks fetch/parse error: {fetch_error}")
-
-if board is None or board.empty:
-    st.warning("No board from PrizePicks. You can upload a board CSV/JSON (columns: player, stat, line, league).")
-    up = st.file_uploader("Upload PrizePicks board fallback", type=["csv","json"])
-    if up is None:
+    nfl_csv = st.file_uploader("Upload NFL team stats CSV", type=["csv"])
+    if nfl_csv is None:
+        st.info("No file uploaded yet. Example columns:\n\nteam,off_ppg,def_ppg")
         st.stop()
-    if up.name.lower().endswith(".csv"):
-        board = pd.read_csv(up)
-    else:
-        data = json.load(up)
-        # accept either raw PP payload or simplified list
-        if isinstance(data, dict) and "data" in data:
-            df = pd.json_normalize(data["data"])
-            cols = {
-                "attributes.league": "league",
-                "attributes.display_stat": "stat",
-                "attributes.line_score": "line",
-                "attributes.player_name": "player",
-                "attributes.team": "pp_team",
-            }
-            keep = [c for c in cols if c in df.columns]
-            board = df[keep].rename(columns=cols)
-        else:
-            board = pd.DataFrame(data)
-    board["line"] = pd.to_numeric(board["line"], errors="coerce")
-    board = board.dropna(subset=["line"])
-    # filter to league
-    if "league" in board.columns:
-        board = board[board["league"].astype(str).str.contains(league, case=False, na=False)]
 
-if board.empty:
-    st.error("Board is empty after parsing.")
-    st.stop()
+    df = pd.read_csv(nfl_csv)
+    required = ["team", "off_ppg", "def_ppg"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        st.error(f"Missing required columns in NFL CSV: {missing}")
+        st.stop()
 
-st.success(f"Loaded {len(board)} board rows for {league}.")
+    df = ensure_numeric(df, ["off_ppg","def_ppg"])
+    teams = sorted(df["team"].dropna().astype(str).unique().tolist())
 
-# -------------- Real stats + mapping --------------
-try:
-    stats_df, market_map = provider_for(league)(season)
-except Exception as e:
-    st.error(f"Could not load {league} stats: {e}")
-    st.stop()
+    c1, c2 = st.columns(2)
+    with c1:
+        team_home = st.selectbox("Home Team", teams, index=0)
+    with c2:
+        team_away = st.selectbox("Away Team", teams, index=min(1, len(teams)-1))
 
-stats_df = stats_df.dropna(subset=["player"]).copy()
-players_set = list(stats_df["player"].unique())
+    sims = st.slider("Number of simulations", 2000, 100000, 20000, step=2000)
+    home_edge = st.slider("Home edge (points added to home λ)", 0.0, 3.0, 0.5, 0.1)
 
-# -------------- Simulate --------------
-rows = []
-prog = st.progress(0)
-for i, r in board.iterrows():
-    prog.progress((i+1)/len(board))
-    pp_player, pp_stat, pp_line = r.get("player"), r.get("stat"), r.get("line")
-    if pd.isna(pp_player) or pd.isna(pp_stat) or pd.isna(pp_line): 
-        continue
+    th = df.loc[df["team"] == team_home].iloc[0]
+    ta = df.loc[df["team"] == team_away].iloc[0]
 
-    # map market name (loose match allowed)
-    stat_map = market_map.get(pp_stat)
-    if stat_map is None:
-        for k in market_map.keys():
-            if fuzz.token_set_ratio(str(pp_stat).lower(), k.lower()) >= 90:
-                stat_map = market_map[k]; break
-    if stat_map is None:
-        continue
+    # naive expected scoring rates blending offense vs opponent defense
+    lam_home = (float(th["off_ppg"]) + float(ta["def_ppg"])) / 2.0
+    lam_away = (float(ta["off_ppg"]) + float(th["def_ppg"])) / 2.0
 
-    match = best_name_match(pp_player, players_set, score_cut=82)
-    if match is None:
-        continue
+    home_scores, away_scores = poisson_match_sim(lam_home, lam_away, sims=sims, home_edge=home_edge)
 
-    row_stats = stats_df.loc[stats_df["player"] == match].iloc[0]
-    avg_val = value_from_mapping(row_stats, stat_map)
-    if pd.isna(avg_val): 
-        continue
+    total = home_scores + away_scores
+    margin = home_scores - away_scores
 
-    try:
-        line_val = float(pp_line)
-    except: 
-        continue
+    st.subheader("Results")
+    st.metric("Mean Home Points", f"{np.mean(home_scores):.2f}")
+    st.metric("Mean Away Points", f"{np.mean(away_scores):.2f}")
+    st.metric("Mean Total", f"{np.mean(total):.2f}")
+    st.metric("Home Win %", f"{np.mean(margin>0)*100:.1f}%")
 
-    p_over, p_under, used_sd = simulate_prob(avg_val, line_val)
-    rows.append({
-        "league": league,
-        "player": match,
-        "pp_player": pp_player,
-        "team": row_stats.get("team"),
-        "market": pp_stat,
-        "line": round(line_val, 3),
-        "avg": round(float(avg_val), 3),
-        "model_sd": used_sd,
-        "P(Over)": p_over,
-        "P(Under)": p_under,
-    })
+    # quick total/spread calculator
+    colA, colB = st.columns(2)
+    with colA:
+        user_total = st.number_input("Total line", 20.0, 100.0, value=float(np.mean(total).round(1)))
+        p_over = float(1 - norm.cdf(user_total, loc=np.mean(total), scale=max(np.std(total), 1.5)))
+        st.write(f"**P(Total Over)** ≈ {p_over*100:.1f}%")
+    with colB:
+        spread = st.number_input("Home spread (negative = favorite)", -30.0, 30.0, value=float(-np.mean(margin).round(1)))
+        p_cover = float(1 - norm.cdf(spread, loc=np.mean(margin), scale=max(np.std(margin), 1.5)))
+        st.write(f"**P(Home covers)** ≈ {p_cover*100:.1f}%")
 
-prog.empty()
-results = pd.DataFrame(rows).sort_values("P(Over)", ascending=False)
+# --------------------------------------------------
+# MLB SIM PAGE
+# --------------------------------------------------
+elif page == "MLB Sim":
+    st.header("⚾️ MLB Team Simulator (CSV)")
+    st.caption(
+        "Upload a team stats CSV with columns at minimum: **team, runs_for_pg, runs_against_pg**. "
+        "We estimate team run rates and simulate a game (Poisson)."
+    )
 
-if results.empty:
-    st.warning("Nothing matched (unsupported markets or unmatched players).")
-    st.stop()
+    mlb_csv = st.file_uploader("Upload MLB team stats CSV", type=["csv"])
+    if mlb_csv is None:
+        st.info("No file uploaded yet. Example columns:\n\nteam,runs_for_pg,runs_against_pg")
+        st.stop()
 
-st.subheader("Simulated edges (conservative normal model)")
-st.caption("Probabilities are model estimates based on **real per-game averages**. SD is conservative to avoid 0%/100% artifacts.")
-st.dataframe(results, use_container_width=True)
+    df = pd.read_csv(mlb_csv)
+    required = ["team", "runs_for_pg", "runs_against_pg"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        st.error(f"Missing required columns in MLB CSV: {missing}")
+        st.stop()
 
-st.download_button(
-    "Download CSV",
-    results.to_csv(index=False).encode("utf-8"),
-    file_name=f"{league.lower()}_{season}_prizepicks_sim.csv",
-    mime="text/csv",
-)
+    df = ensure_numeric(df, ["runs_for_pg","runs_against_pg"])
+    teams = sorted(df["team"].dropna().astype(str).unique().tolist())
 
-st.markdown("#### Top 10 Overs")
-st.dataframe(results.nlargest(10, "P(Over)")[["player","market","line","avg","P(Over)","P(Under)"]], use_container_width=True)
-st.markdown("#### Top 10 Unders")
-st.dataframe(results.nlargest(10, "P(Under)")[["player","market","line","avg","P(Over)","P(Under)"]], use_container_width=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        team_home = st.selectbox("Home Team", teams, index=0)
+    with c2:
+        team_away = st.selectbox("Away Team", teams, index=min(1, len(teams)-1))
+
+    sims = st.slider("Number of simulations", 2000, 100000, 20000, step=2000)
+    home_edge = st.slider("Home edge (runs added to home λ)", 0.0, 0.8, 0.15, 0.05)
+
+    th = df.loc[df["team"] == team_home].iloc[0]
+    ta = df.loc[df["team"] == team_away].iloc[0]
+
+    lam_home = (float(th["runs_for_pg"]) + float(ta["runs_against_pg"])) / 2.0
+    lam_away = (float(ta["runs_for_pg"]) + float(th["runs_against_pg"])) / 2.0
+
+    home_runs, away_runs = poisson_match_sim(lam_home, lam_away, sims=sims, home_edge=home_edge)
+
+    total = home_runs + away_runs
+    margin = home_runs - away_runs
+
+    st.subheader("Results")
+    st.metric("Mean Home Runs", f"{np.mean(home_runs):.2f}")
+    st.metric("Mean Away Runs", f"{np.mean(away_runs):.2f}")
+    st.metric("Mean Total", f"{np.mean(total):.2f}")
+    st.metric("Home Win %", f"{np.mean(margin>0)*100:.1f}%")
+
+    colA, colB = st.columns(2)
+    with colA:
+        user_total = st.number_input("Total line (runs)", 3.0, 16.0, value=float(np.mean(total).round(1)))
+        p_over = float(1 - norm.cdf(user_total, loc=np.mean(total), scale=max(np.std(total), 0.9)))
+        st.write(f"**P(Total Over)** ≈ {p_over*100:.1f}%")
+    with colB:
+        spread = st.number_input("Home runline (negative = favorite)", -5.0, 5.0, value=float(-np.mean(margin).round(1)))
+        p_cover = float(1 - norm.cdf(spread, loc=np.mean(margin), scale=max(np.std(margin), 0.9)))
+        st.write(f"**P(Home covers)** ≈ {p_cover*100:.1f}%")
+
+# --------------------------------------------------
+# PLAYER PROPS PAGE (CSV)
+# --------------------------------------------------
+else:
+    st.header("📄 Player Props (CSV) — Over/Under Simulator")
+    st.caption(
+        "Upload a **Props CSV** with at least: **player, stat, line**. "
+        "Optionally upload a **Player Averages CSV** with per-game columns (examples below). "
+        "We fuzzy-match names, map stats, and estimate P(Over/Under) with a conservative normal model."
+    )
+
+    st.markdown("**Props CSV required columns:** `player, stat, line`  \n"
+                "Examples for `stat`: `Pass Yards`, `Rush Yards`, `Receiving Yards`, `Receptions`, "
+                "`Hits`, `Home Runs`, `RBIs`, `Pitcher Strikeouts`, etc.")
+
+    props_file = st.file_uploader("Upload Props CSV (required)", type=["csv"])
+    stats_file = st.file_uploader("Upload Player Averages CSV (optional)", type=["csv"])
+
+    if props_file is None:
+        st.stop()
+
+    props = pd.read_csv(props_file)
+    if not set(["player","stat","line"]).issubset(props.columns):
+        st.error("Props CSV must include columns: player, stat, line")
+        st.stop()
+    props["line"] = pd.to_numeric(props["line"], errors="coerce")
+    props = props.dropna(subset=["player","stat","line"]).reset_index(drop=True)
+
+    # Mapping: common market names -> expected player-averages columns
+    # You can extend/change these to match your averages CSV.
+    MARKET_MAP = {
+        # NFL-like
+        "pass yards": ["pass_yards","passing_yards","passyds","py"],
+        "rushing yards": ["rush_yards","rushing_yards","ry"],
+        "receiving yards": ["rec_yards","receiving_yards","recy"],
+        "receptions": ["receptions","recs","rec"],
+        "rush+rec yds": ["rush_yards","rec_yards"],
+        "pass+rush+rec yds": ["pass_yards","rush_yards","rec_yards"],
+        # MLB-like
+        "hits": ["hits","H"],
+        "home runs": ["hr","home_runs"],
+        "rbis": ["rbi","RBIs","RBIs_pg","rbi_pg"],
+        "stolen bases": ["sb","stolen_bases"],
+        "pitcher strikeouts": ["pitch_strikeouts","k","Ks","SO"],
+        "total bases": ["total_bases","TB"],  # if you compute it in your averages
+        # NBA-like (if you ever use)
+        "points": ["points","pts"],
+        "assists": ["assists","ast"],
+        "rebounds": ["rebounds","reb"],
+        "3-pt made": ["threes","fg3m"],
+        "pts+reb+ast": ["points","rebounds","assists"],
+        "pts+reb": ["points","rebounds"],
+        "pts+ast": ["points","assists"],
+        "reb+ast": ["rebounds","assists"],
+    }
+
+    def find_stat_columns_for_label(label: str, available_cols: List[str]) -> Optional[List[str]]:
+        lbl = clean_name(label)
+        best_key = None
+        best_score = -1
+        for k in MARKET_MAP.keys():
+            sc = fuzz.token_set_ratio(lbl, k)
+            if sc > best_score:
+                best_key, best_score = k, sc
+        if best_key is None: 
+            return None
+
+        # Filter to columns that actually exist in the uploaded averages CSV
+        cand = MARKET_MAP[best_key]
+        if isinstance(cand, list):
+            # keep those present
+            cols = [c for c in cand if c in available_cols]
+            return cols if cols else None
+        return [cand] if cand in available_cols else None
+
+    if stats_file is None:
+        st.warning("No player averages CSV uploaded — you’ll need to provide one to run the sim.")
+        st.stop()
+
+    stats = pd.read_csv(stats_file)
+    if "player" not in stats.columns:
+        st.error("Player averages CSV must include a 'player' column.")
+        st.stop()
+
+    # ensure numeric for all non-player columns
+    for c in stats.columns:
+        if c == "player":
+            continue
+        stats[c] = pd.to_numeric(stats[c], errors="coerce")
+
+    players = stats["player"].dropna().astype(str).unique().tolist()
+
+    rows=[]
+    prog = st.progress(0.0)
+    for i, r in props.iterrows():
+        prog.progress((i+1)/len(props))
+        p_name = str(r["player"])
+        stat_label = str(r["stat"])
+        line_val = r["line"]
+        if pd.isna(line_val): 
+            continue
+
+        # fuzzy name match
+        match = best_name_match(p_name, players, score_cut=82)
+        if match is None:
+            continue
+
+        # stat mapping -> actual column names present in stats file
+        cols = find_stat_columns_for_label(stat_label, list(stats.columns))
+        if cols is None or not cols:
+            continue
+
+        row_stats = stats.loc[stats["player"] == match].iloc[0]
+        vals = [row_stats.get(c) for c in cols if c in row_stats.index]
+        vals = [v for v in vals if pd.notna(v)]
+        if not vals: 
+            continue
+        avg_val = float(np.sum(vals))
+
+        try:
+            line_val = float(line_val)
+        except:
+            continue
+
+        p_over, p_under, sd_used = simulate_prob(avg_val, line_val)
+        rows.append({
+            "player": match,
+            "prop_player": p_name,
+            "market": stat_label,
+            "line": round(line_val, 3),
+            "avg": round(avg_val, 3),
+            "model_sd": sd_used,
+            "P(Over)": p_over,
+            "P(Under)": p_under,
+        })
+
+    prog.empty()
+    results = pd.DataFrame(rows).sort_values(["P(Over)","P(Under)"], ascending=[False, True])
+
+    if results.empty:
+        st.warning("No matched rows. Check player names and stat labels vs your averages CSV.")
+        st.stop()
+
+    st.subheader("Simulated props (conservative normal model)")
+    st.dataframe(results, use_container_width=True)
+
+    st.download_button(
+        "Download CSV",
+        results.to_csv(index=False).encode("utf-8"),
+        file_name="props_sim_results.csv",
+        mime="text/csv",
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Top 10 Overs**")
+        st.dataframe(results.nlargest(10, "P(Over)")[["player","market","line","avg","P(Over)","P(Under)"]], use_container_width=True)
+    with c2:
+        st.markdown("**Top 10 Unders**")
+        st.dataframe(results.nlargest(10, "P(Under)")[["player","market","line","avg","P(Over)","P(Under)"]], use_container_width=True)
