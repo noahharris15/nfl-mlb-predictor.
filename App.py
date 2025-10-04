@@ -1,4 +1,12 @@
 # App.py — NFL + MLB + Player Props + College Football (stats-only)
+import io
+import math
+from typing import Optional, Tuple, Dict
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import requests
 import streamlit as st
 import pandas as pd
 import requests
@@ -71,17 +79,6 @@ else:
 
     with st.expander("Show team table"):
         st.dataframe(df)
-from __future__ import annotations
-
-import io
-import math
-from typing import Optional, Tuple, Dict
-
-import numpy as np
-import pandas as pd
-import streamlit as st
-import requests
-
 # ----------------------------- App config -------------------------------------
 st.set_page_config(page_title="NFL + MLB + CFB Predictor — 2025 (stats only)",
                    layout="wide")
