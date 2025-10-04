@@ -2,7 +2,8 @@ streamlit
 pandas
 numpy
 requests
+scipy
+rapidfuzz
 nfl_data_py
 pybaseball
-nba_api
-cfbd
+soccerdata
