@@ -2,120 +2,112 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import json
 
 # -----------------------------
-# SETUP
+# PAGE SETUP
 # -----------------------------
 st.set_page_config(page_title="🏈 College Football — Auto from CFBD", layout="centered")
-
 st.title("🏈 College Football — 2025 (auto from CFBD)")
 
-# Get CFBD API key from Streamlit secrets
+# -----------------------------
+# API KEY SETUP
+# -----------------------------
 CFBD_API_KEY = st.secrets.get("CFBD_API_KEY", None)
-
 if not CFBD_API_KEY:
-    st.error("⚠️ Missing CFBD API Key in Streamlit secrets.")
+    st.error("⚠️ Missing CFBD API key in Streamlit secrets.")
     st.stop()
 
 headers = {"Authorization": f"Bearer {CFBD_API_KEY}"}
 
 # -----------------------------
-# DATA FETCHING FUNCTIONS
+# FETCH TEAM STATS
 # -----------------------------
-
-@st.cache_data(ttl=86400)
-def get_cfb_team_stats(year: int = 2024):
-    """Fetch team stats (points for/against) from CFBD."""
-    url = f"https://api.collegefootballdata.com/team/stats?year={year}"
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        st.error(f"❌ API request failed with status {response.status_code}")
+@st.cache_data(ttl=3600)
+def get_cfb_stats(year=2024):
+    """Fetch team stats from the new CFBD endpoint."""
+    url = f"https://api.collegefootballdata.com/stats/season?year={year}&seasonType=regular"
+    resp = requests.get(url, headers=headers)
+    if resp.status_code != 200:
+        st.error(f"❌ API request failed with status {resp.status_code}")
         return None
+
     try:
-        data = response.json()
-        if not data:
-            st.warning("⚠️ No data returned from CFBD API.")
-            return None
-        df = pd.json_normalize(data)
-        # Extract useful stats (points per game for and against)
-        team_ppg = []
-        for team in data:
-            name = team.get("team")
-            points = next((x["stat"] for x in team["stats"] if x["category"] == "pointsPerGame"), None)
-            points_against = next((x["stat"] for x in team["stats"] if x["category"] == "opponentPointsPerGame"), None)
-            if points and points_against:
-                team_ppg.append({"team": name, "off_ppg": float(points), "def_ppg": float(points_against)})
-        return pd.DataFrame(team_ppg)
-    except json.JSONDecodeError:
-        st.error("❌ Could not decode JSON. Check API key or endpoint.")
+        data = resp.json()
+    except Exception as e:
+        st.error(f"❌ Could not decode JSON: {e}")
         return None
 
+    if not data:
+        st.warning("⚠️ No CFB data returned for that year.")
+        return None
+
+    df = pd.DataFrame(data)
+    # Extract relevant stats
+    grouped = df.groupby("team").agg(
+        off_ppg=("stat", lambda x: pd.to_numeric(df.loc[x.index][df.loc[x.index]["statName"]=="pointsPerGame"], errors="coerce").mean()),
+        def_ppg=("stat", lambda x: pd.to_numeric(df.loc[x.index][df.loc[x.index]["statName"]=="opponentPointsPerGame"], errors="coerce").mean())
+    ).reset_index()
+
+    # Drop missing data
+    grouped = grouped.dropna(subset=["off_ppg", "def_ppg"])
+    return grouped
 
 # -----------------------------
-# SIMULATION FUNCTION
+# SIMULATE MATCHUP
 # -----------------------------
+def simulate_game(home, away, df, sims=10000):
+    """Simulate expected scores and win probabilities."""
+    h = df[df["team"] == home].iloc[0]
+    a = df[df["team"] == away].iloc[0]
 
-def simulate_matchup(team1, team2, df, sims=10000):
-    """Simulate a matchup between two teams using Poisson distribution."""
-    t1 = df[df["team"] == team1].iloc[0]
-    t2 = df[df["team"] == team2].iloc[0]
+    home_exp = (h["off_ppg"] + a["def_ppg"]) / 2
+    away_exp = (a["off_ppg"] + h["def_ppg"]) / 2
 
-    # Expected points = offensive avg vs opponent's defensive avg
-    t1_exp = (t1["off_ppg"] + t2["def_ppg"]) / 2
-    t2_exp = (t2["off_ppg"] + t1["def_ppg"]) / 2
+    home_scores = np.random.poisson(home_exp, sims)
+    away_scores = np.random.poisson(away_exp, sims)
 
-    t1_scores = np.random.poisson(t1_exp, sims)
-    t2_scores = np.random.poisson(t2_exp, sims)
-
-    t1_wins = np.sum(t1_scores > t2_scores)
-    t2_wins = np.sum(t2_scores > t1_scores)
-    ties = sims - t1_wins - t2_wins
+    home_win = np.sum(home_scores > away_scores) / sims * 100
+    away_win = np.sum(away_scores > home_scores) / sims * 100
+    tie = 100 - home_win - away_win
 
     return {
-        "team1_exp": t1_exp,
-        "team2_exp": t2_exp,
-        "team1_win_prob": round(t1_wins / sims * 100, 2),
-        "team2_win_prob": round(t2_wins / sims * 100, 2),
-        "tie_prob": round(ties / sims * 100, 2),
+        "home_exp": home_exp,
+        "away_exp": away_exp,
+        "home_win": home_win,
+        "away_win": away_win,
+        "tie": tie
     }
 
 # -----------------------------
-# MAIN APP UI
+# MAIN UI
 # -----------------------------
-
 st.subheader("Select Season and Teams")
 
-season = st.number_input("Season", min_value=2023, max_value=2025, value=2024, step=1)
+year = st.number_input("Season", min_value=2023, max_value=2025, value=2024)
 
-# Fetch stats
-with st.spinner("Fetching College Football stats..."):
-    df = get_cfb_team_stats(season)
+with st.spinner("Loading college football data..."):
+    df = get_cfb_stats(year)
 
 if df is None or df.empty:
-    st.error("❌ No CFB stats available. Check your API key or try again later.")
+    st.error("❌ No valid data found. Try 2024 or verify your API key.")
     st.stop()
 
-teams = df["team"].sort_values().unique()
+teams = sorted(df["team"].unique())
+
 col1, col2 = st.columns(2)
+home = col1.selectbox("Home Team", teams, index=0)
+away = col2.selectbox("Away Team", teams, index=1)
 
-with col1:
-    home_team = st.selectbox("Home Team", teams, index=0)
-with col2:
-    away_team = st.selectbox("Away Team", teams, index=1)
-
-if home_team and away_team:
-    st.write(f"Comparing: **{home_team}** vs **{away_team}**")
-
-    results = simulate_matchup(home_team, away_team, df)
-
+if home and away:
+    st.write(f"Comparing **{home} vs {away}**")
+    results = simulate_game(home, away, df)
     st.markdown(f"""
-    **🏠 {home_team} Expected Points:** {results['team1_exp']:.1f}  
-    **✈️ {away_team} Expected Points:** {results['team2_exp']:.1f}  
-    **📊 Win Probabilities:**  
-    - {home_team}: **{results['team1_win_prob']}%**  
-    - {away_team}: **{results['team2_win_prob']}%**  
-    - Tie: **{results['tie_prob']}%**
+    - 🏠 **{home} Expected Points:** {results['home_exp']:.1f}  
+    - ✈️ **{away} Expected Points:** {results['away_exp']:.1f}  
+    - 📊 **Win Probability:**  
+        - {home}: {results['home_win']:.2f}%  
+        - {away}: {results['away_win']:.2f}%  
+        - Tie: {results['tie']:.2f}%
     """)
 
 st.divider()
