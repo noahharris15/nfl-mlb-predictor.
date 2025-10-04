@@ -1,6 +1,6 @@
-cfbd
+streamlit
 pandas
 numpy
-streamlit
 nfl_data_py
 pybaseball
+cfbd
