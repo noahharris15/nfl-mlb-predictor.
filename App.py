@@ -1,4 +1,4 @@
-# app.py  —  One-file Streamlit app for NFL/MLB player props using The Odds API
+# app.py — Player Props Simulator (Odds API lines + auto stats; NFL + MLB)
 import os, math
 import pandas as pd
 import numpy as np
@@ -7,17 +7,17 @@ import streamlit as st
 from scipy.stats import norm
 from rapidfuzz import fuzz
 
-# --------------------------- App + Sidebar ---------------------------
-st.set_page_config(page_title="Player Props Simulator (Odds API + CSV)", layout="wide")
-st.title("📊 Player Props Simulator (Odds API + Your CSV Stats)")
+st.set_page_config(page_title="Player Props Simulator (Auto Stats)", layout="wide")
+st.title("📊 Player Props Simulator (Odds API + Auto Stats)")
 
+# ---------------- Sidebar ----------------
 with st.sidebar:
-    st.header("Settings")
     league = st.selectbox("League", ["NFL", "MLB"])
-    api_key = st.text_input("Odds API key (or set env ODDS_API_KEY)", type="password") \
+    season = st.number_input("Season", 2018, 2025, value=2024, step=1)
+    api_key = st.text_input("Odds API key (or env ODDS_API_KEY)", type="password") \
               or os.getenv("ODDS_API_KEY", "")
 
-    # Markets allowed by The Odds API for each league (keep to valid keys)
+    # Valid Odds API player-prop markets (per docs)
     VALID_MARKETS = {
         "NFL": [
             "player_passing_yards",
@@ -28,67 +28,34 @@ with st.sidebar:
             "player_passing_touchdowns",
             "player_rushing_touchdowns",
             "player_receiving_touchdowns",
-            "player_interceptions_thrown",
+            "player_interceptions",  # <- Odds API uses this key
         ],
         "MLB": [
             "player_hits",
             "player_total_bases",
             "player_home_runs",
             "player_rbis",
-            "player_runs_scored",
-            "player_strikeouts",   # pitcher strikeouts
+            "player_runs",
+            "player_strikeouts",    # pitcher strikeouts
         ],
     }
-    # Market -> column(s) expected in your CSV
-    CSV_MAP = {
-        "NFL": {
-            "player_passing_yards": "passing_yards",
-            "player_rushing_yards": "rushing_yards",
-            "player_receiving_yards": "receiving_yards",
-            "player_receptions": "receptions",
-            "player_rush_and_receive_yards": ["rushing_yards", "receiving_yards"],
-            "player_passing_touchdowns": "passing_tds",
-            "player_rushing_touchdowns": "rushing_tds",
-            "player_receiving_touchdowns": "receiving_tds",
-            "player_interceptions_thrown": "interceptions_thrown",
-        },
-        "MLB": {
-            "player_hits": "hits",
-            "player_total_bases": "total_bases",
-            "player_home_runs": "home_runs",
-            "player_rbis": "rbis",
-            "player_runs_scored": "runs",
-            "player_strikeouts": "pitcher_strikeouts",
-        },
-    }
-
-    # defaults per league
     defaults = {
-        "NFL": ["player_passing_yards", "player_rushing_yards",
-                "player_receiving_yards", "player_receptions"],
-        "MLB": ["player_hits", "player_total_bases",
-                "player_home_runs", "player_strikeouts"],
+        "NFL": ["player_passing_yards","player_rushing_yards",
+                "player_receiving_yards","player_receptions"],
+        "MLB": ["player_hits","player_total_bases","player_home_runs","player_strikeouts"],
     }
-
-    sel_markets = st.multiselect(
-        "Markets to pull",
-        options=VALID_MARKETS[league],
-        default=[m for m in defaults[league] if m in VALID_MARKETS[league]],
-    )
-
-    bookmakers = st.text_input("Bookmakers (comma-separated)", "draftkings,betmgm,fanduel,caesars")
+    markets = st.multiselect("Markets to pull",
+                             options=VALID_MARKETS[league],
+                             default=[m for m in defaults[league] if m in VALID_MARKETS[league]])
+    bookmakers = st.text_input("Bookmakers (comma-sep)", "draftkings,betmgm,fanduel,caesars")
 
 st.caption(
-    "This app pulls **player lines from The Odds API**, then **simulates Over/Under** "
-    "with a conservative normal model using **your uploaded per-game CSV stats**. "
-    "We fuzzy-match player names."
+    "We fetch **player lines from The Odds API**, auto-load **real per-game stats** "
+    f"for **{league} {season}**, fuzzy-match names, and simulate with a conservative normal model."
 )
 
-# --------------------------- Helpers ---------------------------
-SPORT_KEY = {
-    "NFL": "americanfootball_nfl",
-    "MLB": "baseball_mlb",
-}
+# ---------------- Helpers ----------------
+SPORT_KEY = {"NFL": "americanfootball_nfl", "MLB": "baseball_mlb"}
 
 def clean_name(s: str) -> str:
     return (s or "").replace(".", "").replace("-", " ").replace("'", "").strip().lower()
@@ -103,22 +70,15 @@ def best_name_match(name, candidates, score_cut=84):
     return best if score_best >= score_cut else None
 
 def conservative_sd(avg, minimum=0.75, frac=0.30):
-    if avg is None or (isinstance(avg, float) and math.isnan(avg)): return 1.25
+    if avg is None or (isinstance(avg, float) and np.isnan(avg)): return 1.25
     if avg <= 0: return 1.0
-    return max(frac * float(avg), minimum)
+    return max(frac*float(avg), minimum)
 
 def simulate_prob(avg, line):
     sd = conservative_sd(avg)
     p_over = 1 - norm.cdf(line, loc=avg, scale=sd)
     p_under = norm.cdf(line, loc=avg, scale=sd)
     return round(100*p_over, 2), round(100*p_under, 2), round(sd, 3)
-
-def value_from_mapping(row: pd.Series, mapping):
-    if isinstance(mapping, list):
-        vals = [row.get(c) for c in mapping if c in row.index]
-        vals = [v for v in vals if pd.notna(v)]
-        return float(np.sum(vals)) if vals else np.nan
-    return row.get(mapping)
 
 def fetch_odds_board(league: str, markets: list, bookmakers: str, api_key: str) -> pd.DataFrame:
     if not api_key:
@@ -153,143 +113,170 @@ def fetch_odds_board(league: str, markets: list, bookmakers: str, api_key: str) 
                         "bookmaker": bm.get("key"),
                     })
     df = pd.DataFrame(rows)
-    # collapse to a single line per player/market (median line across books)
     if not df.empty:
-        df = (df.groupby(["player", "market"], as_index=False)
-                .agg({"line": "median", "bookmaker": "first"}))
+        df = (df.groupby(["player","market"], as_index=False)
+                .agg({"line": "median", "bookmaker":"first"}))
     return df
 
-# --------------------------- CSV upload ---------------------------
-st.markdown(f"### Upload {league} per-game stats CSV")
-if league == "NFL":
-    st.caption("Required column: `player`. Example columns: "
-               "`passing_yards, rushing_yards, receiving_yards, receptions, passing_tds, "
-               "rushing_tds, receiving_tds, interceptions_thrown`.")
-else:
-    st.caption("Required column: `player`. Example columns: "
-               "`hits, total_bases, home_runs, rbis, runs, pitcher_strikeouts`.")
+# ---------------- Auto stats loaders ----------------
+@st.cache_data(ttl=6*3600, show_spinner=False)  # cache 6h
+def load_nfl_stats(season: int) -> pd.DataFrame:
+    import nfl_data_py as nfl
+    st.info("Loading NFL season data…", icon="🏈")
+    df = nfl.import_seasonal_data([season])
+    # games per player to make per-game rates (avoid divide by 0)
+    g = df["games"].replace({0: np.nan}) if "games" in df.columns else np.nan
+    out = pd.DataFrame({
+        "player": df.get("player_display_name"),
+        "passing_yards": df.get("passing_yards")/g,
+        "rushing_yards": df.get("rushing_yards")/g,
+        "receiving_yards": df.get("receiving_yards")/g,
+        "receptions": df.get("receptions")/g,
+        "passing_tds": df.get("passing_tds")/g,
+        "rushing_tds": df.get("rushing_tds")/g,
+        "receiving_tds": df.get("receiving_tds")/g,
+        "interceptions": df.get("interceptions")/g,  # thrown
+    })
+    return out.dropna(subset=["player"]).reset_index(drop=True)
 
-csv_file = st.file_uploader("Upload CSV", type=["csv"], accept_multiple_files=False)
+@st.cache_data(ttl=12*3600, show_spinner=False)
+def load_mlb_stats(season: int) -> pd.DataFrame:
+    st.info("Loading MLB season stats…", icon="⚾")
+    from pybaseball import batting_stats, pitching_stats
+    bat = batting_stats(season); pit = pitching_stats(season)
+    bat_out = pd.DataFrame({
+        "player": bat.get("Name"),
+        "G": bat.get("G"),
+        "hits": bat.get("H"),
+        "total_bases": bat.get("TB"),
+        "home_runs": bat.get("HR"),
+        "rbis": bat.get("RBI"),
+        "runs": bat.get("R"),
+    }).dropna(subset=["player"])
+    # per-game
+    for c in ["hits","total_bases","home_runs","rbis","runs"]:
+        bat_out[c] = bat_out[c] / bat_out["G"].replace({0:np.nan})
 
-if not sel_markets:
-    st.warning("Select at least one market in the sidebar.")
-    st.stop()
+    pit_out = pd.DataFrame({
+        "player": pit.get("Name"),
+        "G": pit.get("G"),
+        "pitcher_strikeouts": pit.get("SO"),
+    }).dropna(subset=["player"])
+    pit_out["pitcher_strikeouts"] = pit_out["pitcher_strikeouts"] / pit_out["G"].replace({0:np.nan})
 
-if csv_file is None:
-    st.info("Upload your CSV to continue.")
-    st.stop()
+    out = pd.merge(
+        bat_out.drop(columns=["G"]),
+        pit_out.drop(columns=["G"]),
+        on="player", how="outer"
+    )
+    return out.dropna(subset=["player"]).reset_index(drop=True)
 
-try:
-    df_stats = pd.read_csv(csv_file)
-except Exception as e:
-    st.error(f"Could not read CSV: {e}")
-    st.stop()
+def get_stats_df(league: str, season: int) -> pd.DataFrame:
+    return load_nfl_stats(season) if league=="NFL" else load_mlb_stats(season)
 
-if "player" not in df_stats.columns:
-    st.error("Your CSV must include a 'player' column.")
-    st.stop()
-
-df_stats["player"] = df_stats["player"].astype(str)
-players = df_stats["player"].tolist()
-
-# --------------------------- Fetch lines ---------------------------
-try:
-    board = fetch_odds_board(league, sel_markets, bookmakers, api_key)
-except Exception as e:
-    st.error(str(e))
-    st.stop()
-
-if board.empty:
-    st.warning("No player lines returned for the selected markets. Try different markets/bookmakers.")
-    st.stop()
-
-st.success(f"Fetched {len(board)} player lines for {league}.")
-
-# --------------------------- Simulate ---------------------------
-CSV_MAP = {
+# Market -> stat columns used in auto stats
+STAT_MAP = {
     "NFL": {
         "player_passing_yards": "passing_yards",
         "player_rushing_yards": "rushing_yards",
         "player_receiving_yards": "receiving_yards",
         "player_receptions": "receptions",
-        "player_rush_and_receive_yards": ["rushing_yards", "receiving_yards"],
+        "player_rush_and_receive_yards": ["rushing_yards","receiving_yards"],
         "player_passing_touchdowns": "passing_tds",
         "player_rushing_touchdowns": "rushing_tds",
         "player_receiving_touchdowns": "receiving_tds",
-        "player_interceptions_thrown": "interceptions_thrown",
+        "player_interceptions": "interceptions",
     },
     "MLB": {
         "player_hits": "hits",
         "player_total_bases": "total_bases",
         "player_home_runs": "home_runs",
         "player_rbis": "rbis",
-        "player_runs_scored": "runs",
+        "player_runs": "runs",
         "player_strikeouts": "pitcher_strikeouts",
     },
 }
 
-rows = []
-missing_players = 0
-missing_stats = 0
+def value_from_mapping(row: pd.Series, mapping):
+    if isinstance(mapping, list):
+        vals = [row.get(c) for c in mapping if c in row.index]
+        vals = [v for v in vals if pd.notna(v)]
+        return float(np.sum(vals)) if vals else np.nan
+    return row.get(mapping)
 
+# ---------------- Fetch, match, simulate ----------------
+if not markets:
+    st.warning("Select at least one market in the sidebar.")
+    st.stop()
+
+try:
+    board = fetch_odds_board(league, markets, bookmakers, api_key)
+except Exception as e:
+    st.error(str(e))
+    st.stop()
+
+if board.empty:
+    st.warning("No player lines returned. Try different markets/bookmakers.")
+    st.stop()
+
+stats_df = get_stats_df(league, season)
+players = stats_df["player"].astype(str).tolist()
+
+rows, missing_names, missing_stats = [], 0, 0
 for _, r in board.iterrows():
-    board_name = r["player"]
-    market = r["market"]
-    line = float(r["line"])
-
-    match = best_name_match(board_name, players)
-    if not match:
-        missing_players += 1
-        continue
-
-    row = df_stats.loc[df_stats["player"] == match].iloc[0]
-    mapping = CSV_MAP[league].get(market)
+    b_name, mkt, line = r["player"], r["market"], float(r["line"])
+    mapping = STAT_MAP[league].get(mkt)
     if mapping is None:
         continue
 
-    avg_val = value_from_mapping(row, mapping)
-    if pd.isna(avg_val):
+    match = best_name_match(b_name, players)
+    if not match:
+        missing_names += 1
+        continue
+
+    row = stats_df.loc[stats_df["player"] == match].iloc[0]
+    avg = value_from_mapping(row, mapping)
+    if pd.isna(avg):
         missing_stats += 1
         continue
 
-    p_over, p_under, sd = simulate_prob(float(avg_val), line)
+    p_over, p_under, sd = simulate_prob(float(avg), line)
     rows.append({
-        "player_board": board_name,
-        "player_csv": match,
-        "market": market,
+        "player": match,
+        "board_name": b_name,
+        "market": mkt,
         "line": round(line, 3),
-        "avg": round(float(avg_val), 3),
+        "avg": round(float(avg), 3),
         "model_sd": sd,
         "P(Over)": p_over,
         "P(Under)": p_under,
     })
 
-results = pd.DataFrame(rows).sort_values(["market", "P(Over)"], ascending=[True, False])
+results = pd.DataFrame(rows).sort_values(["market","P(Over)"], ascending=[True,False])
 
-col1, col2 = st.columns(2)
-with col1:
-    st.metric("Matched props", len(results))
-with col2:
-    st.caption(f"Unmatched players: {missing_players} • Missing CSV stat values: {missing_stats}")
+c1, c2, c3 = st.columns(3)
+c1.metric("Matched props", len(results))
+c2.caption(f"Unmatched names: {missing_names}")
+c3.caption(f"Missing stat values: {missing_stats}")
 
 if results.empty:
-    st.warning("No matches between Odds API players and your CSV for the selected markets.")
+    st.warning("No matches between Odds API players and auto stats for the selected markets.")
     st.stop()
 
 st.subheader("Simulated probabilities")
-st.caption("Model = conservative normal around your per-game average (prevents 0%/100% artifacts).")
+st.caption("Model = conservative normal around per-game average (avoids 0%/100% artifacts).")
 st.dataframe(results, use_container_width=True)
 
 st.download_button(
     "Download CSV",
     results.to_csv(index=False).encode("utf-8"),
-    file_name=f"{league.lower()}_simulated_props.csv",
+    file_name=f"{league.lower()}_{season}_simulated_props.csv",
     mime="text/csv",
 )
 
 st.markdown("#### Top 10 Overs")
-st.dataframe(results.nlargest(10, "P(Over)")[["player_board","market","line","avg","P(Over)","P(Under)"]],
+st.dataframe(results.nlargest(10,"P(Over)")[["board_name","market","line","avg","P(Over)","P(Under)"]],
              use_container_width=True)
 st.markdown("#### Top 10 Unders")
-st.dataframe(results.nlargest(10, "P(Under)")[["player_board","market","line","avg","P(Over)","P(Under)"]],
+st.dataframe(results.nlargest(10,"P(Under)")[["board_name","market","line","avg","P(Over)","P(Under)"]],
              use_container_width=True)
