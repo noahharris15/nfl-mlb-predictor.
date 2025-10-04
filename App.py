@@ -1,123 +1,168 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
+# ========================= CFB (College Football) =============================
+# Auto-pull 2025 team scoring from CollegeFootballData (CFBD)
+# Shows diagnostics (key presence, response status) and falls back to CSV if needed.
+
+import json
 import requests
 
-# Load secrets
-ODDS_API_KEY = st.secrets.get("ODDS_API_KEY", None)
-CFBD_API_KEY = st.secrets.get("CFBD_API_KEY", None)
+CFB_SEASON = 2025
 
-st.set_page_config(page_title="Sports Predictor", layout="wide")
+def _cfbd_key_info():
+    try:
+        key = st.secrets.get("CFBD_API_KEY", "")
+    except Exception:
+        key = ""
+    if not key:
+        return "", False, "No key in st.secrets"
+    # non-sensitive preview (first/last 3 chars + length)
+    preview = f"{key[:3]}…{key[-3:]} (len={len(key)})"
+    return key, True, preview
 
-# -----------------------------
-# College Football Data Function
-# -----------------------------
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)  # cache 30 min
+def _cfbd_request(path: str, params: dict | None = None) -> tuple[int, dict | list | str]:
+    """Return (status_code, json_or_text)."""
+    base = "https://api.collegefootballdata.com"
+    key = st.secrets.get("CFBD_API_KEY", "")
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+        "User-Agent": "streamlit-cfb-ppg/1.0",
+    }
+    url = f"{base}{path}"
+    try:
+        r = requests.get(url, headers=headers, params=params or {}, timeout=15)
+        ct = r.headers.get("Content-Type","")
+        if "application/json" in ct:
+            try:
+                return r.status_code, r.json()
+            except Exception:
+                return r.status_code, {"parse_error": True, "text": r.text}
+        else:
+            return r.status_code, r.text
+    except requests.RequestException as e:
+        return 0, {"error": str(e)}
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def cfb_team_stats_2025() -> pd.DataFrame:
     """
-    Robust pull from CollegeFootballData for 2025.
-    Normalized to: team, off_ppg, def_ppg
+    Build a simple team table with off_ppg and def_ppg for the season.
+    Uses CFBD's /stats/season endpoint with teamType=fbs+fcs for completeness.
     """
-    if not CFBD_API_KEY:
-        return pd.DataFrame({"team": [], "off_ppg": [], "def_ppg": []})
+    # offense
+    code_off, off = _cfbd_request(
+        "/stats/season",
+        {"year": CFB_SEASON, "teamType": "both", "side": "offense"}
+    )
+    # defense
+    code_def, deff = _cfbd_request(
+        "/stats/season",
+        {"year": CFB_SEASON, "teamType": "both", "side": "defense"}
+    )
 
-    headers = {"Authorization": f"Bearer {CFBD_API_KEY}"}
+    if code_off != 200 or code_def != 200:
+        # bubble up details so UI can show them
+        raise RuntimeError(json.dumps({
+            "off_status": code_off, "def_status": code_def,
+            "off_sample": (off[:1] if isinstance(off, list) else off),
+            "def_sample": (deff[:1] if isinstance(deff, list) else deff),
+        }, default=str))
 
-    def fetch_stat(year: int, wanted: str, extra_qs: dict | None = None) -> pd.DataFrame:
-        qs = {"year": str(year)}
-        if extra_qs:
-            qs.update(extra_qs)
-        url = "https://api.collegefootballdata.com/stats/season"
-        r = requests.get(url, headers=headers, params=qs, timeout=30)
-        if r.status_code != 200:
-            return pd.DataFrame()
-        data = r.json()
-        if not isinstance(data, list) or not data:
-            return pd.DataFrame()
-        df = pd.DataFrame(data)
-        if "statName" not in df.columns or "team" not in df.columns or "statValue" not in df.columns:
-            return pd.DataFrame()
-        mask = df["statName"].astype(str).str.lower().str.contains(wanted.lower())
-        df = df.loc[mask, ["team", "statValue"]].rename(columns={"statValue": wanted})
-        return df
+    # CFBD returns a list of dicts; pointsPerGame can be nested under 'stat' or flat
+    def _ppg_from_rows(rows):
+        out = {}
+        for r in rows or []:
+            team = r.get("team")
+            ppg = (r.get("pointsPerGame")
+                   or r.get("stat",{}).get("pointsPerGame")
+                   or r.get("ppa",{}).get("pointsPerGame"))
+            # also check common alt names that appear in some responses
+            if ppg is None:
+                ppg = (r.get("scoring",{}).get("pointsPerGame")
+                       or r.get("scoring",{}).get("ptsPerGame"))
+            if team and ppg is not None:
+                try:
+                    out[team] = float(ppg)
+                except Exception:
+                    continue
+        return out
 
-    # Try to get Offense PPG
-    off_df = fetch_stat(2025, "Points Per Game")
-    if not off_df.empty:
-        off_df = off_df.rename(columns={"Points Per Game": "off_ppg"})
+    off_map = _ppg_from_rows(off if isinstance(off, list) else [])
+    def_map = _ppg_from_rows(deff if isinstance(deff, list) else [])
 
-    # Try to get Opponent PPG
-    def_df = fetch_stat(2025, "Opponent Points Per Game")
-    if not def_df.empty:
-        def_df = def_df.rename(columns={"Opponent Points Per Game": "def_ppg"})
+    # Build DF
+    teams = sorted(set(off_map) | set(def_map))
+    if not teams:
+        raise RuntimeError("CFBD returned empty team list (after parse).")
 
-    # Handle missing cases
-    if off_df.empty and def_df.empty:
-        return pd.DataFrame({"team": [], "off_ppg": [], "def_ppg": []})
+    df = pd.DataFrame({
+        "team": teams,
+        "off_ppg": [off_map.get(t, 28.0) for t in teams],
+        "def_ppg": [def_map.get(t, 28.0) for t in teams],
+    })
+    # Gentle shrink toward 28 to stabilize tiny samples early season
+    df["off_ppg"] = 0.9*df["off_ppg"] + 0.1*28.0
+    df["def_ppg"] = 0.9*df["def_ppg"] + 0.1*28.0
+    return df
 
-    if def_df.empty:
-        off_df["def_ppg"] = off_df["off_ppg"].median()
-        return off_df.rename(columns={"team": "team"})[["team", "off_ppg", "def_ppg"]]
+def _cfb_matchup_mu(rates: pd.DataFrame, home: str, away: str) -> tuple[float, float]:
+    rH = rates.loc[rates["team"] == home]
+    rA = rates.loc[rates["team"] == away]
+    if rH.empty or rA.empty:
+        raise ValueError(f"Unknown CFB team(s): {home}, {away}")
+    H, A = rH.iloc[0], rA.iloc[0]
+    mu_home = max(EPS, (H["off_ppg"] + A["def_ppg"]) / 2.0)
+    mu_away = max(EPS, (A["off_ppg"] + H["def_ppg"]) / 2.0)
+    return mu_home, mu_away
 
-    if off_df.empty:
-        def_df["off_ppg"] = def_df["def_ppg"].median()
-        return def_df.rename(columns={"team": "team"})[["team", "off_ppg", "def_ppg"]]
-
-    # Merge both
-    df = pd.merge(off_df, def_df, on="team", how="inner")
-    df["off_ppg"] = pd.to_numeric(df["off_ppg"], errors="coerce")
-    df["def_ppg"] = pd.to_numeric(df["def_ppg"], errors="coerce")
-    return df.dropna().sort_values("team").reset_index(drop=True)
-
-
-# -----------------------------
-# College Football Page
-# -----------------------------
-def college_football_page():
+# ---------------------------- CFB UI block ------------------------------------
+elif page == "College Football":
     st.subheader("🏈🎓 College Football — 2025 (auto from CFBD)")
 
-    if st.button("Clear CFB cache"):
-        cfb_team_stats_2025.clear()
-        st.success("Cleared CFB cache. Re-run the app.")
+    key, has_key, key_preview = _cfbd_key_info()
+    with st.expander("Diagnostics", expanded=False):
+        st.write(f"Key present: **{has_key}**")
+        if has_key:
+            st.write(f"Key preview: `{key_preview}`")
+        if st.button("Clear CFB cache"):
+            st.cache_data.clear()
+            st.success("Cleared CFB cache. Re-run the app.")
 
-    df = cfb_team_stats_2025()
-    if df.empty:
-        st.error("No CFB stats available. Check your CFBD_API_KEY or API limits.")
-        return
+    if not has_key:
+        st.error("No `CFBD_API_KEY` found in Secrets. Add it in Streamlit Secrets.")
+        st.stop()
 
-    home = st.selectbox("Home team", df["team"].unique())
-    away = st.selectbox("Away team", df["team"].unique())
+    # Try to load CFBD
+    try:
+        rates = cfb_team_stats_2025()
+    except Exception as e:
+        st.error("CFBD request failed or returned no data. Details below.")
+        with st.expander("Error details (for debugging)"):
+            st.code(str(e))
+        st.info("You can still use a CSV fallback (team, off_ppg, def_ppg).")
+        up = st.file_uploader("Upload CFB CSV fallback", type=["csv","xlsx"])
+        if up is None:
+            st.stop()
+        df = pd.read_csv(up) if up.name.lower().endswith(".csv") else pd.read_excel(up)
+        need = {"team","off_ppg","def_ppg"}
+        if not need.issubset({c.lower() for c in df.columns}):
+            st.error("CSV must contain columns: team, off_ppg, def_ppg.")
+            st.stop()
+        # normalize col names
+        cols = {c.lower(): c for c in df.columns}
+        rates = df.rename(columns={
+            cols["team"]: "team", cols["off_ppg"]: "off_ppg", cols["def_ppg"]: "def_ppg"
+        })[["team","off_ppg","def_ppg"]]
 
-    if home and away:
-        home_row = df.loc[df["team"] == home].iloc[0]
-        away_row = df.loc[df["team"] == away].iloc[0]
+    # Normal CFB UI
+    home = st.selectbox("Home team", sorted(rates["team"].unique().tolist()))
+    away = st.selectbox("Away team", sorted([t for t in rates["team"].unique().tolist() if t != home]))
 
-        home_pts = (home_row["off_ppg"] + away_row["def_ppg"]) / 2
-        away_pts = (away_row["off_ppg"] + home_row["def_ppg"]) / 2
-
-        total = home_pts + away_pts
-        p_home = home_pts / total
-        p_away = away_pts / total
-
-        st.markdown(
-            f"**{home} vs {away}** — Expected points: {home_pts:.1f}–{away_pts:.1f} "
-            f"· P({home} win) = {p_home:.1%}, P({away} win) = {p_away:.1%}"
-        )
+    mu_h, mu_a = _cfb_matchup_mu(rates, home, away)
+    pH, pA, mH, mA = _poisson_sim(mu_h, mu_a)
+    st.markdown(
+        f"**{home}** vs **{away}** — Expected points: {mH:.1f}–{mA:.1f} · "
+        f"P({home} win) = **{100*pH:.1f}%**, P({away} win) = **{100*pA:.1f}%**"
+    )
 
     with st.expander("Show team table"):
-        st.dataframe(df)
-
-
-# -----------------------------
-# Main Navigation
-# -----------------------------
-page = st.radio("Pick a page", ["NFL", "MLB", "College Football", "Player Props"])
-
-if page == "College Football":
-    college_football_page()
-elif page == "NFL":
-    st.write("NFL page placeholder...")
-elif page == "MLB":
-    st.write("MLB page placeholder...")
-elif page == "Player Props":
-    st.write("Player Props page placeholder...")
+        st.dataframe(rates.sort_values("team").reset_index(drop=True))
