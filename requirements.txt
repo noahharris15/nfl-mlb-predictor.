@@ -4,6 +4,5 @@ numpy
 nfl-data-py
 pybaseball
 requests
-# optional; comment out if you don't need yet:
-# cfbd
-# statsapi
+cfbd
+statsapi
