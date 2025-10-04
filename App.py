@@ -1,278 +1,290 @@
-# app.py
-import time
+# app.py  — All-Sports PrizePicks Simulator (robust parsing + sane probabilities)
+
 import math
-import json
-import requests
-import numpy as np
+import time
+from typing import Dict, Any, List, Optional
+
 import pandas as pd
+import numpy as np
+import requests
 import streamlit as st
-from functools import lru_cache
 
-st.set_page_config(page_title="All-Sports PrizePicks Simulator", layout="wide")
+# ------------------------------------------------------------
+# UI SETUP
+# ------------------------------------------------------------
+st.set_page_config(page_title="All-Sports PrizePicks Simulator", page_icon="📊", layout="wide")
+st.title("📊 All-Sports PrizePicks Simulator (Realistic, league-clean, robust parsing)")
 
-# ----------------------------
-# Small utilities
-# ----------------------------
-def normal_cdf(x, mean=0.0, sd=1.0):
-    # P(X <= x) for Normal(mean, sd). Avoid scipy dependency.
-    z = (x - mean) / (sd if sd > 0 else 1e-6)
-    # Abramowitz-Stegun approximation
-    t = 1.0 / (1.0 + 0.2316419 * abs(z))
-    d = 0.3989423 * math.exp(-z*z/2.0)
-    prob = 1 - d * (1.330274*t - 1.821256*t**2 + 1.781478*t**3 - 0.356538*t**4 + 0.3193815*t**5)
-    return prob if z >= 0 else 1 - prob
-
-def clamp01(x):
-    return max(0.0, min(1.0, x))
-
-def backoff_sleep(attempt):
-    time.sleep(min(2**attempt, 8))
-
-# ----------------------------------------------------
-# PrizePicks: Correct endpoint + robust fetch & parse
-# ----------------------------------------------------
-PP_URL = "https://api.prizepicks.com/projections"
-
-@lru_cache(maxsize=32)
-def fetch_prizepicks_raw(league: str):
-    """Fetch PP projections for one league only, with retries and a UA header."""
+# ------------------------------------------------------------
+# Robust PrizePicks fetch/parse (handles old/new payloads)
+# ------------------------------------------------------------
+def fetch_prizepicks_board(league: str, per_page: int = 250, max_retries: int = 4) -> pd.DataFrame:
+    """
+    Fetch PrizePicks projections for a single league and return a tidy DataFrame.
+    Handles both:
+      - relationships.player.data.id            (old)
+      - relationships.new_player.data.id        (new)
+    Also builds player details from `included` (type 'player' or 'new_player').
+    """
+    league = (league or "").lower().strip()
+    base = "https://api.prizepicks.com/projections"
     params = {
-        "per_page": 250,          # Pulls ~full board page by page
+        "per_page": per_page,
         "single_stat": "true",
-        "league": league.lower()
+        "league": league,
     }
-    headers = {"User-Agent": "Mozilla/5.0"}
-    last_err = None
-    for attempt in range(5):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; PP-Streamlit/1.0)",
+        "Accept": "application/json",
+    }
+
+    last_err: Optional[Exception] = None
+    for i in range(max_retries):
         try:
-            r = requests.get(PP_URL, params=params, headers=headers, timeout=10)
-            if r.status_code == 429:
-                last_err = f"429 Too Many Requests (attempt {attempt+1})"
-                backoff_sleep(attempt+1)
-                continue
+            r = requests.get(base, params=params, headers=headers, timeout=20)
             r.raise_for_status()
-            return r.json()
-        except requests.RequestException as e:
-            last_err = str(e)
-            backoff_sleep(attempt+1)
-    raise RuntimeError(f"PrizePicks fetch failed for {league}: {last_err}")
+            payload: Dict[str, Any] = r.json() if r.content else {"data": [], "included": []}
+            data = payload.get("data", []) or []
+            included = payload.get("included", []) or []
 
-def parse_pp_board(data: dict, league: str) -> pd.DataFrame:
-    """Turn PP JSON into a tidy DataFrame filtered to the chosen league."""
-    # PP payload has "data" (projections) & "included" (players/teams/games)
-    df_proj = pd.json_normalize(data.get("data", []))
-    inc = pd.json_normalize(data.get("included", []))
+            # Build player lookup
+            player_by_id: Dict[str, Dict[str, Any]] = {}
+            for inc in included:
+                typ = inc.get("type")
+                if typ not in ("player", "new_player"):
+                    continue
+                pid = inc.get("id")
+                attrs = inc.get("attributes", {}) or {}
+                name = (
+                    attrs.get("name")
+                    or attrs.get("display_name")
+                    or attrs.get("full_name")
+                    or attrs.get("nickname")
+                    or ""
+                )
+                team = (
+                    attrs.get("team")
+                    or attrs.get("team_name")
+                    or attrs.get("pro_team")
+                    or attrs.get("league_team")
+                    or ""
+                )
+                player_by_id[pid] = {"player": name, "team": team}
 
-    # Keep only matching league at projection level when available
-    # (Some props include league on relationships/attributes)
-    if "attributes.league" in df_proj.columns:
-        df_proj = df_proj[df_proj["attributes.league"].str.lower() == league.lower()]
+            rows: List[Dict[str, Any]] = []
+            for item in data:
+                attrs = item.get("attributes", {}) or {}
 
-    # Build a player lookup
-    players = inc[inc["type"] == "players"].copy()
-    players["player_id"] = players["id"]
-    players["player_name"] = players["attributes.name"]
-    players["team"] = players["attributes.team"]  # sometimes None
+                item_league = (attrs.get("league") or "").lower()
+                # Hard filter: keep only chosen league
+                if league and item_league and item_league != league:
+                    continue
 
-    proj = df_proj.copy()
-    # Common fields
-    proj["player_id"] = proj["relationships.new_player.data.id"].fillna(proj["relationships.player.data.id"])
-    proj["player_id"] = proj["player_id"].astype(str)
-    proj["market_pp"] = proj["attributes.stat_type"].fillna(proj["attributes.title"])
-    proj["line"] = pd.to_numeric(proj["attributes.line_score"], errors="coerce")
-    proj["league"] = proj["attributes.league"].str.upper()
+                line = (
+                    attrs.get("line_score")
+                    or attrs.get("line_score_decimal")
+                    or attrs.get("value")
+                )
+                market_pp = (
+                    attrs.get("stat_type")
+                    or attrs.get("stat")
+                    or attrs.get("display_stat")
+                )
 
-    # Join player info
-    proj = proj.merge(players[["player_id", "player_name", "team"]], on="player_id", how="left")
+                rel = item.get("relationships", {}) or {}
+                player_rel = rel.get("new_player") or rel.get("player") or {}
+                player_id = (player_rel.get("data") or {}).get("id")
 
-    # Drop junk / null lines
-    proj = proj.dropna(subset=["line", "market_pp", "player_name"]).reset_index(drop=True)
+                pinfo = player_by_id.get(player_id, {})
+                rows.append(
+                    {
+                        "league": (item_league.upper() or league.upper()),
+                        "player_id": player_id,
+                        "player": pinfo.get("player", ""),
+                        "team": pinfo.get("team", ""),
+                        "market_pp": market_pp,
+                        "line_raw": line,
+                    }
+                )
 
-    # Normalize market names a bit (lower snake)
-    proj["market"] = (
-        proj["market_pp"].str.lower()
-        .str.replace(" ", "_", regex=False)
-        .str.replace("-", "_", regex=False)
-    )
+            df = pd.DataFrame(rows)
+            if df.empty:
+                return df
 
-    # Only chosen league (extra safety)
-    proj = proj[proj["league"].str.lower() == league.lower()].reset_index(drop=True)
+            # Clean columns
+            df["line"] = pd.to_numeric(df["line_raw"], errors="coerce")
+            df = df.dropna(subset=["player", "market_pp", "line"])
+            return df.reset_index(drop=True)
 
-    # Keep the essentials
-    keep_cols = ["league", "player_name", "team", "market", "market_pp", "line"]
-    proj = proj[keep_cols].rename(columns={"player_name": "player"})
+        except Exception as e:
+            last_err = e
+            # polite backoff
+            time.sleep(1.5 * (2 ** i))
 
-    # Deduplicate (PrizePicks can duplicate the same prop across slips)
-    proj = proj.drop_duplicates(subset=["player", "team", "market", "line"]).reset_index(drop=True)
-    return proj
+    # If we got here, we failed
+    raise RuntimeError(f"PrizePicks fetch/parse error: {last_err}")
 
-# ----------------------------------------------------
-# Optional baselines from free public APIs (NBA only here)
-# ----------------------------------------------------
-@lru_cache(maxsize=512)
-def nba_player_averages(player_name: str):
-    """Return approximate NBA per-game averages using balldontlie (free)."""
-    # Note: name matching is imperfect; we do a best-effort fuzzy-ish search.
-    base = "https://api.balldontlie.io/v1/players"
-    stats = "https://api.balldontlie.io/v1/season_averages"
-    headers = {"User-Agent": "Mozilla/5.0"}
+# ------------------------------------------------------------
+# Market normalization (keeps names tidy & comparable)
+# ------------------------------------------------------------
+MARKET_MAP = {
+    # Basketball
+    "points": "points",
+    "rebounds": "rebounds",
+    "assists": "assists",
+    "rebounds_assists": "rebounds_assists",
+    "pts_rebs_asts": "pra",
+    "threes_made": "threes",
+    "fantasy_score": "fantasy",
 
-    # Find player
-    r = requests.get(base, params={"search": player_name}, headers=headers, timeout=10)
-    if r.status_code != 200:
-        return {}
-    res = r.json().get("data", [])
-    if not res:
-        return {}
+    # Football (NFL)
+    "pass_yards": "pass_yards",
+    "rush_yards": "rush_yards",
+    "receiving_yards": "rec_yards",
+    "rec_yds": "rec_yards",
+    "receptions": "receptions",
+    "rush_attempts": "rush_att",
+    "pass_completions": "pass_cmp",
 
-    player_id = res[0]["id"]
+    # Baseball (examples)
+    "hits": "hits",
+    "total_bases": "tb",
+    "strikeouts": "ks",
+}
 
-    # Current or last season
-    season = pd.Timestamp.today().year - 1  # safe default: last season
-    r2 = requests.get(stats, params={"season": season, "player_ids[]": player_id}, headers=headers, timeout=10)
-    if r2.status_code != 200:
-        return {}
+def normalize_market(s: str) -> str:
+    if not s:
+        return ""
+    key = s.lower().strip().replace(" ", "_")
+    return MARKET_MAP.get(key, key)
 
-    dat = (r2.json().get("data") or [])
-    if not dat:
-        return {}
-    row = dat[0]
-    # Map to common PP markets we’ll see
-    return {
-        "points": row.get("pts"),
-        "rebounds": row.get("reb"),
-        "assists": row.get("ast"),
-        "points_rebounds_assists": (row.get("pts") or 0) + (row.get("reb") or 0) + (row.get("ast") or 0),
-        # Add more as needed…
-    }
+# ------------------------------------------------------------
+# Conservative model: estimate mean/sd and compute P(Over/Under)
+# (We avoid 0/100 artifacts by using sensible floors/caps.)
+# ------------------------------------------------------------
+# Default per-market SDs if we have no real variance (tuned conservatively)
+DEFAULT_SD = {
+    # NBA-ish
+    "points": 6.0,
+    "rebounds": 3.0,
+    "assists": 2.5,
+    "pra": 7.5,
+    "threes": 1.5,
 
-def get_baseline_mean_sd(row: pd.Series) -> tuple[float, float, str]:
+    # NFL-ish
+    "pass_yards": 40.0,
+    "rush_yards": 20.0,
+    "rec_yards": 22.0,
+    "receptions": 1.6,
+    "rush_att": 3.0,
+    "pass_cmp": 4.0,
+
+    # MLB-ish
+    "hits": 0.6,
+    "tb": 1.0,
+    "ks": 1.8,
+
+    # Fallback
+    "fantasy": 8.0,
+}
+
+VAR_FLOOR = 1e-6        # never allow zero variance
+Z_CAP = 5.25            # keeps probs away from 0/100 extremes
+
+def normal_cdf(x: float, mean: float, sd: float) -> float:
+    sd = max(sd, math.sqrt(VAR_FLOOR))
+    z = (x - mean) / sd
+    # cap z to avoid perfect 0/1
+    z = max(min(z, Z_CAP), -Z_CAP)
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+def estimate_market_mean(row: pd.Series) -> float:
     """
-    Return (mean, sd, source) for a given prop row.
-    - If NBA & we can fetch a matching stat from balldontlie: use that mean and a sane SD.
-    - Else: use a conservative prior centered near the PP line with jitter to avoid 0/100.
+    Simple neutral baseline: use the line as a central estimate
+    (this is conservative if you don't have real per-player averages).
+    If you have real averages in your pipeline, plug them in here.
     """
-    league = row["league"].lower()
-    market = row["market"]
-    line = float(row["line"])
+    return float(row["line"])
 
-    # Try NBA real averages first
-    if league == "nba":
-        avg = nba_player_averages(row["player"])
-        if avg:
-            # Attempt a market match
-            m = None
-            # Common mapping heuristics
-            if "points_rebounds_assists" in market or market in {"pra", "points+rebounds+assists"}:
-                m = avg.get("points_rebounds_assists")
-            elif "points" in market and "rebounds" not in market and "assists" not in market:
-                m = avg.get("points")
-            elif "rebounds" in market and "assists" not in market and "points" not in market:
-                m = avg.get("rebounds")
-            elif "assists" in market and "points" not in market and "rebounds" not in market:
-                m = avg.get("assists")
+def estimate_market_sd(market: str, line: float) -> float:
+    sd = DEFAULT_SD.get(market, None)
+    if sd is None:
+        # generic heuristic if a new market sneaks in
+        sd = max(0.08 * float(line), 1.0)
+    return float(sd)
 
-            if m is not None:
-                # SD heuristic: 35% of mean, bounded
-                sd = max(0.6, 0.35 * max(1.0, m))
-                return float(m), float(sd), "nba_avg"
+def compute_probs(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
 
-    # Conservative fallback around the line (prevents 0/100 artifacts):
-    # N(mean ~ line ± jitter, sd ~ 20% of max(line, 8) bounded)
-    jitter = np.random.normal(loc=0.0, scale=max(0.4, 0.03 * max(10.0, line)))
-    mean = max(0.0, line + jitter)
-    sd = max(0.8, 0.20 * max(8.0, line))
-    return float(mean), float(sd), "fallback"
+    df = df.copy()
+    df["market"] = df["market_pp"].map(normalize_market)
 
-def simulate_probs(df_props: pd.DataFrame) -> pd.DataFrame:
-    """Compute P(Over) and P(Under) using a normal model for each prop."""
-    rows = []
-    for _, r in df_props.iterrows():
-        mean, sd, src = get_baseline_mean_sd(r)
-        line = float(r["line"])
-        p_under = clamp01(normal_cdf(line, mean, sd))
-        p_over = clamp01(1.0 - p_under)
-        rows.append({
-            **r.to_dict(),
-            "mean": round(mean, 3),
-            "model_sd": round(sd, 3),
-            "P(Over)": round(p_over * 100, 2),
-            "P(Under)": round(p_under * 100, 2),
-            "baseline": src
-        })
-    out = pd.DataFrame(rows)
-    # Rank by distance from 50/50 (bigger edge first)
-    out["edge"] = (out["P(Over)"] - 50).abs()
-    return out.sort_values(["edge"], ascending=False).reset_index(drop=True)
+    # Keep only rows we can model
+    df = df.dropna(subset=["line", "market"])
 
-# ----------------------------
+    # Estimate mean/sd
+    df["avg"] = df.apply(estimate_market_mean, axis=1)
+    df["model_sd"] = df.apply(lambda r: estimate_market_sd(r["market"], r["line"]), axis=1)
+
+    # Probabilities
+    # P(Over) = 1 - CDF(line)
+    df["P(Over)"] = 1.0 - df.apply(lambda r: normal_cdf(r["line"], r["avg"], r["model_sd"]), axis=1)
+    df["P(Under)"] = 1.0 - df["P(Over)"]
+
+    # Keep tidy columns
+    keep = ["league", "player", "team", "market", "market_pp", "line", "avg", "model_sd", "P(Over)", "P(Under)"]
+    return df[keep].reset_index(drop=True)
+
+# ------------------------------------------------------------
 # UI
-# ----------------------------
-st.title("📊 All-Sports PrizePicks Simulator (Real stats when available)")
+# ------------------------------------------------------------
+LEAGUES = ["NFL", "NBA", "MLB", "NHL", "NCAAF", "NCAAB"]
 
-league = st.selectbox(
-    "Select League",
-    ["NFL", "NBA", "MLB", "NHL", "WNBA", "CBB", "CFB", "SOC", "LOL", "VAL", "CS2"],
-    index=0
-)
+col_a, col_b = st.columns([1, 1])
+with col_a:
+    league = st.selectbox("Select League", LEAGUES, index=0)
 
 with st.expander("ℹ️ How this works", expanded=False):
     st.markdown(
         """
-        1) We fetch the current **PrizePicks board** for the chosen league only.  
-        2) We **parse & keep** only that league (no cross-sport mixing).  
-        3) We estimate per-prop **P(Over/Under)** with a **conservative normal model**:  
-           - **NBA**: tries real per-game averages via *balldontlie* for points / rebounds / assists / PRA.  
-           - Others: fallback around the PP line with jitter and a sane SD to avoid 0%/100% artifacts.  
+- We fetch the **current** PrizePicks board for the league you select and **filter strictly** to that league.
+- Market names are normalized (e.g., `rec_yds` → `rec_yards`) so you don’t get cross-sport or odd label artifacts.
+- We use a **conservative normal model** with variance floors to avoid silly **0%/100%** results.
+- If you later add real player averages/variance, plug them into `estimate_market_mean` / `estimate_market_sd`.
         """
     )
 
-# Fetch board
-status = st.empty()
+debug = st.checkbox("Show debug logs", value=False)
+
+# Fetch & simulate
 try:
-    status.info(f"Fetching PrizePicks board for **{league}**…")
-    raw = fetch_prizepicks_raw(league)
-    board = parse_pp_board(raw, league)
-    if board.empty:
-        status.warning("No PrizePicks markets parsed for this league right now.")
-        st.stop()
-    status.success(f"Loaded {len(board)} props.")
+    with st.spinner("Fetching PrizePicks board…"):
+        raw = fetch_prizepicks_board(league)
+
+    if raw.empty:
+        st.warning("No markets parsed for this league right now.")
+    else:
+        modeled = compute_probs(raw)
+
+        # Display results
+        st.subheader("Simulated edges (conservative normal model)")
+        st.caption("Probabilities are model estimates based on a neutral baseline from the current board.")
+        st.dataframe(
+            modeled.sort_values(["P(Over)"], ascending=False).reset_index(drop=True),
+            use_container_width=True,
+        )
+
+        # Download
+        csv = modeled.to_csv(index=False).encode("utf-8")
+        st.download_button("Download CSV", data=csv, file_name=f"pp_{league.lower()}_sims.csv", mime="text/csv")
+
+        if debug:
+            st.divider()
+            st.subheader("Debug: raw parsed rows")
+            st.dataframe(raw.head(200), use_container_width=True)
+
 except Exception as e:
-    status.error(f"Fetch/parse error: {e}")
-    st.stop()
-
-st.subheader("Clean board (parsed)")
-st.dataframe(board, use_container_width=True)
-
-# Simulate
-st.subheader("Simulated probabilities (conservative model)")
-with st.spinner("Simulating…"):
-    results = simulate_probs(board)
-
-# Show results with some helpful sorting/filters
-col1, col2, col3 = st.columns([1,1,1])
-with col1:
-    min_edge = st.slider("Minimum edge (|P-50|)", 0.0, 25.0, 5.0, 0.5)
-with col2:
-    view = st.selectbox("View", ["All", "Only Over ≥ 55%", "Only Under ≥ 55%"], index=0)
-with col3:
-    src_filter = st.selectbox("Baseline source", ["any", "nba_avg", "fallback"], index=0)
-
-df_show = results.copy()
-df_show = df_show[df_show["edge"] >= min_edge]
-
-if view == "Only Over ≥ 55%":
-    df_show = df_show[df_show["P(Over)"] >= 55]
-elif view == "Only Under ≥ 55%":
-    df_show = df_show[df_show["P(Under)"] >= 55]
-
-if src_filter != "any":
-    df_show = df_show[df_show["baseline"] == src_filter]
-
-# Friendly column order
-cols = ["league", "player", "team", "market", "market_pp", "line", "mean", "model_sd", "P(Over)", "P(Under)", "baseline"]
-df_show = df_show[cols] if all(c in df_show.columns for c in cols) else df_show
-
-st.dataframe(df_show, use_container_width=True)
-
-st.caption("Tip: use the filters to avoid unrealistic 0/100% edges. Baselines are deliberately conservative unless real averages are available.")
+    st.error(f"Fetch/parse error: {e}")
+    if debug:
+        st.exception(e)
