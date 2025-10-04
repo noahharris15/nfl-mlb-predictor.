@@ -3,15 +3,10 @@ import pandas as pd
 import numpy as np
 import requests
 
-# -----------------------------
-# Streamlit setup
-# -----------------------------
-st.set_page_config(page_title="🏈 College Football — 2025 (auto from CFBD)", layout="centered")
+st.set_page_config(page_title="🏈 College Football Predictor", layout="centered")
 st.title("🏈 College Football — 2025 (auto from CFBD)")
 
-# -----------------------------
-# API Key setup
-# -----------------------------
+# --- API Key ---
 CFBD_API_KEY = st.secrets.get("CFBD_API_KEY", None)
 if not CFBD_API_KEY:
     st.error("⚠️ Missing CFBD API key in Streamlit secrets.")
@@ -19,54 +14,54 @@ if not CFBD_API_KEY:
 
 headers = {"Authorization": f"Bearer {CFBD_API_KEY}"}
 
-# -----------------------------
-# Pull and clean CFB stats
-# -----------------------------
+# --- Pull & clean CFBD stats ---
 @st.cache_data(ttl=3600)
 def get_cfb_stats(year=2024):
-    """Fetch and flatten team stats from CFBD API"""
+    """Fetches and formats team-level stats from CFBD"""
     url = f"https://api.collegefootballdata.com/stats/season?year={year}&seasonType=regular"
-    resp = requests.get(url, headers=headers)
+    r = requests.get(url, headers=headers)
 
-    if resp.status_code != 200:
-        st.error(f"❌ CFBD request failed: {resp.status_code}")
+    if r.status_code != 200:
+        st.error(f"CFBD API error: {r.status_code}")
         return pd.DataFrame()
 
     try:
-        data = resp.json()
+        data = r.json()
     except Exception as e:
-        st.error(f"❌ Could not decode JSON: {e}")
+        st.error(f"JSON parse error: {e}")
         return pd.DataFrame()
 
     if not data:
-        st.warning("⚠️ No data returned for this season.")
+        st.warning("⚠️ No data found for this season.")
         return pd.DataFrame()
 
-    # Convert JSON to DataFrame and keep only relevant columns
-    df = pd.json_normalize(data)[["team", "statName", "statValue"]]
+    df = pd.json_normalize(data)
+    df = df[["team", "statName", "statValue"]]
 
-    # Pivot to get each stat as a column
-    df_pivot = df.pivot_table(index="team", columns="statName", values="statValue", aggfunc="first").reset_index()
+    # Pivot stats wide
+    df = df.pivot_table(index="team", columns="statName", values="statValue", aggfunc="first").reset_index()
 
-    # Convert numeric columns
-    for col in df_pivot.columns:
-        if col != "team":
-            df_pivot[col] = pd.to_numeric(df_pivot[col], errors="coerce")
+    # Convert everything numeric that can be
+    for c in df.columns:
+        if c != "team":
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Rename key stats
-    df_pivot = df_pivot.rename(columns={
-        "pointsPerGame": "off_ppg",
-        "opponentPointsPerGame": "def_ppg"
-    })
+    # Detect available scoring columns
+    possible_off = [c for c in df.columns if "points" in c.lower() and "pergame" in c.lower() and "opponent" not in c.lower()]
+    possible_def = [c for c in df.columns if "opponentpoints" in c.lower() or "opp_points" in c.lower()]
 
-    df_pivot = df_pivot.dropna(subset=["off_ppg", "def_ppg"], how="any")
-    return df_pivot
+    if not possible_off or not possible_def:
+        st.error("❌ Could not find points per game columns in CFBD data. Check API format.")
+        return pd.DataFrame()
 
-# -----------------------------
-# Simulate Game
-# -----------------------------
+    df["off_ppg"] = df[possible_off[0]]
+    df["def_ppg"] = df[possible_def[0]]
+
+    df = df.dropna(subset=["off_ppg", "def_ppg"])
+    return df
+
+# --- Simulation function ---
 def simulate_game(home, away, df, sims=10000):
-    """Monte Carlo sim for expected scores & win probability"""
     h = df[df["team"] == home].iloc[0]
     a = df[df["team"] == away].iloc[0]
 
@@ -78,48 +73,31 @@ def simulate_game(home, away, df, sims=10000):
 
     home_win = np.mean(home_scores > away_scores) * 100
     away_win = np.mean(away_scores > home_scores) * 100
-    tie = 100 - home_win - away_win
 
-    return {
-        "home_exp": home_exp,
-        "away_exp": away_exp,
-        "home_win": home_win,
-        "away_win": away_win,
-        "tie": tie
-    }
+    return home_exp, away_exp, home_win, away_win
 
-# -----------------------------
-# User Interface
-# -----------------------------
-year = st.number_input("Season", min_value=2023, max_value=2025, value=2024, step=1)
-st.write("📊 Using CFBD API to load real offensive & defensive PPG stats")
+# --- UI ---
+year = st.number_input("Season", min_value=2023, max_value=2025, value=2024)
+st.info("Using CFBD API to load real offensive & defensive PPG stats.")
 
-with st.spinner("Fetching live college football data..."):
+with st.spinner("Loading data..."):
     df = get_cfb_stats(year)
 
 if df.empty:
-    st.error("❌ No stats found. Try a different season or check API key.")
     st.stop()
 
 teams = sorted(df["team"].unique())
-
 col1, col2 = st.columns(2)
-home = col1.selectbox("🏠 Home Team", teams, index=0)
-away = col2.selectbox("✈️ Away Team", teams, index=1)
+home_team = col1.selectbox("🏠 Home Team", teams)
+away_team = col2.selectbox("✈️ Away Team", teams)
 
-if home and away:
-    st.subheader(f"**{home} vs {away}** — Simulation Results")
-
-    results = simulate_game(home, away, df)
+if st.button("Simulate Game"):
+    home_exp, away_exp, home_win, away_win = simulate_game(home_team, away_team, df)
     st.markdown(f"""
-    - 🏠 **{home} Expected Points:** {results['home_exp']:.1f}  
-    - ✈️ **{away} Expected Points:** {results['away_exp']:.1f}  
-    - 📈 **Win Probability:**  
-        - {home}: {results['home_win']:.2f}%  
-        - {away}: {results['away_win']:.2f}%  
-        - Tie: {results['tie']:.2f}%
+    ### 🏈 {home_team} vs {away_team}
+    - **Expected Points:** {home_team} {home_exp:.1f} — {away_team} {away_exp:.1f}
+    - **Win Probability:**
+        - {home_team}: {home_win:.2f}%
+        - {away_team}: {away_win:.2f}%
     """)
-
-st.divider()
-with st.expander("📋 Show Full Team Stats Table"):
-    st.dataframe(df.sort_values("off_ppg", ascending=False))
+    st.dataframe(df[["team", "off_ppg", "def_ppg"]].sort_values("off_ppg", ascending=False))
