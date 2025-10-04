@@ -4,13 +4,13 @@ import numpy as np
 import requests
 
 # -----------------------------
-# PAGE SETUP
+# Streamlit setup
 # -----------------------------
-st.set_page_config(page_title="🏈 College Football — Auto from CFBD", layout="centered")
+st.set_page_config(page_title="🏈 College Football — 2025 (auto from CFBD)", layout="centered")
 st.title("🏈 College Football — 2025 (auto from CFBD)")
 
 # -----------------------------
-# API KEY SETUP
+# API Key setup
 # -----------------------------
 CFBD_API_KEY = st.secrets.get("CFBD_API_KEY", None)
 if not CFBD_API_KEY:
@@ -20,43 +20,53 @@ if not CFBD_API_KEY:
 headers = {"Authorization": f"Bearer {CFBD_API_KEY}"}
 
 # -----------------------------
-# FETCH TEAM STATS
+# Pull and clean CFB stats
 # -----------------------------
 @st.cache_data(ttl=3600)
 def get_cfb_stats(year=2024):
-    """Fetch team stats from the new CFBD endpoint."""
+    """Fetch and flatten team stats from CFBD API"""
     url = f"https://api.collegefootballdata.com/stats/season?year={year}&seasonType=regular"
     resp = requests.get(url, headers=headers)
+
     if resp.status_code != 200:
-        st.error(f"❌ API request failed with status {resp.status_code}")
-        return None
+        st.error(f"❌ CFBD request failed: {resp.status_code}")
+        return pd.DataFrame()
 
     try:
         data = resp.json()
     except Exception as e:
         st.error(f"❌ Could not decode JSON: {e}")
-        return None
+        return pd.DataFrame()
 
     if not data:
-        st.warning("⚠️ No CFB data returned for that year.")
-        return None
+        st.warning("⚠️ No data returned for this season.")
+        return pd.DataFrame()
 
-    df = pd.DataFrame(data)
-    # Extract relevant stats
-    grouped = df.groupby("team").agg(
-        off_ppg=("stat", lambda x: pd.to_numeric(df.loc[x.index][df.loc[x.index]["statName"]=="pointsPerGame"], errors="coerce").mean()),
-        def_ppg=("stat", lambda x: pd.to_numeric(df.loc[x.index][df.loc[x.index]["statName"]=="opponentPointsPerGame"], errors="coerce").mean())
-    ).reset_index()
+    # Convert JSON to DataFrame and keep only relevant columns
+    df = pd.json_normalize(data)[["team", "statName", "statValue"]]
 
-    # Drop missing data
-    grouped = grouped.dropna(subset=["off_ppg", "def_ppg"])
-    return grouped
+    # Pivot to get each stat as a column
+    df_pivot = df.pivot_table(index="team", columns="statName", values="statValue", aggfunc="first").reset_index()
+
+    # Convert numeric columns
+    for col in df_pivot.columns:
+        if col != "team":
+            df_pivot[col] = pd.to_numeric(df_pivot[col], errors="coerce")
+
+    # Rename key stats
+    df_pivot = df_pivot.rename(columns={
+        "pointsPerGame": "off_ppg",
+        "opponentPointsPerGame": "def_ppg"
+    })
+
+    df_pivot = df_pivot.dropna(subset=["off_ppg", "def_ppg"], how="any")
+    return df_pivot
 
 # -----------------------------
-# SIMULATE MATCHUP
+# Simulate Game
 # -----------------------------
 def simulate_game(home, away, df, sims=10000):
-    """Simulate expected scores and win probabilities."""
+    """Monte Carlo sim for expected scores & win probability"""
     h = df[df["team"] == home].iloc[0]
     a = df[df["team"] == away].iloc[0]
 
@@ -66,8 +76,8 @@ def simulate_game(home, away, df, sims=10000):
     home_scores = np.random.poisson(home_exp, sims)
     away_scores = np.random.poisson(away_exp, sims)
 
-    home_win = np.sum(home_scores > away_scores) / sims * 100
-    away_win = np.sum(away_scores > home_scores) / sims * 100
+    home_win = np.mean(home_scores > away_scores) * 100
+    away_win = np.mean(away_scores > home_scores) * 100
     tie = 100 - home_win - away_win
 
     return {
@@ -79,37 +89,37 @@ def simulate_game(home, away, df, sims=10000):
     }
 
 # -----------------------------
-# MAIN UI
+# User Interface
 # -----------------------------
-st.subheader("Select Season and Teams")
+year = st.number_input("Season", min_value=2023, max_value=2025, value=2024, step=1)
+st.write("📊 Using CFBD API to load real offensive & defensive PPG stats")
 
-year = st.number_input("Season", min_value=2023, max_value=2025, value=2024)
-
-with st.spinner("Loading college football data..."):
+with st.spinner("Fetching live college football data..."):
     df = get_cfb_stats(year)
 
-if df is None or df.empty:
-    st.error("❌ No valid data found. Try 2024 or verify your API key.")
+if df.empty:
+    st.error("❌ No stats found. Try a different season or check API key.")
     st.stop()
 
 teams = sorted(df["team"].unique())
 
 col1, col2 = st.columns(2)
-home = col1.selectbox("Home Team", teams, index=0)
-away = col2.selectbox("Away Team", teams, index=1)
+home = col1.selectbox("🏠 Home Team", teams, index=0)
+away = col2.selectbox("✈️ Away Team", teams, index=1)
 
 if home and away:
-    st.write(f"Comparing **{home} vs {away}**")
+    st.subheader(f"**{home} vs {away}** — Simulation Results")
+
     results = simulate_game(home, away, df)
     st.markdown(f"""
     - 🏠 **{home} Expected Points:** {results['home_exp']:.1f}  
     - ✈️ **{away} Expected Points:** {results['away_exp']:.1f}  
-    - 📊 **Win Probability:**  
+    - 📈 **Win Probability:**  
         - {home}: {results['home_win']:.2f}%  
         - {away}: {results['away_win']:.2f}%  
         - Tie: {results['tie']:.2f}%
     """)
 
 st.divider()
-with st.expander("Show Raw Team Stats Table"):
+with st.expander("📋 Show Full Team Stats Table"):
     st.dataframe(df.sort_values("off_ppg", ascending=False))
