@@ -10,17 +10,20 @@ BASE_URL = "https://api.collegefootballdata.com"
 headers = {"Authorization": f"Bearer {API_KEY}"}
 
 # ------------------------------
-# Pull Team Stats from CFBD API
+# Function to load stats
 # ------------------------------
 @st.cache_data
-def get_cfb_team_stats(year=2024):
+def get_cfb_team_stats(year):
     url = f"{BASE_URL}/stats/season?year={year}"
     try:
         response = requests.get(url, headers=headers)
         response.raise_for_status()
         data = response.json()
     except Exception as e:
-        st.error(f"CFBD request failed: {e}")
+        st.error(f"CFBD request failed for {year}: {e}")
+        return pd.DataFrame()
+
+    if not data:
         return pd.DataFrame()
 
     teams = []
@@ -29,36 +32,41 @@ def get_cfb_team_stats(year=2024):
         off_ppg = item.get("pointsPerGame")
         def_ppg = item.get("opponentPointsPerGame")
 
-        # Skip teams missing stats
-        if off_ppg is None or def_ppg is None:
-            continue
+        if off_ppg and def_ppg:
+            teams.append({
+                "team": team_name,
+                "off_ppg": float(off_ppg),
+                "def_ppg": float(def_ppg)
+            })
 
-        teams.append({
-            "team": team_name,
-            "off_ppg": float(off_ppg),
-            "def_ppg": float(def_ppg)
-        })
-
-    df = pd.DataFrame(teams)
-    return df
+    return pd.DataFrame(teams)
 
 # ------------------------------
-# Load Data and Fallback
+# Auto fallback years
 # ------------------------------
-year = st.selectbox("Select Year", [2023, 2024, 2025], index=1)
-df = get_cfb_team_stats(year)
+year_order = [2025, 2024, 2023]
+df = pd.DataFrame()
+used_year = None
+
+for yr in year_order:
+    df = get_cfb_team_stats(yr)
+    if not df.empty:
+        used_year = yr
+        break
 
 if df.empty:
-    st.warning("⚠️ No data found for this year — try 2024 or upload fallback CSV.")
+    st.error("❌ No CFBD data found for 2023–2025. Try uploading a CSV fallback.")
     uploaded = st.file_uploader("Upload CFB CSV (team, off_ppg, def_ppg)", type=["csv"])
     if uploaded:
         df = pd.read_csv(uploaded)
+        used_year = "CSV upload"
+    else:
+        st.stop()
 
-if df.empty:
-    st.stop()
+st.success(f"✅ Using {used_year} season data from CollegeFootballData.com")
 
 # ------------------------------
-# Team Comparison
+# Simulation setup
 # ------------------------------
 home_team = st.selectbox("Home team", df["team"].unique())
 away_team = st.selectbox("Away team", df["team"].unique())
@@ -66,15 +74,10 @@ away_team = st.selectbox("Away team", df["team"].unique())
 home_stats = df[df["team"] == home_team].iloc[0]
 away_stats = df[df["team"] == away_team].iloc[0]
 
-# ------------------------------
-# Simulation Function
-# ------------------------------
 def simulate_game(home, away, sims=10000):
-    # Calculate expected points safely
     home_exp = np.nanmean([(home["off_ppg"] + away["def_ppg"]) / 2])
     away_exp = np.nanmean([(away["off_ppg"] + home["def_ppg"]) / 2])
 
-    # Prevent invalid (negative or nan) values
     home_exp = max(home_exp, 0.1)
     away_exp = max(away_exp, 0.1)
 
@@ -92,7 +95,6 @@ def simulate_game(home, away, sims=10000):
 # Run Simulation
 # ------------------------------
 result = simulate_game(home_stats, away_stats)
-
 st.subheader(f"{home_team} vs {away_team}")
 st.write(
     f"Expected points: **{home_team} {result['home_exp']:.1f} – {away_team} {result['away_exp']:.1f}**"
@@ -102,5 +104,5 @@ st.write(
     f"P({away_team} win) = **{result['p_away_win']:.1%}**"
 )
 
-with st.expander("📊 Full team stats table"):
+with st.expander("📊 Show full team stats"):
     st.dataframe(df)
