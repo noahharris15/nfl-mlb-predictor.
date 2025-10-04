@@ -1,5 +1,76 @@
 # App.py — NFL + MLB + Player Props + College Football (stats-only)
+import streamlit as st
+import pandas as pd
+import requests
 
+# Load secrets
+CFBD_API_KEY = st.secrets["CFBD_API_KEY"]
+ODDS_API_KEY = st.secrets["ODDS_API_KEY"]
+
+# =========================
+# Fetch College Football Stats
+# =========================
+@st.cache_data
+def get_cfb_team_stats(year=2025):
+    url = f"https://api.collegefootballdata.com/stats/season?year={year}"
+    headers = {"Authorization": f"Bearer {CFBD_API_KEY}"}
+    response = requests.get(url, headers=headers)
+
+    if response.status_code != 200:
+        st.error(f"CFBD API error: {response.status_code} {response.text}")
+        return pd.DataFrame()
+
+    data = response.json()
+
+    # Convert into dataframe
+    df = pd.DataFrame(data)
+
+    # Ensure we have team, offense PPG, defense PPG
+    # CFBD splits stats by category (Offense/Defense), so pivot it
+    df = df.pivot_table(index="team", columns="statName", values="statValue", aggfunc="mean").reset_index()
+
+    # Rename to match expected names
+    if "Points Per Game" in df.columns:
+        df = df.rename(columns={"Points Per Game": "off_ppg"})
+    if "Opponent Points Per Game" in df.columns:
+        df = df.rename(columns={"Opponent Points Per Game": "def_ppg"})
+
+    # Fill missing values with 0
+    df = df.fillna(0)
+    return df[["team", "off_ppg", "def_ppg"]]
+
+# =========================
+# UI
+# =========================
+st.title("🏈 College Football — 2025 (auto from CFBD)")
+
+df = get_cfb_team_stats(2025)
+
+if df.empty:
+    st.warning("No data pulled. Double-check your CFBD key in Streamlit Secrets.")
+else:
+    home_team = st.selectbox("Home team", df["team"].unique())
+    away_team = st.selectbox("Away team", df["team"].unique())
+
+    if st.button("Simulate Matchup"):
+        home_stats = df[df["team"] == home_team].iloc[0]
+        away_stats = df[df["team"] == away_team].iloc[0]
+
+        # Simple PPG-based estimate
+        home_exp = (home_stats["off_ppg"] + away_stats["def_ppg"]) / 2
+        away_exp = (away_stats["off_ppg"] + home_stats["def_ppg"]) / 2
+
+        total = home_exp + away_exp
+        home_prob = home_exp / total if total > 0 else 0.5
+        away_prob = away_exp / total if total > 0 else 0.5
+
+        st.write(
+            f"**{home_team} vs {away_team}** — Expected points: {home_exp:.1f}-{away_exp:.1f}. "
+            f"P({home_team} win) = {home_prob:.1%}, P({away_team} win) = {away_prob:.1%}"
+        )
+
+    with st.expander("Show team table"):
+        st.dataframe(df)
 from __future__ import annotations
 
 import io
