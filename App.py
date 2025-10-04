@@ -1,23 +1,25 @@
 # app.py — NFL + MLB predictors + Player Props (defense-adjusted, 2025 season)
+# ✅ Defense CSV is EMBEDDED in DEFENSE_CSV_TEXT (vertical format you sent).
+# ✅ No defense upload needed. NFL & MLB team sims use 2025 scoring rates.
+# ✅ Player Props page uses your uploaded QB/RB/WR CSVs and adjusts by opponent defense.
+
+import re
+from io import StringIO
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-from typing import Optional
-from io import StringIO
 
 # ---------------------------- Third-party data libs ----------------------------
-# NFL schedules (unchanged from your working version idea)
-import nfl_data_py as nfl
-
-# MLB team schedule-and-record (team RS/RA) — keep if your current build works
-from pybaseball import schedule_and_record
+import nfl_data_py as nfl                          # NFL schedule / scores
+from pybaseball import schedule_and_record         # MLB team runs for/against
 
 # ------------------------------ UI / Constants --------------------------------
 st.set_page_config(page_title="NFL & MLB Predictors + Player Props (2025)", layout="wide")
 
 SIM_TRIALS = 10000
-HOME_EDGE_NFL = 0.6   # small HFA point bump in NFL sim
+HOME_EDGE_NFL = 0.6   # small home-field points bump in NFL sim
 EPS = 1e-9
 
 # ---------------- MLB: hard-coded team names (stable across libs) -------------
@@ -34,66 +36,678 @@ MLB_TEAMS_2025 = {
     "TEX": "Texas Rangers","TOR": "Toronto Blue Jays","WSN": "Washington Nationals",
 }
 
-# ---------------- DEFENSE STRENGTH (embedded; no external files) --------------
-# Baselines to scale by (league-ish)
-LEAGUE_PASS_YPA = 6.9
-LEAGUE_RUSH_YPA = 4.3
-LEAGUE_REC_YPT  = 7.6
+# ---------------- DEFENSE (your embedded vertical table) -----------------------
+# Format: repeated blocks of 15 numeric lines followed by the team full name line.
+# Column order per block:
+#   Season, EPA/Play, Total EPA, Success %, EPA/Pass, EPA/Rush, Pass Yards,
+#   Comp %, Pass TD, Rush Yards, Rush TD, ADoT, Sack %, Scramble %, Int %, Team Name
+DEFENSE_CSV_TEXT = """\
+Team
+Season
+EPA/Play
+Total EPA
+Success %
+EPA/Pass
+EPA/Rush
+Pass Yards
+Comp %
+Pass TD
+Rush Yards
+Rush TD
+ADoT
+Sack %
+Scramble %
+Int %
 
-_DEFENSE_CSV = """Team,pass_ypa_allowed,rush_ypa_allowed,rec_ypt_allowed
-ARI,6.9,4.3,7.6
-ATL,6.9,4.3,7.6
-BAL,6.9,4.3,7.6
-BUF,6.9,4.3,7.6
-CAR,6.9,4.3,7.6
-CHI,6.9,4.3,7.6
-CIN,6.9,4.3,7.6
-CLE,6.9,4.3,7.6
-DAL,6.9,4.3,7.6
-DEN,6.9,4.3,7.6
-DET,6.9,4.3,7.6
-GB,6.9,4.3,7.6
-HOU,6.9,4.3,7.6
-IND,6.9,4.3,7.6
-JAX,6.9,4.3,7.6
-KC,6.9,4.3,7.6
-LAC,6.9,4.3,7.6
-LAR,6.9,4.3,7.6
-LV,6.9,4.3,7.6
-MIA,6.9,4.3,7.6
-MIN,6.9,4.3,7.6
-NE,6.9,4.3,7.6
-NO,6.9,4.3,7.6
-NYG,6.9,4.3,7.6
-NYJ,6.9,4.3,7.6
-PHI,6.9,4.3,7.6
-PIT,6.9,4.3,7.6
-SEA,6.9,4.3,7.6
-SF,6.9,4.3,7.6
-TB,6.9,4.3,7.6
-TEN,6.9,4.3,7.6
-WAS,6.9,4.3,7.6
+2025.0
+-0.17
+-38.71
+0.4174
+-0.37
+0.06
+685.0
+0.6762
+3.0
+521.0
+4.0
+5.8
+0.0813
+0.065
+0.0163
+Minnesota Vikings
+
+2025.0
+-0.13
+-33.41
+0.379
+-0.17
+-0.05
+984.0
+0.5962
+7.0
+331.0
+1.0
+8.15
+0.0409
+0.0468
+0.0526
+Jacksonville Jaguars
+
+2025.0
+-0.11
+-26.37
+0.3796
+-0.1
+-0.12
+853.0
+0.5746
+2.0
+397.0
+2.0
+9.94
+0.0974
+0.0325
+0.0065
+Denver Broncos
+
+2025.0
+-0.11
+-25.57
+0.3667
+-0.17
+0.01
+710.0
+0.5938
+3.0
+445.0
+3.0
+7.69
+0.0823
+0.1076
+0.019
+Los Angeles Chargers
+
+2025.0
+-0.09
+-21.51
+0.3783
+0.0
+-0.22
+894.0
+0.6271
+7.0
+376.0
+4.0
+10.44
+0.1
+0.0571
+0.0214
+Detroit Lions
+
+2025.0
+-0.08
+-20.49
+0.4291
+-0.11
+-0.04
+860.0
+0.5693
+5.0
+504.0
+3.0
+8.43
+0.0329
+0.0658
+0.0197
+Philadelphia Eagles
+
+2025.0
+-0.08
+-19.59
+0.4149
+-0.16
+0.04
+790.0
+0.5714
+3.0
+409.0
+4.0
+8.3
+0.0733
+0.04
+0.0133
+Houston Texans
+
+2025.0
+-0.08
+-18.57
+0.4042
+-0.12
+0.0
+851.0
+0.664
+5.0
+394.0
+2.0
+8.12
+0.0952
+0.0544
+0.0204
+Los Angeles Rams
+
+2025.0
+-0.07
+-18.65
+0.4075
+0.0
+-0.19
+910.0
+0.6645
+6.0
+359.0
+0.0
+7.03
+0.069
+0.0575
+0.0402
+Seattle Seahawks
+
+2025.0
+-0.06
+-14.94
+0.4344
+-0.09
+-0.03
+690.0
+0.6829
+5.0
+462.0
+2.0
+7.02
+0.0368
+0.0588
+0.0
+San Francisco 49ers
+
+2025.0
+-0.06
+-13.91
+0.4202
+-0.02
+-0.11
+832.0
+0.6429
+6.0
+340.0
+3.0
+6.54
+0.0645
+0.1226
+0.0065
+Tampa Bay Buccaneers
+
+2025.0
+-0.05
+-11.24
+0.4279
+-0.13
+0.05
+602.0
+0.5769
+5.0
+436.0
+2.0
+10.08
+0.0806
+0.0806
+0.0242
+Atlanta Falcons
+
+2025.0
+-0.05
+-10.73
+0.379
+0.06
+-0.17
+689.0
+0.6442
+8.0
+281.0
+2.0
+7.95
+0.0924
+0.0336
+0.0168
+Cleveland Browns
+
+2025.0
+-0.05
+-11.02
+0.4638
+-0.04
+-0.05
+946.0
+0.6643
+8.0
+384.0
+2.0
+6.69
+0.0633
+0.0506
+0.0253
+Indianapolis Colts
+
+2025.0
+-0.02
+-3.64
+0.4487
+-0.09
+0.09
+778.0
+0.6694
+4.0
+508.0
+4.0
+8.27
+0.0694
+0.0903
+0.0208
+Kansas City Chiefs
+
+2025.0
+-0.01
+-2.38
+0.4559
+0.06
+-0.14
+1068.0
+0.6369
+5.0
+384.0
+2.0
+8.06
+0.0444
+0.0222
+0.0111
+Arizona Cardinals
+
+2025.0
+-0.01
+-1.85
+0.4315
+0.14
+-0.22
+948.0
+0.6565
+5.0
+411.0
+4.0
+7.98
+0.0544
+0.0544
+0.0136
+Las Vegas Raiders
+
+2025.0
+0.0
+0.2
+0.4094
+0.03
+-0.07
+886.0
+0.6815
+6.0
+310.0
+3.0
+6.87
+0.0632
+0.0345
+0.0115
+Green Bay Packers
+
+2025.0
+0.0
+0.89
+0.4912
+0.01
+0.0
+886.0
+0.7368
+10.0
+658.0
+4.0
+6.75
+0.0407
+0.0325
+0.0569
+Chicago Bears
+
+2025.0
+0.02
+3.33
+0.4208
+-0.06
+0.1
+564.0
+0.6214
+6.0
+657.0
+5.0
+6.87
+0.0732
+0.0894
+0.0163
+Buffalo Bills
+
+2025.0
+0.04
+9.13
+0.4133
+0.03
+0.05
+802.0
+0.6239
+4.0
+517.0
+5.0
+7.5
+0.0155
+0.0775
+0.031
+Carolina Panthers
+
+2025.0
+0.04
+11.09
+0.461
+0.11
+-0.05
+1131.0
+0.6957
+7.0
+488.0
+4.0
+7.6
+0.087
+0.0559
+0.0311
+Pittsburgh Steelers
+
+2025.0
+0.04
+10.44
+0.4183
+0.18
+-0.12
+1062.0
+0.6098
+7.0
+430.0
+3.0
+10.83
+0.0714
+0.05
+0.0071
+Washington Commanders
+
+2025.0
+0.05
+12.43
+0.4693
+0.19
+-0.15
+1024.0
+0.712
+7.0
+310.0
+2.0
+7.68
+0.0725
+0.0217
+0.0217
+New England Patriots
+
+2025.0
+0.07
+18.22
+0.4613
+-0.01
+0.19
+1021.0
+0.6375
+5.0
+612.0
+6.0
+7.88
+0.0562
+0.0449
+0.0169
+New York Giants
+
+2025.0
+0.07
+17.94
+0.4417
+0.2
+-0.06
+884.0
+0.7117
+9.0
+475.0
+4.0
+7.4
+0.0853
+0.0543
+0.0078
+New Orleans Saints
+
+2025.0
+0.1
+27.12
+0.4731
+0.13
+0.04
+1089.0
+0.6536
+8.0
+543.0
+5.0
+6.99
+0.0366
+0.0305
+0.0305
+Cincinnati Bengals
+
+2025.0
+0.11
+25.77
+0.3959
+0.23
+-0.03
+834.0
+0.6577
+7.0
+522.0
+4.0
+6.11
+0.0476
+0.0714
+0.0
+New York Jets
+
+2025.0
+0.12
+30.47
+0.4435
+0.16
+0.07
+935.0
+0.6984
+6.0
+566.0
+7.0
+6.82
+0.0294
+0.0441
+0.0221
+Tennessee Titans
+
+2025.0
+0.14
+39.54
+0.4685
+0.14
+0.12
+1084.0
+0.6667
+9.0
+565.0
+7.0
+8.04
+0.0233
+0.0523
+0.0058
+Baltimore Ravens
+
+2025.0
+0.25
+65.26
+0.4943
+0.4
+0.06
+1237.0
+0.7333
+10.0
+493.0
+6.0
+9.19
+0.034
+0.0476
+0.0068
+Dallas Cowboys
+
+2025.0
+0.25
+59.66
+0.5397
+0.34
+0.12
+941.0
+0.7757
+7.0
+632.0
+5.0
+6.15
+0.0615
+0.1154
+0.0
+Miami Dolphins
 """
 
-def load_embedded_defense() -> pd.DataFrame:
-    df = pd.read_csv(StringIO(_DEFENSE_CSV))
-    for c, base in {"pass_ypa_allowed": LEAGUE_PASS_YPA,
-                    "rush_ypa_allowed": LEAGUE_RUSH_YPA,
-                    "rec_ypt_allowed":  LEAGUE_REC_YPT}.items():
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(base).clip(lower=0.1)
-    df["Team"] = df["Team"].str.upper()
+# ---------------------- Team name → abbreviation mapping ----------------------
+TEAM_NAME_TO_ABBR = {
+    "Arizona Cardinals":"ARI","Atlanta Falcons":"ATL","Baltimore Ravens":"BAL","Buffalo Bills":"BUF",
+    "Carolina Panthers":"CAR","Chicago Bears":"CHI","Cincinnati Bengals":"CIN","Cleveland Browns":"CLE",
+    "Dallas Cowboys":"DAL","Denver Broncos":"DEN","Detroit Lions":"DET","Green Bay Packers":"GB",
+    "Houston Texans":"HOU","Indianapolis Colts":"IND","Jacksonville Jaguars":"JAX","Kansas City Chiefs":"KC",
+    "Las Vegas Raiders":"LV","Los Angeles Chargers":"LAC","Los Angeles Rams":"LAR","Miami Dolphins":"MIA",
+    "Minnesota Vikings":"MIN","New England Patriots":"NE","New Orleans Saints":"NO","New York Giants":"NYG",
+    "New York Jets":"NYJ","Philadelphia Eagles":"PHI","Pittsburgh Steelers":"PIT","San Francisco 49ers":"SF",
+    "Seattle Seahawks":"SEA","Tampa Bay Buccaneers":"TB","Tennessee Titans":"TEN","Washington Commanders":"WAS",
+}
+
+# --------------------- Parse your vertical defense table ----------------------
+def parse_vertical_defense(text: str) -> pd.DataFrame:
+    """
+    The provided table is vertical: 15 numeric lines then a team name, repeated.
+    We parse blocks into rows with columns in the known order.
+    """
+    if not text or not text.strip():
+        return pd.DataFrame()
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    # Remove header words-only lines that appear first
+    header_words = set([
+        "team","season","epa/play","total epa","success %","epa/pass","epa/rush",
+        "pass yards","comp %","pass td","rush yards","rush td","adot","sack %","scramble %","int %"
+    ])
+    cleaned = []
+    for ln in lines:
+        if ln.lower() in header_words:
+            continue
+        cleaned.append(ln)
+    lines = cleaned
+
+    rows = []
+    buf = []
+    for ln in lines:
+        # number or decimal like -0.17
+        if re.fullmatch(r"-?\d+(\.\d+)?", ln):
+            buf.append(float(ln))
+        else:
+            # non-numeric: assume team name ends block
+            team = ln
+            if len(buf) >= 15:
+                # Map the first 15 numbers to the columns
+                (season, epa_play, total_epa, success, epa_pass, epa_rush,
+                 pass_yards, comp_pct, pass_td, rush_yards, rush_td,
+                 adot, sack_pct, scramble_pct, int_pct) = buf[:15]
+                rows.append({
+                    "team_name": team,
+                    "season": season,
+                    "epa_play": epa_play,
+                    "epa_pass": epa_pass,
+                    "epa_rush": epa_rush,
+                })
+            buf = []
+
+    df = pd.DataFrame(rows)
+    # attach abbreviations
+    df["abbr"] = df["team_name"].map(TEAM_NAME_TO_ABBR)
+    df = df.dropna(subset=["abbr"]).reset_index(drop=True)
     return df
 
-def defense_scalers(opp_abbrev: str, def_df: pd.DataFrame) -> dict:
-    row = def_df.loc[def_df["Team"] == opp_abbrev.upper()]
+def build_defense_factors(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert EPA metrics (lower = better defense) into multiplicative factors.
+    We compute z-scores and clamp to ~0.85..1.15 range.
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    def _scale(series: pd.Series) -> pd.Series:
+        s = pd.to_numeric(series, errors="coerce")
+        mu, sd = float(s.mean()), float(s.std(ddof=0) or 1.0)
+        z = (s - mu) / (sd if sd > 1e-9 else 1.0)
+        # Lower EPA (better D) -> smaller factor
+        return 1.0 + np.clip(z, -2.0, 2.0) * 0.075
+
+    out = df.copy()
+    out["factor_all"]  = _scale(out["epa_play"])
+    # If pass/rush present, use them; else fall back to all
+    out["factor_pass"] = _scale(out["epa_pass"]) if "epa_pass" in out.columns and out["epa_pass"].notna().any() else out["factor_all"]
+    out["factor_rush"] = _scale(out["epa_rush"]) if "epa_rush" in out.columns and out["epa_rush"].notna().any() else out["factor_all"]
+
+    # Clamp just in case
+    for c in ["factor_all","factor_pass","factor_rush"]:
+        out[c] = out[c].clip(0.80, 1.20)
+    return out[["abbr","team_name","factor_all","factor_pass","factor_rush"]]
+
+@st.cache_data(show_spinner=False)
+def load_embedded_defense() -> pd.DataFrame:
+    raw = parse_vertical_defense(DEFENSE_CSV_TEXT)
+    if raw.empty:
+        return pd.DataFrame(columns=["abbr","team_name","factor_all","factor_pass","factor_rush"])
+    return build_defense_factors(raw)
+
+def defense_scalers(opp_abbrev: str, def_factors: pd.DataFrame) -> Dict[str, float]:
+    row = def_factors.loc[def_factors["abbr"].str.upper() == opp_abbrev.upper()]
     if row.empty:
         return {"pass": 1.0, "rush": 1.0, "recv": 1.0}
     r = row.iloc[0]
-    return {
-        "pass": float(r["pass_ypa_allowed"] / LEAGUE_PASS_YPA),
-        "rush": float(r["rush_ypa_allowed"] / LEAGUE_RUSH_YPA),
-        "recv": float(r["rec_ypt_allowed"]  / LEAGUE_REC_YPT),
-    }
+    # Use pass vs. rush; receiving uses pass factor as a proxy
+    return {"pass": float(r["factor_pass"]), "rush": float(r["factor_rush"]), "recv": float(r["factor_pass"])}
 
 # ----------------------- Small sim helpers (Poisson/Normal) -------------------
 def simulate_poisson_game(mu_home: float, mu_away: float, trials: int = SIM_TRIALS):
@@ -223,7 +837,7 @@ def mlb_matchup_mu(rates: pd.DataFrame, home: str, away: str):
     if rH.empty or rA.empty:
         raise ValueError(f"Unknown MLB team(s): {home}, {away}")
     H, A = rH.iloc[0], rA.iloc[0]
-    mu_home = max(EPS, (H["RS_pg"] + A["RA_pg"]) / 2.0)  # neutral HFA in baseball
+    mu_home = max(EPS, (H["RS_pg"] + A["RA_pg"]) / 2.0)  # neutral HFA in MLB
     mu_away = max(EPS, (A["RS_pg"] + H["RA_pg"]) / 2.0)
     return mu_home, mu_away
 
@@ -234,37 +848,33 @@ def _coerce_numeric(df: pd.DataFrame, cols: list) -> pd.DataFrame:
             df[c] = (
                 df[c]
                 .astype(str)
-                .str.replace(",", "")
-                .str.replace("%", "")
+                .str.replace(",", "", regex=False)
+                .str.replace("%", "", regex=False)
             )
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
 def _load_any_csv(uploaded_file) -> pd.DataFrame:
-    """Robust loader for your pasted CSVs that include extra header lines."""
+    """Robust loader for pasted CSVs that include extra header lines."""
     raw = uploaded_file.read().decode("utf-8", errors="ignore")
-    # Find the header row that starts with 'Rk,Player,...'
+    # Find the header row that starts with 'Rk,Player,...' (common FBref export)
     lines = raw.strip().splitlines()
     header_idx = 0
-    for i, ln in enumerate(lines[:10]):  # search early lines
+    for i, ln in enumerate(lines[:10]):
         if ln.startswith("Rk,Player"):
             header_idx = i
             break
-    cleaned = "\n".join(lines[header_idx:])
-    df = pd.read_csv(StringIO(cleaned))
-    return df
+    cleaned = "\n".join(lines[header_idx:]) if lines else raw
+    try:
+        return pd.read_csv(StringIO(cleaned))
+    except Exception:
+        return pd.read_csv(StringIO(raw))  # last resort
 
 def build_qb_projection_row(qb_row: pd.Series, opp_scaler: float) -> dict:
-    # Expect columns: Player, Team, G, Yds, Y/G, TD, Att, Cmp, Rate ... (your export has them)
-    ypg = qb_row.get("Y/G")
-    td = qb_row.get("TD")
-    g  = qb_row.get("G")
-    att = qb_row.get("Att")
-    # Base per-game estimates
+    ypg = qb_row.get("Y/G"); td = qb_row.get("TD"); g = qb_row.get("G")
     try:
         base_yards = float(ypg)
     except Exception:
-        # fallback from totals if needed
         try:
             base_yards = float(qb_row.get("Yds")) / max(1.0, float(g))
         except Exception:
@@ -273,12 +883,10 @@ def build_qb_projection_row(qb_row: pd.Series, opp_scaler: float) -> dict:
         base_tds = float(td) / max(1.0, float(g))
     except Exception:
         base_tds = 1.5
-    # Defense adjust (pass)
     yards_mu = base_yards * float(opp_scaler)
-    tds_mu = base_tds * (opp_scaler ** 0.7)  # soften TD scaling a bit
-    # crude variance: 18% of mean
+    tds_mu   = base_tds   * (opp_scaler ** 0.7)
     yards_sd = max(8.0, 0.18 * yards_mu)
-    tds_sd = max(0.25, 0.55 * tds_mu)
+    tds_sd   = max(0.25, 0.55 * tds_mu)
     return {
         "Player": qb_row.get("Player"), "Team": qb_row.get("Team"),
         "Adj_PassYds_mu": yards_mu, "Adj_PassYds_sd": yards_sd,
@@ -286,9 +894,7 @@ def build_qb_projection_row(qb_row: pd.Series, opp_scaler: float) -> dict:
     }
 
 def build_rb_projection_row(rb_row: pd.Series, opp_scaler: float) -> dict:
-    # Expect: Player, Team, G, Yds, Y/G, TD, Att
-    ypg = rb_row.get("Y/G")
-    td = rb_row.get("TD"); g = rb_row.get("G")
+    ypg = rb_row.get("Y/G"); td = rb_row.get("TD"); g = rb_row.get("G")
     try:
         base_yards = float(ypg)
     except Exception:
@@ -301,9 +907,9 @@ def build_rb_projection_row(rb_row: pd.Series, opp_scaler: float) -> dict:
     except Exception:
         base_tds = 0.5
     yards_mu = base_yards * float(opp_scaler)
-    tds_mu = base_tds * (opp_scaler ** 0.7)
+    tds_mu   = base_tds   * (opp_scaler ** 0.7)
     yards_sd = max(6.0, 0.22 * yards_mu)
-    tds_sd = max(0.20, 0.65 * tds_mu)
+    tds_sd   = max(0.20, 0.65 * tds_mu)
     return {
         "Player": rb_row.get("Player"), "Team": rb_row.get("Team"),
         "Adj_RushYds_mu": yards_mu, "Adj_RushYds_sd": yards_sd,
@@ -311,9 +917,7 @@ def build_rb_projection_row(rb_row: pd.Series, opp_scaler: float) -> dict:
     }
 
 def build_wr_projection_row(wr_row: pd.Series, opp_scaler: float) -> dict:
-    # Expect: Player, Team, G, Yds, Y/G, TD, Tgt, Rec
-    ypg = wr_row.get("Y/G")
-    td = wr_row.get("TD"); g = wr_row.get("G")
+    ypg = wr_row.get("Y/G"); td = wr_row.get("TD"); g = wr_row.get("G")
     try:
         base_yards = float(ypg)
     except Exception:
@@ -326,9 +930,9 @@ def build_wr_projection_row(wr_row: pd.Series, opp_scaler: float) -> dict:
     except Exception:
         base_tds = 0.4
     yards_mu = base_yards * float(opp_scaler)
-    tds_mu = base_tds * (opp_scaler ** 0.7)
+    tds_mu   = base_tds   * (opp_scaler ** 0.7)
     yards_sd = max(6.0, 0.20 * yards_mu)
-    tds_sd = max(0.20, 0.70 * tds_mu)
+    tds_sd   = max(0.20, 0.70 * tds_mu)
     return {
         "Player": wr_row.get("Player"), "Team": wr_row.get("Team"),
         "Adj_RecYds_mu": yards_mu, "Adj_RecYds_sd": yards_sd,
@@ -337,7 +941,7 @@ def build_wr_projection_row(wr_row: pd.Series, opp_scaler: float) -> dict:
 
 # ----------------------------------- UI ---------------------------------------
 st.title("🏈⚾ NFL & MLB Predictors + Player Props — 2025")
-st.caption("NFL & MLB team matchups (team scoring rates only) + a Player Props page that ingests your QB/RB/WR CSVs and adjusts by opponent defense strength (embedded).")
+st.caption("NFL & MLB team matchups (team scoring rates only) + a Player Props page that ingests your QB/RB/WR CSVs and adjusts by **embedded** opponent defense.")
 
 page = st.radio("Pick a page", ["NFL", "MLB", "Player Props"], horizontal=True)
 
@@ -417,14 +1021,19 @@ elif page == "MLB":
 # -------------------------------- Player Props --------------------------------
 else:
     st.subheader("📈 Player Props (upload your QB / RB / WR CSVs)")
-    st.caption("We’ll parse your CSVs, adjust by **opponent defense** (baked in), and let you download a combined Excel.")
+    st.caption("We parse your CSVs, adjust by **embedded defense** (EPA-based factors), and give quick O/U sims + Excel export.")
 
-    def_df = load_embedded_defense()
-    opp = st.selectbox("Opponent (defense to adjust for)", def_df["Team"].tolist(), index=0)
-    scalers = defense_scalers(opp, def_df)
+    # Load embedded defense factors (from your vertical table)
+    def_factors = load_embedded_defense()
+    if def_factors.empty:
+        st.error("Embedded defense table failed to parse. (Ping me and I’ll tweak the parser.)")
+        st.stop()
 
-    with st.expander("Opponent defense used (lower = tougher)"):
-        st.dataframe(def_df.loc[def_df["Team"] == opp].reset_index(drop=True), use_container_width=True)
+    opp = st.selectbox("Opponent (defense to adjust for)", def_factors["abbr"].tolist(), index=0)
+    scalers = defense_scalers(opp, def_factors)
+
+    with st.expander("Defense factors in use"):
+        st.dataframe(def_factors.sort_values("abbr").reset_index(drop=True), use_container_width=True)
 
     colA, colB, colC = st.columns(3)
     with colA:
