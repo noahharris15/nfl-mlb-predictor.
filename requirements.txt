@@ -1,8 +1,6 @@
-streamlit
+cfbd
 pandas
 numpy
-nfl-data-py
+streamlit
+nfl_data_py
 pybaseball
-requests
-cfbd
-statsapi
