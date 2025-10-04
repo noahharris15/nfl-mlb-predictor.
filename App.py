@@ -347,38 +347,103 @@ elif page == "MLB":
         f"P({t1} win) = **{100*pH:.1f}%**, P({t2} win) = **{100*pA:.1f}%**"
     )
 
-# ---------------------- College Football (auto) ----------------------
+# -------------------------- College Football page --------------------------
 elif page == "College Football":
     st.subheader("🏈 College Football — 2025 (auto from CFBD)")
-    client_ok = _init_cfbd_client() is not None
-    if not HAS_CFBD:
-        st.warning("Install `cfbd` in requirements.txt to enable auto loading.")
-    if not client_ok:
-        st.info("Add your CFBD key in Streamlit **Secrets** as `CFBD_API_KEY = \"...\"`.")
-    rates, upcoming, status = cfb_team_rates_by_games(2025) if client_ok else (pd.DataFrame(), pd.DataFrame(), "no_key")
-    if client_ok and not rates.empty:
-        if not upcoming.empty:
-            labels = [f"{r['home_team']} vs {r['away_team']} — {r.get('date','')}" for _, r in upcoming.iterrows()]
-            sel = st.selectbox("Select upcoming game", labels)
-            try:
-                teams_part = sel.split(" — ")[0]
-                home, away = [t.strip() for t in teams_part.split(" vs ")]
-            except Exception:
-                home = away = None
-        else:
-            home = st.selectbox("Home team", rates["team"].tolist())
-            away = st.selectbox("Away team", [t for t in rates["team"].tolist() if t != home])
-        if home and away:
-            rH = rates.loc[rates["team"] == home].iloc[0]
-            rA = rates.loc[rates["team"] == away].iloc[0]
-            mu_home = (rH["PF_pg"] + rA["PA_pg"]) / 2.0
-            mu_away = (rA["PF_pg"] + rH["PA_pg"]) / 2.0
-            pH, pA, mH, mA = _poisson_sim(mu_home, mu_away)
-            st.markdown(
-                f"**{home}** vs **{away}** — Expected points: {mH:.1f}–{mA:.1f} · "
-                f"P({home} win) = **{100*pH:.1f}%**, P({away} win) = **{100*pA:.1f}%**"
-            )
 
+    # Quick indicator so we can tell if the key is visible
+    key_present = bool(st.secrets.get("CFBD_API_KEY"))
+    if not key_present:
+        st.info('Add your CFBD key in **Manage app → Settings → Secrets** as:\n\n`CFBD_API_KEY="YOUR_KEY"`')
+        st.stop()
+
+    # Lazy import so the rest of the app works even if cfbd isn't installed locally
+    try:
+        import cfbd  # pip package: cfbd
+    except Exception as e:
+        st.error("The `cfbd` package is not installed. Add `cfbd` to requirements.txt and redeploy.")
+        st.stop()
+
+    @st.cache_data(show_spinner=False)
+    def _cfbd_rates_for_year(year: int):
+        """Fetch all regular-season games for `year` and return PF/PA per team."""
+        cfg = cfbd.Configuration()
+        # CFBD uses an Authorization: Bearer <key> header
+        cfg.api_key["Authorization"] = st.secrets["CFBD_API_KEY"]
+        cfg.api_key_prefix["Authorization"] = "Bearer"
+        client = cfbd.ApiClient(cfg)
+        games_api = cfbd.GamesApi(client)
+
+        # Pull regular-season games
+        games = games_api.get_games(year=year, season_type="regular")
+
+        rows = []
+        for g in games:
+            # Some early games can be missing scores; guard it
+            if (getattr(g, "home_points", None) is None) or (getattr(g, "away_points", None) is None):
+                continue
+            rows.append({"team": g.home_team, "pf": g.home_points, "pa": g.away_points})
+            rows.append({"team": g.away_team, "pf": g.away_points, "pa": g.home_points})
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return pd.DataFrame(), 0
+
+        agg = df.groupby("team", as_index=False).agg(
+            games=("pf", "size"),
+            PF=("pf", "sum"),
+            PA=("pa", "sum"),
+        )
+        agg["PF_pg"] = agg["PF"] / agg["games"]
+        agg["PA_pg"] = agg["PA"] / agg["games"]
+
+        # Light shrink toward the national average for small sample sizes
+        league_total = float((df["pf"] + df["pa"]).mean()) if not df.empty else 52.0
+        prior = league_total / 2.0
+        shrink = np.clip(1.0 - agg["games"] / 4.0, 0.0, 1.0)
+        agg["PF_pg"] = (1 - shrink) * agg["PF_pg"] + shrink * prior
+        agg["PA_pg"] = (1 - shrink) * agg["PA_pg"] + shrink * prior
+
+        return agg[["team", "PF_pg", "PA_pg"]], len(games)
+
+    # Try 2025; if there are zero scored games, fall back to 2024 so page isn’t blank
+    try:
+        rates_2025, n_games_2025 = _cfbd_rates_for_year(2025)
+        if rates_2025.empty:
+            st.warning("No 2025 scored games returned yet; showing 2024 as a fallback.")
+            rates, _ = _cfbd_rates_for_year(2024)
+            season_label = "2024"
+        else:
+            rates = rates_2025
+            season_label = "2025"
+    except Exception as e:
+        st.error(f"CFBD error: {e}")
+        st.stop()
+
+    if rates.empty:
+        st.info("No team data available yet.")
+        st.stop()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        home = st.selectbox("Home team", rates["team"].tolist())
+    with c2:
+        away = st.selectbox("Away team", [t for t in rates["team"].tolist() if t != home])
+
+    rH = rates.loc[rates["team"] == home].iloc[0]
+    rA = rates.loc[rates["team"] == away].iloc[0]
+    mu_home = max(0.1, (float(rH["PF_pg"]) + float(rA["PA_pg"])) / 2.0)  # no HFA by default in CFB
+    mu_away = max(0.1, (float(rA["PF_pg"]) + float(rH["PA_pg"])) / 2.0)
+
+    pH, pA, mH, mA = _poisson_sim(mu_home, mu_away)
+    st.markdown(
+        f"**{home}** vs **{away}** — {season_label}  \n"
+        f"Expected points: **{mH:.1f}–{mA:.1f}**  ·  "
+        f"P({home} win) **{100*pH:.1f}%**,  P({away} win) **{100*pA:.1f}%**"
+    )
+
+    with st.expander("Show team rates"):
+        st.dataframe(rates.sort_values("team").reset_index(drop=True))
 # -------------------------- Player Props --------------------------
 else:
     st.subheader("🎯 Player Props — upload QB/RB/WR CSVs")
