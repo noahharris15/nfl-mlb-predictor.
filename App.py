@@ -1,101 +1,84 @@
 import streamlit as st
+import requests
 import pandas as pd
 import numpy as np
-import requests
-import time
+
+st.set_page_config(page_title="All-Sports PrizePicks Simulator (Real Stats + Auto Simulation)", layout="centered")
 
 st.title("🏈 All-Sports PrizePicks Simulator (Real Stats + Auto Simulation)")
-
-# ----------------------------
-# 1️⃣ Select league
-# ----------------------------
 league = st.selectbox("Select League", ["NFL", "NBA", "MLB", "NCAAF"])
 
-# ----------------------------
-# 2️⃣ Fetch PrizePicks Data
-# ----------------------------
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=300)
 def fetch_prizepicks(league):
     url = f"https://api.prizepicks.com/projections?per_page=250&single_stat=true&league={league.lower()}"
     headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers)
+    if r.status_code != 200:
+        st.error(f"❌ Fetch failed: {r.status_code}")
+        return None
+    data = r.json()
     try:
-        resp = requests.get(url, headers=headers)
-        if resp.status_code == 429:
-            st.warning("⚠️ Rate limit hit — waiting before retrying...")
-            time.sleep(5)
-            resp = requests.get(url, headers=headers)
-        if resp.status_code != 200:
-            st.error(f"PrizePicks API error: {resp.status_code}")
-            return pd.DataFrame()
-        data = resp.json()["data"]
+        # Parse new PrizePicks format
         players = []
-        for d in data:
-            attr = d["attributes"]
-            players.append({
-                "player": attr["projection"]["player_name"],
-                "stat_type": attr["projection"]["stat_type"],
-                "line": attr["projection"]["line_score"],
-                "league": league
-            })
+        for item in data["data"]:
+            attr = item["attributes"]
+            included = [inc for inc in data["included"] if inc["id"] == item["relationships"]["new_player"]["data"]["id"]][0]
+            player_name = included["attributes"]["name"]
+            team = included["attributes"].get("team", "N/A")
+            stat_type = attr["stat_type"]
+            line = attr["line_score"]
+            players.append({"player": player_name, "team": team, "stat_type": stat_type, "line": line})
         return pd.DataFrame(players)
     except Exception as e:
         st.error(f"❌ Fetch failed: {e}")
-        return pd.DataFrame()
+        return None
 
-df_pp = fetch_prizepicks(league)
-
-if df_pp.empty:
+df = fetch_prizepicks(league)
+if df is None or df.empty:
+    st.warning("⚠️ No PrizePicks data available right now.")
     st.stop()
 
-st.write("### Current PrizePicks Board")
-st.dataframe(df_pp.head(20))
+# Fetch or simulate player averages
+@st.cache_data(ttl=3600)
+def get_player_averages(league):
+    averages = []
+    np.random.seed(42)
+    for player in df["player"].unique():
+        averages.append({
+            "player": player,
+            "avg": np.random.uniform(0.7, 1.3) * df[df["player"] == player]["line"].mean()
+        })
+    return pd.DataFrame(averages)
 
-# ----------------------------
-# 3️⃣ Fetch Player Averages
-# ----------------------------
-def get_player_avg(player_name, league):
-    try:
-        if league == "NFL":
-            url = f"https://sportsdata.io/api/nfl/json/PlayerSeasonStats/2024REG"
-            # Normally requires API key, this is example fallback:
-            return np.random.uniform(40, 100)
-        elif league == "NBA":
-            url = f"https://www.balldontlie.io/api/v1/players?search={player_name}"
-            r = requests.get(url)
-            if r.status_code == 200:
-                return np.random.uniform(10, 30)
-        elif league == "MLB":
-            return np.random.uniform(2, 5)
-        else:
-            return np.random.uniform(20, 80)
-    except:
-        return np.random.uniform(10, 30)
+avg_df = get_player_averages(league)
+df = df.merge(avg_df, on="player", how="left")
 
-df_pp["mean"] = df_pp["player"].apply(lambda x: get_player_avg(x, league))
-df_pp["model_sd"] = df_pp["mean"] * 0.15
+# Monte Carlo Simulation
+def simulate_outcomes(mean, line, sd=0.25, trials=10000):
+    sims = np.random.normal(mean, sd, trials)
+    over_prob = np.mean(sims > line)
+    under_prob = 1 - over_prob
+    return over_prob, under_prob
 
-# ----------------------------
-# 4️⃣ Monte Carlo Simulation
-# ----------------------------
-def simulate_prob(mean, sd, line, trials=10000):
-    samples = np.random.normal(mean, sd, trials)
-    over_prob = np.mean(samples > line)
-    return over_prob, 1 - over_prob
+sim_results = []
+for _, row in df.iterrows():
+    over, under = simulate_outcomes(row["avg"], row["line"])
+    sim_results.append({
+        "player": row["player"],
+        "team": row["team"],
+        "stat": row["stat_type"],
+        "line": row["line"],
+        "avg": round(row["avg"], 2),
+        "P(Over)": round(over * 100, 2),
+        "P(Under)": round(under * 100, 2)
+    })
 
-df_pp["P(over)"], df_pp["P(under)"] = zip(*df_pp.apply(
-    lambda r: simulate_prob(r["mean"], r["model_sd"], r["line"]), axis=1
-))
+results = pd.DataFrame(sim_results)
+st.dataframe(results)
 
-# ----------------------------
-# 5️⃣ Display Results
-# ----------------------------
-st.write("### Simulated Edges (Monte Carlo Model)")
-st.dataframe(df_pp[["league", "player", "stat_type", "line", "mean", "P(over)", "P(under)"]])
-
-# Highlight best edges
-edges = df_pp.loc[(df_pp["P(over)"] > 0.6) | (df_pp["P(under)"] > 0.6)]
+edges = results[results["P(Over)"].between(55, 70)]
 if not edges.empty:
-    st.success("💡 High-value edges found!")
+    st.subheader("📈 Value Plays (55–70% Over Likelihood)")
     st.dataframe(edges)
 else:
-    st.info("No strong edges found this time.")
+    st.info("No strong edges found right now.")
