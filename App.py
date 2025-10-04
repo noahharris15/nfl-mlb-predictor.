@@ -1,5 +1,5 @@
 # app.py — Player Props Simulator (Odds API lines + auto stats; NFL + MLB)
-import os, math
+import os
 import pandas as pd
 import numpy as np
 import requests
@@ -7,7 +7,7 @@ import streamlit as st
 from scipy.stats import norm
 from rapidfuzz import fuzz
 
-st.set_page_config(page_title="Player Props Simulator (Auto Stats)", layout="wide")
+st.set_page_config(page_title="Player Props Simulator (Odds API + Auto Stats)", layout="wide")
 st.title("📊 Player Props Simulator (Odds API + Auto Stats)")
 
 # ---------------- Sidebar ----------------
@@ -17,18 +17,18 @@ with st.sidebar:
     api_key = st.text_input("Odds API key (or env ODDS_API_KEY)", type="password") \
               or os.getenv("ODDS_API_KEY", "")
 
-    # Valid Odds API player-prop markets (per docs)
+    # ✅ Accepted market keys per The Odds API v4
     VALID_MARKETS = {
         "NFL": [
-            "player_passing_yards",
-            "player_rushing_yards",
-            "player_receiving_yards",
+            "player_pass_yds",
+            "player_pass_tds",
+            "player_pass_interceptions",
+            "player_rush_yds",
+            "player_rush_tds",
+            "player_reception_yds",
             "player_receptions",
-            "player_rush_and_receive_yards",
-            "player_passing_touchdowns",
-            "player_rushing_touchdowns",
-            "player_receiving_touchdowns",
-            "player_interceptions",  # <- Odds API uses this key
+            "player_rec_tds",
+            "player_rush_rec_yds",   # combo
         ],
         "MLB": [
             "player_hits",
@@ -40,8 +40,7 @@ with st.sidebar:
         ],
     }
     defaults = {
-        "NFL": ["player_passing_yards","player_rushing_yards",
-                "player_receiving_yards","player_receptions"],
+        "NFL": ["player_pass_yds","player_rush_yds","player_reception_yds","player_receptions"],
         "MLB": ["player_hits","player_total_bases","player_home_runs","player_strikeouts"],
     }
     markets = st.multiselect("Markets to pull",
@@ -83,6 +82,11 @@ def simulate_prob(avg, line):
 def fetch_odds_board(league: str, markets: list, bookmakers: str, api_key: str) -> pd.DataFrame:
     if not api_key:
         raise RuntimeError("Add your Odds API key in the sidebar (or set env ODDS_API_KEY).")
+    # Only send markets that are valid for this league
+    markets = [m for m in markets if m in VALID_MARKETS[league]]
+    if not markets:
+        return pd.DataFrame()
+
     url = f"https://api.the-odds-api.com/v4/sports/{SPORT_KEY[league]}/odds"
     params = {
         "apiKey": api_key,
@@ -90,10 +94,11 @@ def fetch_odds_board(league: str, markets: list, bookmakers: str, api_key: str) 
         "oddsFormat": "decimal",
         "markets": ",".join(markets),
         "bookmakers": bookmakers,
+        "includeLinks": "false",
     }
     r = requests.get(url, params=params, timeout=25)
     if r.status_code != 200:
-        raise RuntimeError(f"Odds API error {r.status_code}: {r.text[:400]}")
+        raise RuntimeError(f"Odds API error {r.status_code}: {r.text[:500]}\nURL: {r.url}")
     data = r.json() or []
     rows = []
     for event in data:
@@ -119,23 +124,22 @@ def fetch_odds_board(league: str, markets: list, bookmakers: str, api_key: str) 
     return df
 
 # ---------------- Auto stats loaders ----------------
-@st.cache_data(ttl=6*3600, show_spinner=False)  # cache 6h
+@st.cache_data(ttl=6*3600, show_spinner=False)
 def load_nfl_stats(season: int) -> pd.DataFrame:
     import nfl_data_py as nfl
     st.info("Loading NFL season data…", icon="🏈")
     df = nfl.import_seasonal_data([season])
-    # games per player to make per-game rates (avoid divide by 0)
     g = df["games"].replace({0: np.nan}) if "games" in df.columns else np.nan
     out = pd.DataFrame({
         "player": df.get("player_display_name"),
-        "passing_yards": df.get("passing_yards")/g,
-        "rushing_yards": df.get("rushing_yards")/g,
-        "receiving_yards": df.get("receiving_yards")/g,
+        "passing_yds": df.get("passing_yards")/g,
+        "rushing_yds": df.get("rushing_yards")/g,
+        "receiving_yds": df.get("receiving_yards")/g,
         "receptions": df.get("receptions")/g,
-        "passing_tds": df.get("passing_tds")/g,
-        "rushing_tds": df.get("rushing_tds")/g,
-        "receiving_tds": df.get("receiving_tds")/g,
-        "interceptions": df.get("interceptions")/g,  # thrown
+        "pass_tds": df.get("passing_tds")/g,
+        "rush_tds": df.get("rushing_tds")/g,
+        "rec_tds": df.get("receiving_tds")/g,
+        "pass_ints": df.get("interceptions")/g,  # thrown
     })
     return out.dropna(subset=["player"]).reset_index(drop=True)
 
@@ -153,39 +157,32 @@ def load_mlb_stats(season: int) -> pd.DataFrame:
         "rbis": bat.get("RBI"),
         "runs": bat.get("R"),
     }).dropna(subset=["player"])
-    # per-game
     for c in ["hits","total_bases","home_runs","rbis","runs"]:
         bat_out[c] = bat_out[c] / bat_out["G"].replace({0:np.nan})
-
     pit_out = pd.DataFrame({
         "player": pit.get("Name"),
         "G": pit.get("G"),
         "pitcher_strikeouts": pit.get("SO"),
     }).dropna(subset=["player"])
     pit_out["pitcher_strikeouts"] = pit_out["pitcher_strikeouts"] / pit_out["G"].replace({0:np.nan})
-
-    out = pd.merge(
-        bat_out.drop(columns=["G"]),
-        pit_out.drop(columns=["G"]),
-        on="player", how="outer"
-    )
+    out = pd.merge(bat_out.drop(columns=["G"]), pit_out.drop(columns=["G"]), on="player", how="outer")
     return out.dropna(subset=["player"]).reset_index(drop=True)
 
 def get_stats_df(league: str, season: int) -> pd.DataFrame:
     return load_nfl_stats(season) if league=="NFL" else load_mlb_stats(season)
 
-# Market -> stat columns used in auto stats
+# ✅ Odds market -> our stat columns
 STAT_MAP = {
     "NFL": {
-        "player_passing_yards": "passing_yards",
-        "player_rushing_yards": "rushing_yards",
-        "player_receiving_yards": "receiving_yards",
+        "player_pass_yds": "passing_yds",
+        "player_pass_tds": "pass_tds",
+        "player_pass_interceptions": "pass_ints",
+        "player_rush_yds": "rushing_yds",
+        "player_rush_tds": "rush_tds",
+        "player_reception_yds": "receiving_yds",
         "player_receptions": "receptions",
-        "player_rush_and_receive_yards": ["rushing_yards","receiving_yards"],
-        "player_passing_touchdowns": "passing_tds",
-        "player_rushing_touchdowns": "rushing_tds",
-        "player_receiving_touchdowns": "receiving_tds",
-        "player_interceptions": "interceptions",
+        "player_rec_tds": "rec_tds",
+        "player_rush_rec_yds": ["rushing_yds","receiving_yds"],
     },
     "MLB": {
         "player_hits": "hits",
