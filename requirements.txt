@@ -1,6 +1,8 @@
 streamlit
 pandas
 numpy
+requests
 nfl_data_py
 pybaseball
+nba_api
 cfbd
