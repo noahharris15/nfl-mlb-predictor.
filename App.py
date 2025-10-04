@@ -228,43 +228,78 @@ def _prop_sim(mean:float,line:float,sd:float)->Tuple[float,float]:
 
 # =============================================================================
 # College Football (auto from CFBD)
-# =============================================================================
-CFBD_API_KEY = st.secrets.get("CFBD_API_KEY", os.getenv("CFBD_API_KEY","")).strip()
-CFBD_HEADERS = {"Authorization": f"Bearer {CFBD_API_KEY}"} if CFBD_API_KEY else {}
+# ==============================================================================
+# College Football (CFBD API)
+# ==============================================================================
+import requests
 
 @st.cache_data(show_spinner=False)
-def cfb_team_stats_2025()->pd.DataFrame:
-    if not CFBD_HEADERS:
+def cfb_team_stats_2025() -> pd.DataFrame:
+    api_key = st.secrets.get("CFBD_API_KEY", "")
+    if not api_key:
+        st.error("Missing CFBD_API_KEY in Streamlit secrets")
         return pd.DataFrame()
-    url="https://api.collegefootballdata.com/stats/season?year=2025&seasonType=regular"
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    url = "https://api.collegefootballdata.com/team/stats/season?year=2025"
+
     try:
-        r=requests.get(url, headers=CFBD_HEADERS, timeout=20)
-        r.raise_for_status()
-        data=r.json()
+        resp = requests.get(url, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            st.error(f"CFBD error {resp.status_code}: {resp.text}")
+            return pd.DataFrame()
+
+        raw = resp.json()
+        rows = []
+        for t in raw:
+            team = t.get("team")
+            # Look for points scored / allowed
+            pts_for = next((s["stat"] for s in t.get("stats", []) if s["category"] == "points"), None)
+            pts_against = next((s["stat"] for s in t.get("stats", []) if s["category"] == "opponentPoints"), None)
+            games = next((s["stat"] for s in t.get("stats", []) if s["category"] == "games"), None)
+
+            try:
+                pts_for = float(pts_for)
+                pts_against = float(pts_against)
+                games = float(games)
+                off_ppg = pts_for / games if games > 0 else 0.0
+                def_ppg = pts_against / games if games > 0 else 0.0
+                rows.append({"team": team, "off_ppg": off_ppg, "def_ppg": def_ppg})
+            except Exception:
+                continue
+
+        return pd.DataFrame(rows)
     except Exception as e:
-        st.error(f"CFBD error: {e}")
+        st.error(f"CFBD request failed: {e}")
         return pd.DataFrame()
 
-    # Aggregate offense/defense points per game per team
-    teams:Dict[str,Dict[str,float]]={}
-    for row in data:
-        team=row.get("team")
-        stat=row.get("stat")
-        cat=row.get("category")
-        name=row.get("statName","").lower()
-        if team is None or stat is None: continue
-        if name!="points": continue
-        t=teams.setdefault(team,{"off_pts":0,"off_g":0,"def_pts":0,"def_g":0})
-        if cat=="offense": t["off_pts"]+=stat; t["off_g"]+=1
-        elif cat=="defense": t["def_pts"]+=stat; t["def_g"]+=1
+# --------------------- College Football Page ---------------------
+elif page == "College Football":
+    st.subheader("🏈🎓 College Football — 2025 (auto from CFBD)")
+    df = cfb_team_stats_2025()
+    if df.empty:
+        st.warning("No data returned from CFBD. Check your API key or wait for season games.")
+        st.stop()
 
-    rows=[]
-    for tm,v in teams.items():
-        off_ppg = v["off_pts"]/v["off_g"] if v["off_g"] else 0.0
-        def_ppg = v["def_pts"]/v["def_g"] if v["def_g"] else 0.0
-        rows.append({"team":tm,"off_ppg":round(off_ppg,1),"def_ppg":round(def_ppg,1)})
-    df=pd.DataFrame(rows).sort_values("team").reset_index(drop=True)
-    return df
+    home = st.selectbox("Home team", df["team"].tolist())
+    away = st.selectbox("Away team", [t for t in df["team"].tolist() if t != home])
+
+    rowH = df.loc[df["team"] == home].iloc[0]
+    rowA = df.loc[df["team"] == away].iloc[0]
+
+    mu_home = (rowH["off_ppg"] + rowA["def_ppg"]) / 2.0 + 0.8  # home edge ~0.8 pts
+    mu_away = (rowA["off_ppg"] + rowH["def_ppg"]) / 2.0
+    pH, pA, mH, mA = _poisson_sim(mu_home, mu_away)
+
+    st.markdown(
+        f"**{home}** vs **{away}** — "
+        f"Expected points: {mH:.1f}–{mA:.1f} · "
+        f"P({home} win) = **{100*pH:.1f}%**, "
+        f"P({away} win) = **{100*pA:.1f}%**"
+    )
+
+    with st.expander("Show team table"):
+        st.dataframe(df.sort_values("off_ppg", ascending=False).reset_index(drop=True))
 
 # =============================================================================
 # UI router
