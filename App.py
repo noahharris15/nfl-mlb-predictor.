@@ -1,72 +1,196 @@
-import streamlit as st
+# app_cfb.py — College Football (stats only) from CFBD + Poisson sim
+# Requirements (add to requirements.txt): streamlit requests pandas numpy
+# In Streamlit "Secrets", set: CFBD_API_KEY = "your_key_here"
+
+from __future__ import annotations
+import math
+from typing import Tuple, Optional
+from datetime import datetime
+
 import requests
-import pandas as pd
 import numpy as np
+import pandas as pd
+import streamlit as st
 
-# --- Function to pull College Football stats from CFBD ---
-def cfb_team_stats(year=2025):
-    api_key = st.secrets["CFBD_API_KEY"]
-    headers = {"Authorization": f"Bearer {api_key}"}
+# ------------------------ UI config ------------------------
+st.set_page_config(page_title="College Football — (auto from CFBD)", layout="wide")
 
-    url = f"https://api.collegefootballdata.com/teams/season?year={year}"
-    response = requests.get(url, headers=headers)
+st.title("🏈🎓 College Football — 2025 (auto from CFBD)")
 
-    if response.status_code != 200:
-        st.error(f"CFBD request failed: {response.text}")
-        return pd.DataFrame()
+st.caption(
+    "This page fetches current-season **team scoring** from CollegeFootballData and "
+    "runs a simple Poisson simulation for win probabilities. "
+    "If the API is unavailable or rate-limited, you can upload a CSV fallback "
+    "with columns: `team, off_ppg, def_ppg`."
+)
 
-    data = response.json()
+# ------------------------ constants ------------------------
+SIM_TRIALS = 10000
+EPS = 1e-9
 
-    # Extract team-level offense and defense points per game
-    teams = []
-    for team in data:
+# ------------------------ helpers --------------------------
+def poisson_sim(mu_home: float, mu_away: float, trials: int = SIM_TRIALS) -> Tuple[float, float, float, float]:
+    """Return (p_home, p_away, mean_home, mean_away)."""
+    mu_home = max(0.1, float(mu_home))
+    mu_away = max(0.1, float(mu_away))
+    h = np.random.poisson(mu_home, size=trials)
+    a = np.random.poisson(mu_away, size=trials)
+    wins_home = (h > a).astype(np.float64)
+    ties = (h == a)
+    if ties.any():
+        # tiny home OT edge, college-ish
+        wins_home[ties] = 0.52
+    p_home = float(wins_home.mean())
+    return p_home, 1.0 - p_home, float(h.mean()), float(a.mean())
+
+def _api_key_ok() -> bool:
+    try:
+        key = st.secrets.get("CFBD_API_KEY", "")
+        return isinstance(key, str) and len(key.strip()) >= 8
+    except Exception:
+        return False
+
+def _headers() -> dict:
+    return {"Authorization": f"Bearer {st.secrets['CFBD_API_KEY']}"}
+
+@st.cache_data(show_spinner=False, ttl=900)
+def cfb_team_ppg_from_games(year: int, start_week: Optional[int], end_week: Optional[int]) -> Tuple[pd.DataFrame, dict]:
+    """
+    Build team Off PPG and Def PPG by aggregating /games/teams endpoint.
+    Returns (df, meta) where df has columns [team, off_ppg, def_ppg].
+    """
+    params = {"year": year}
+    if start_week: params["startWeek"] = int(start_week)
+    if end_week: params["endWeek"] = int(end_week)
+
+    url = "https://api.collegefootballdata.com/games/teams"
+    meta = {"url": url, "params": params}
+
+    resp = requests.get(url, headers=_headers(), params=params, timeout=30)
+    meta["status"] = resp.status_code
+
+    # Try to detect non-JSON (e.g., HTML error page)
+    try:
+        data = resp.json()
+    except Exception:
+        meta["error"] = f"Non-JSON response (first 200 chars): {resp.text[:200]!r}"
+        return pd.DataFrame(), meta
+
+    if resp.status_code != 200:
+        meta["error"] = f"HTTP {resp.status_code}: {data}"
+        return pd.DataFrame(), meta
+
+    # data is a list of team-game dicts. Each has 'team', 'points', 'opponent', 'opponentPoints'
+    rows = []
+    for g in data:
+        t = str(g.get("team", "")).strip()
+        pts_for = g.get("points", None)
+        pts_against = g.get("opponentPoints", None)
+        if not t or pts_for is None or pts_against is None:
+            continue
         try:
-            teams.append({
-                "team": team["team"],
-                "off_ppg": team.get("pointsPerGame", np.nan),
-                "def_ppg": team.get("opponentPointsPerGame", np.nan)
-            })
-        except:
+            rows.append({"team": t, "pts_for": float(pts_for), "pts_against": float(pts_against)})
+        except Exception:
             continue
 
-    return pd.DataFrame(teams)
+    if not rows:
+        meta["error"] = "returned empty team list (after parse)."
+        return pd.DataFrame(), meta
 
+    games = pd.DataFrame(rows)
+    agg = games.groupby("team", as_index=False).agg(
+        off_ppg=("pts_for", "mean"),
+        def_ppg=("pts_against", "mean"),
+        games=("pts_for", "size"),
+        off_pts=("pts_for", "sum"),
+        def_pts=("pts_against", "sum"),
+    ).sort_values("team").reset_index(drop=True)
 
-# --- Monte Carlo Simulation for CFB games ---
-def simulate_game(home_off, away_def, away_off, home_def, sims=10000):
-    home_scores = np.random.normal(home_off, 7, sims) - np.random.normal(away_def, 7, sims)
-    away_scores = np.random.normal(away_off, 7, sims) - np.random.normal(home_def, 7, sims)
+    # Light shrink toward league average if few games
+    if not agg.empty:
+        league_for = float(agg["off_ppg"].mean())
+        league_against = float(agg["def_ppg"].mean())
+        w = np.clip(1.0 - agg["games"] / 4.0, 0.0, 1.0)
+        agg["off_ppg"] = (1 - w) * agg["off_ppg"] + w * league_for
+        agg["def_ppg"] = (1 - w) * agg["def_ppg"] + w * league_against
 
-    home_avg = np.mean(home_scores)
-    away_avg = np.mean(away_scores)
-    home_win_prob = np.mean(home_scores > away_scores)
-    away_win_prob = 1 - home_win_prob
+    return agg[["team", "off_ppg", "def_ppg"]], meta
 
-    return home_avg, away_avg, home_win_prob, away_win_prob
+def _csv_fallback_uploader() -> pd.DataFrame:
+    up = st.file_uploader("Upload CFB CSV fallback (team, off_ppg, def_ppg)", type=["csv", "xlsx"])
+    if up is None:
+        return pd.DataFrame()
+    name = up.name.lower()
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        df = pd.read_excel(up)
+    else:
+        df = pd.read_csv(up)
+    cols = {c.strip().lower(): c for c in df.columns}
+    tcol = next((cols[k] for k in ("team", "school") if k in cols), None)
+    ofc = next((cols[k] for k in ("off_ppg","offense_ppg","points_for_pg") if k in cols), None)
+    dfc = next((cols[k] for k in ("def_ppg","defense_ppg","points_against_pg") if k in cols), None)
+    if not (tcol and ofc and dfc):
+        st.error("CSV needs columns: team, off_ppg, def_ppg (names are flexible).")
+        return pd.DataFrame()
+    out = df[[tcol, ofc, dfc]].copy()
+    out.columns = ["team", "off_ppg", "def_ppg"]
+    return out
 
+# ------------------------ controls -------------------------
+year_default = datetime.utcnow().year
+# If new season hasn't fully populated, 2024 is safer than 2025 early in season
+year = st.number_input("Season year", min_value=2014, max_value=2100, value=max(2024, year_default), step=1)
+c1, c2, c3 = st.columns([1,1,2])
+with c1:
+    start_week = st.number_input("Start week (optional)", min_value=1, max_value=20, value=1, step=1)
+with c2:
+    end_week = st.number_input("End week (optional)", min_value=1, max_value=20, value=start_week, step=1)
 
-# --- Streamlit Page ---
-st.title("🏈 College Football — 2025 (auto from CFBD)")
+st.divider()
 
-df = cfb_team_stats(2025)
+# ------------------------ data fetch -----------------------
+df = pd.DataFrame()
+meta = {}
+
+if _api_key_ok():
+    with st.spinner("Fetching team scoring from CFBD…"):
+        df, meta = cfb_team_ppg_from_games(int(year), int(start_week) if start_week else None, int(end_week) if end_week else None)
+
+    with st.expander("Debug (CFBD request)"):
+        st.write({"key_present": True, "url": meta.get("url"), "params": meta.get("params"),
+                  "status": meta.get("status"), "error": meta.get("error")})
+
+    if meta.get("error"):
+        st.error("CFBD request failed or returned no data. You can still use a CSV fallback.")
+        df_csv = _csv_fallback_uploader()
+        if not df_csv.empty:
+            df = df_csv.copy()
+else:
+    st.warning("CFBD_API_KEY not found in Secrets. Using CSV fallback.")
+    df_csv = _csv_fallback_uploader()
+    if not df_csv.empty:
+        df = df_csv.copy()
 
 if df.empty:
-    st.warning("No CFB stats available. Double-check API key or CFBD limits.")
-else:
-    st.dataframe(df)
+    st.stop()
 
-    home_team = st.selectbox("Home team", df["team"].unique())
-    away_team = st.selectbox("Away team", df["team"].unique())
+# ------------------------ matchup UI -----------------------
+teams = df["team"].tolist()
+h = st.selectbox("Home team", teams, index=0)
+a = st.selectbox("Away team", [t for t in teams if t != h], index=min(1, len(teams)-1))
 
-    if st.button("Simulate Game"):
-        home = df[df["team"] == home_team].iloc[0]
-        away = df[df["team"] == away_team].iloc[0]
+H = df.loc[df["team"] == h].iloc[0]
+A = df.loc[df["team"] == a].iloc[0]
 
-        home_avg, away_avg, home_prob, away_prob = simulate_game(
-            home["off_ppg"], away["def_ppg"], away["off_ppg"], home["def_ppg"]
-        )
+mu_home = max(EPS, (H["off_ppg"] + A["def_ppg"]) / 2.0)
+mu_away = max(EPS, (A["off_ppg"] + H["def_ppg"]) / 2.0)
 
-        st.write(f"**{home_team} vs {away_team}**")
-        st.write(f"Expected points: {home_avg:.1f} – {away_avg:.1f}")
-        st.write(f"P({home_team} win) = {home_prob*100:.1f}%")
-        st.write(f"P({away_team} win) = {away_prob*100:.1f}%")
+pH, pA, mH, mA = poisson_sim(mu_home, mu_away)
+
+st.markdown(
+    f"**{h}** vs **{a}** — Expected points: **{mH:.1f}–{mA:.1f}**  "
+    f"· P({h} win) = **{100*pH:.1f}%**, P({a} win) = **{100*pA:.1f}%**"
+)
+
+with st.expander("Show team table"):
+    st.dataframe(df.sort_values("team").reset_index(drop=True))
