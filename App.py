@@ -158,7 +158,7 @@ def build_player_projections(weekly: pd.DataFrame, scalers: Dict[str, float]) ->
     rb = agg[agg["position"] == "RB"].copy()
     wr = agg[agg["position"].isin(["WR","TE"])].copy()
 
-    # ---- SD heuristics (fixed parentheses) ----
+    # ---- SD heuristics ----
     qb["sd_pass_yds"] = (qb["mu_pass_yds"] * 0.20).clip(lower=25.0)
     qb["sd_pass_tds"] = (qb["mu_pass_tds"] * 0.60).clip(lower=0.25)
     rb["sd_rush_yds"] = (rb["mu_rush_yds"] * 0.22).clip(lower=6.0)
@@ -195,4 +195,191 @@ region = st.selectbox("Region", ["us","us2","eu","uk"], index=0)
 lookahead = st.slider("Lookahead days", 0, 7, value=1)
 markets = st.multiselect("Markets to fetch", VALID_MARKETS, default=VALID_MARKETS)
 
-def
+def odds_get(url: str, params: dict) -> dict:
+    r = requests.get(url, params=params, timeout=25)
+    if r.status_code != 200:
+        raise requests.HTTPError(f"HTTP {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+def list_nfl_events(api_key: str, lookahead_days: int, region: str):
+    base = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events"
+    params = {"apiKey": api_key, "daysFrom": 0, "daysTo": lookahead_days, "regions": region}
+    return odds_get(base, params)
+
+def fetch_event_props(api_key: str, event_id: str, region: str, markets: List[str]):
+    base = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events/{event_id}/odds"
+    params = {"apiKey": api_key, "regions": region, "markets": ",".join(markets), "oddsFormat": "american"}
+    return odds_get(base, params)
+
+events = []
+if api_key:
+    try:
+        events = list_nfl_events(api_key, lookahead, region)
+    except Exception as e:
+        st.error(f"Events fetch error: {e}")
+
+if not events:
+    st.info("Enter your Odds API key and pick a lookahead to list upcoming games.")
+    st.stop()
+
+event_labels = [f'{e["away_team"]} @ {e["home_team"]} — {e.get("commence_time","")}' for e in events]
+pick = st.selectbox("Game", event_labels)
+event = events[event_labels.index(pick)]
+event_id = event["id"]
+
+# ---------------- Fetch props & simulate ----------------
+st.header("4) Fetch props for this event and simulate")
+go = st.button("Fetch lines & simulate")
+if go:
+    if not markets:
+        st.warning("Pick at least one market.")
+        st.stop()
+
+    try:
+        data = fetch_event_props(api_key, event_id, region, markets)
+    except Exception as e:
+        st.error(f"Props fetch failed: {e}")
+        st.stop()
+
+    # Aggregate bookmaker outcomes → one row per (market, player, point/side)
+    rows = []
+    for bk in data.get("bookmakers", []):
+        for m in bk.get("markets", []):
+            mkey = m.get("key")
+            for o in m.get("outcomes", []):
+                name = o.get("description")  # player name
+                side = o.get("name")         # "Over"/"Under" or "Yes"/"No"
+                point = o.get("point")       # may be None for anytime TD
+                if mkey not in VALID_MARKETS or name is None or side is None:
+                    continue
+                rows.append({
+                    "market": mkey,
+                    "player_raw": name,
+                    "side": side,
+                    "point": (None if point is None else float(point)),
+                })
+
+    if not rows:
+        st.warning("No player outcomes returned for selected markets.")
+        st.stop()
+
+    df = pd.DataFrame(rows).drop_duplicates()
+
+    out_rows = []
+    qb_names = qb_proj["Player"].tolist()
+    rb_names = rb_proj["Player"].tolist()
+    wr_names = wr_proj["Player"].tolist()
+
+    for _, r in df.iterrows():
+        market = r["market"]; player = r["player_raw"]; point = r["point"]; side = r["side"]
+
+        # ----- Passing TDs (QBs) -----
+        if market == "player_pass_tds" and not qb_proj.empty:
+            match = fuzzy_pick(player, qb_names, cutoff=82)
+            if not match: 
+                continue
+            row = qb_proj.loc[qb_proj["Player"] == match].iloc[0]
+            mu, sd = float(row["mu_pass_tds"]), float(row["sd_pass_tds"])
+            if point is None:  # safeguard
+                continue
+            p_over = norm_over_prob(mu, sd, float(point), SIM_TRIALS)
+            p = p_over if side == "Over" else 1.0 - p_over
+
+        # ----- Passing yards (QBs) -----
+        elif market == "player_pass_yds" and not qb_proj.empty:
+            match = fuzzy_pick(player, qb_names, cutoff=82)
+            if not match:
+                continue
+            row = qb_proj.loc[qb_proj["Player"] == match].iloc[0]
+            mu, sd = float(row["mu_pass_yds"]), float(row["sd_pass_yds"])
+            if point is None:
+                continue
+            p_over = norm_over_prob(mu, sd, float(point), SIM_TRIALS)
+            p = p_over if side == "Over" else 1.0 - p_over
+
+        # ----- Rushing yards (RBs) -----
+        elif market == "player_rush_yds" and not rb_proj.empty:
+            match = fuzzy_pick(player, rb_names, cutoff=82)
+            if not match:
+                continue
+            row = rb_proj.loc[rb_proj["Player"] == match].iloc[0]
+            mu, sd = float(row["mu_rush_yds"]), float(row["sd_rush_yds"])
+            if point is None:
+                continue
+            p_over = norm_over_prob(mu, sd, float(point), SIM_TRIALS)
+            p = p_over if side == "Over" else 1.0 - p_over
+
+        # ----- Receptions (WR/TE) -----
+        elif market == "player_receptions" and not wr_proj.empty:
+            match = fuzzy_pick(player, wr_names, cutoff=82)
+            if not match:
+                continue
+            row = wr_proj.loc[wr_proj["Player"] == match].iloc[0]
+            mu, sd = float(row["mu_receptions"]), float(row["sd_receptions"])
+            if point is None:
+                continue
+            p_over = norm_over_prob(mu, sd, float(point), SIM_TRIALS)
+            p = p_over if side == "Over" else 1.0 - p_over
+
+        # ----- Anytime TD (WR/TE/RB) -----
+        elif market == "player_anytime_td":
+            match = None
+            src = None
+            m = fuzzy_pick(player, wr_names, cutoff=82)
+            if m is not None:
+                match, src = m, "WR"
+            if match is None:
+                m = fuzzy_pick(player, rb_names, cutoff=82)
+                if m is not None:
+                    match, src = m, "RB"
+            if match is None:
+                continue
+
+            if src == "WR":
+                row = wr_proj.loc[wr_proj["Player"] == match].iloc[0]
+                lam = float(row["lam_any_wr"])
+            else:
+                row = rb_proj.loc[rb_proj["Player"] == match].iloc[0]
+                lam = float(row["lam_any_rb"])
+
+            p_yes = anytime_yes_prob_poisson(lam)
+            if side in ("Yes","No"):
+                p = p_yes if side == "Yes" else (1.0 - p_yes)
+            elif side in ("Over","Under"):   # O/U 0.5 format
+                p = p_yes if side == "Over" else (1.0 - p_yes)
+            else:
+                continue
+
+            mu, sd = lam, float("nan")
+            point = (0.5 if side in ("Over","Under") else None)
+
+        else:
+            continue
+
+        out_rows.append({
+            "market": market,
+            "player": match,
+            "side": side,
+            "line": (None if point is None else round(float(point), 3)),
+            "mu": (None if (isinstance(mu, float) and math.isnan(mu)) else round(float(mu), 3)),
+            "sd": (None if (isinstance(sd, float) and math.isnan(sd)) else round(float(sd), 3)),
+            "prob": round(100*p, 2),
+            "opp_def": opp_team,
+            "pass_adj": round(scalers["pass_adj"], 3),
+            "rush_adj": round(scalers["rush_adj"], 3),
+            "recv_adj": round(scalers["recv_adj"], 3),
+        })
+
+    if not out_rows:
+        st.warning("No props matched your players.")
+        st.stop()
+
+    results = pd.DataFrame(out_rows).sort_values("prob", ascending=False).reset_index(drop=True)
+    st.subheader("Simulated probabilities (Normal for yards/TDs; Poisson for Anytime TD)")
+    st.dataframe(results, use_container_width=True)
+    st.download_button(
+        "⬇️ Download results CSV",
+        results.to_csv(index=False).encode("utf-8"),
+        file_name="props_sim_results.csv",
+        mime="text/csv",
+    )
