@@ -1,4 +1,4 @@
-# Player Props Simulator — Odds API + nfl_data_py (no CSVs)
+# Player Props Simulator — Odds API + nfl_data_py (no CSVs; with GitHub fallback)
 # Run: streamlit run app.py
 
 import math
@@ -94,6 +94,7 @@ def anytime_yes_prob_poisson(lam: float) -> float:
 
 # ---------------- nfl_data_py loaders ----------------
 st.header("1) Pull season/weekly stats from nfl_data_py (no CSVs)")
+
 c1, c2 = st.columns([1,1])
 with c1:
     season = st.number_input("Season", min_value=2010, max_value=2100, value=2025, step=1)
@@ -102,18 +103,58 @@ with c2:
 
 @st.cache_data(show_spinner=False)
 def load_weekly_player_stats(season: int, week_max: int) -> pd.DataFrame:
-    df = nfl.import_weekly_data([season])
-    df = df[df["week"].astype(int) <= int(week_max)].copy()
+    """
+    Try nfl_data_py (works locally). If blocked (e.g., Streamlit Cloud),
+    fall back to NFLVerse GitHub raw CSV (no uploads needed).
+    """
+    # ---- Attempt 1: nfl_data_py (local-friendly) ----
+    try:
+        df = nfl.import_weekly_data([season])
+        df = df[df["week"].astype(int) <= int(week_max)].copy()
+        st.info("Loaded weekly data via nfl_data_py.")
+    except Exception as e:
+        # ---- Attempt 2: GitHub raw CSV fallback (cloud-friendly) ----
+        st.warning(f"nfl_data_py failed: {e}. Falling back to NFLVerse GitHub CSV.")
+        urls = [
+            f"https://raw.githubusercontent.com/nflverse/nflfastR-data/master/data/player_stats/player_stats_{season}.csv.gz",
+            f"https://raw.githubusercontent.com/nflverse/nflfastR-data/master/data/player_stats/player_stats_{season}.csv",
+        ]
+        df = None
+        last_err = None
+        for url in urls:
+            try:
+                df_try = pd.read_csv(url, low_memory=False)
+                df = df_try
+                st.info(f"Loaded weekly data from {url.split('/')[-1]}")
+                break
+            except Exception as ee:
+                last_err = ee
+                continue
+        if df is None:
+            raise RuntimeError(f"Could not fetch weekly data from GitHub. Last error: {last_err}")
 
+        # player_stats_{season} has all weeks; filter to <= week_max
+        if "week" in df.columns:
+            df = df[df["week"].astype(int) <= int(week_max)].copy()
+        else:
+            # some mirrors label week as 'game_week' — handle defensively
+            if "game_week" in df.columns:
+                df["week"] = df["game_week"]
+                df = df[df["week"].astype(int) <= int(week_max)].copy()
+            else:
+                st.warning("No 'week' column found; using full season totals.")
+
+    # ---- Standardize columns we need ----
     need = [
         "season","week","player_name","position","recent_team",
         "passing_yards","passing_tds",
         "rushing_yards","rushing_tds",
-        "receptions","receiving_tds"
+        "receptions","receiving_tds",
     ]
     for c in need:
         if c not in df.columns:
             df[c] = np.nan
+
     return df[need].copy()
 
 weekly = load_weekly_player_stats(season, week_max)
@@ -241,13 +282,12 @@ if go:
         st.error(f"Props fetch failed: {e}")
         st.stop()
 
-    # Aggregate bookmaker outcomes → one row per (market, player, point/side)
     rows = []
     for bk in data.get("bookmakers", []):
         for m in bk.get("markets", []):
             mkey = m.get("key")
             for o in m.get("outcomes", []):
-                name = o.get("description")  # player name
+                name = o.get("description")
                 side = o.get("name")         # "Over"/"Under" or "Yes"/"No"
                 point = o.get("point")       # may be None for anytime TD
                 if mkey not in VALID_MARKETS or name is None or side is None:
@@ -273,19 +313,17 @@ if go:
     for _, r in df.iterrows():
         market = r["market"]; player = r["player_raw"]; point = r["point"]; side = r["side"]
 
-        # ----- Passing TDs (QBs) -----
         if market == "player_pass_tds" and not qb_proj.empty:
             match = fuzzy_pick(player, qb_names, cutoff=82)
             if not match: 
                 continue
             row = qb_proj.loc[qb_proj["Player"] == match].iloc[0]
             mu, sd = float(row["mu_pass_tds"]), float(row["sd_pass_tds"])
-            if point is None:  # safeguard
+            if point is None: 
                 continue
             p_over = norm_over_prob(mu, sd, float(point), SIM_TRIALS)
             p = p_over if side == "Over" else 1.0 - p_over
 
-        # ----- Passing yards (QBs) -----
         elif market == "player_pass_yds" and not qb_proj.empty:
             match = fuzzy_pick(player, qb_names, cutoff=82)
             if not match:
@@ -297,7 +335,6 @@ if go:
             p_over = norm_over_prob(mu, sd, float(point), SIM_TRIALS)
             p = p_over if side == "Over" else 1.0 - p_over
 
-        # ----- Rushing yards (RBs) -----
         elif market == "player_rush_yds" and not rb_proj.empty:
             match = fuzzy_pick(player, rb_names, cutoff=82)
             if not match:
@@ -309,7 +346,6 @@ if go:
             p_over = norm_over_prob(mu, sd, float(point), SIM_TRIALS)
             p = p_over if side == "Over" else 1.0 - p_over
 
-        # ----- Receptions (WR/TE) -----
         elif market == "player_receptions" and not wr_proj.empty:
             match = fuzzy_pick(player, wr_names, cutoff=82)
             if not match:
@@ -321,10 +357,8 @@ if go:
             p_over = norm_over_prob(mu, sd, float(point), SIM_TRIALS)
             p = p_over if side == "Over" else 1.0 - p_over
 
-        # ----- Anytime TD (WR/TE/RB) -----
         elif market == "player_anytime_td":
-            match = None
-            src = None
+            match = None; src = None
             m = fuzzy_pick(player, wr_names, cutoff=82)
             if m is not None:
                 match, src = m, "WR"
@@ -345,7 +379,7 @@ if go:
             p_yes = anytime_yes_prob_poisson(lam)
             if side in ("Yes","No"):
                 p = p_yes if side == "Yes" else (1.0 - p_yes)
-            elif side in ("Over","Under"):   # O/U 0.5 format
+            elif side in ("Over","Under"):
                 p = p_yes if side == "Over" else (1.0 - p_yes)
             else:
                 continue
