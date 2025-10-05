@@ -1,335 +1,330 @@
-# app.py — NFL Player Props (ALL GAMES) with per-player defense adjustment (EPA) + simulation
-import time, math, json, random
-from io import StringIO
-from typing import Dict, List, Optional, Tuple
+# app.py — NFL Player Props (All games, Odds API + embedded Defense EPA), single page
+import math
+import time
+import json
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from scipy.stats import norm
-from tenacity import retry, stop_after_attempt, wait_exponential_jitter
 
-# ────────────────────────────── CONFIG ──────────────────────────────
-st.set_page_config(page_title="NFL Player Props • All Games", layout="wide")
-st.title("🏈 NFL Player Props — all games (Odds API + real stats + defense-adjusted sims)")
+# ---------------------------- UI & page config ----------------------------
+st.set_page_config(page_title="NFL Player Props — Odds API + Defense EPA", layout="wide")
+st.title("🏈 NFL Player Props — Odds API + Defense EPA (All Games)")
 
-# Put your key here or in st.secrets["ODDS_API_KEY"]
-ODDS_API_KEY = st.secrets.get("ODDS_API_KEY", "").strip() or "PASTE_YOUR_ODDS_API_KEY_HERE"
+# ---------------------------- Inputs ----------------------------
+with st.sidebar:
+    st.subheader("Settings")
+    api_key = st.text_input("The Odds API key", value="", type="password", help="Paste your key here.")
+    lookahead_days = st.slider("Lookahead days for events", 0, 7, 1)
+    region = st.selectbox("Region", ["us", "us2", "us_il"], index=0)
+    bookmakers = st.multiselect(
+        "Bookmakers (average line across selected; leave empty = all)",
+        ["draftkings", "fanduel", "betmgm", "caesars", "pointsbetus", "barstool", "betrivers"],
+        default=["draftkings","fanduel","betmgm","caesars"]
+    )
+    markets = st.multiselect(
+        "Markets to pull",
+        ["player_pass_yds","player_rush_yds","player_rec_yds","player_receptions","player_anytime_td"],
+        default=["player_pass_yds","player_rush_yds","player_rec_yds","player_receptions","player_anytime_td"]
+    )
+    trials = st.number_input("Simulation trials", 2000, 20000, 8000, step=1000)
+    st.caption("We simulate with a conservative normal model for yards/rec; TD is Bernoulli.")
+    run_btn = st.button("Fetch ALL games & simulate", use_container_width=True)
 
-LOOKAHEAD_DAYS = st.slider("Lookahead days for events", 0, 7, 1)
-REGION = st.selectbox("Region", ["us","us2","eu","uk","au"], index=0)
-SEASON = st.number_input("Season for per-game averages", 2018, 2025, value=2025, step=1)
-
-MARKETS = [
-    "player_pass_yds",
-    "player_rush_yds",
-    "player_receiving_yds",
-    "player_receptions",
-    "player_anytime_td",
+# ---------------------------- Embedded Defense EPA (your table) ----------------------------
+# Columns in your sheet (for offense-vs-defense scaling we use EPA/Pass and EPA/Rush):
+# Team | Season | EPA/Play | Total EPA | Success % | EPA/Pass | EPA/Rush | Pass Yards | Comp % | Pass TD | Rush Yards | Rush TD | ADoT | Sack % | Scramble % | Int %
+_DEF_EPA_ROWS = [
+    # team,           epa_pass, epa_rush  (2025 values from your screenshot)
+    ("Minnesota Vikings",        -0.37,  0.06),
+    ("Jacksonville Jaguars",     -0.17, -0.05),
+    ("Denver Broncos",           -0.10, -0.12),
+    ("Los Angeles Chargers",     -0.17,  0.01),
+    ("Detroit Lions",             0.00, -0.22),
+    ("Philadelphia Eagles",      -0.11, -0.04),
+    ("Houston Texans",           -0.16,  0.04),
+    ("Los Angeles Rams",         -0.12,  0.00),
+    ("Seattle Seahawks",          0.00, -0.19),
+    ("San Francisco 49ers",      -0.02, -0.11),
+    ("Tampa Bay Buccaneers",     -0.13,  0.05),
+    ("Atlanta Falcons",           0.06, -0.17),
+    ("Cleveland Browns",         -0.04, -0.05),
+    ("Indianapolis Colts",       -0.09,  0.09),
+    ("Kansas City Chiefs",       -0.09,  0.11),
+    ("Arizona Cardinals",         0.06, -0.14),
+    ("Las Vegas Raiders",         0.14, -0.22),
+    ("Green Bay Packers",         0.03, -0.07),
+    ("Chicago Bears",             0.01,  0.01),
+    ("Buffalo Bills",             0.06,  0.06),
+    ("Carolina Panthers",         0.05,  0.05),
+    ("Pittsburgh Steelers",       0.10,  0.00),
+    ("Washington Commanders",     0.18, -0.12),
+    ("New England Patriots",     -0.01,  0.19),
+    ("New York Giants",           0.20, -0.06),
+    ("New Orleans Saints",        0.20, -0.06),
+    ("Cincinnati Bengals",        0.13,  0.04),
+    ("New York Jets",             0.23, -0.03),
+    ("Tennessee Titans",          0.16,  0.12),
+    ("Baltimore Ravens",          0.40,  0.06),
+    ("Dallas Cowboys",            0.34,  0.12),
+    ("Miami Dolphins",            0.34,  0.12),  # from your last rows (rounded)
 ]
 
-st.caption("We fetch all NFL events in the lookahead window, pull **five** player markets per game from The Odds API, "
-           "average book lines, estimate defense-adjusted μ (from real per-game averages), and compute Over/Under probabilities "
-           "with a conservative normal model. Anytime TD is treated as a Bernoulli (λ≈TDs per game → p≈1−e^(−λ)).")
+DEF_EPA = pd.DataFrame(_DEF_EPA_ROWS, columns=["team","epa_pass","epa_rush"])
 
-# ───────────────── DEFENSE TABLE (embedded; EPA → multipliers) ─────────────────
-# Using your EPA snapshot. We transform to pass/rush/recv multipliers centered at 1.0.
-# You can tweak the scaling knobs below if you want stronger/weaker adjustments.
-_DEFENSE_EPA = """
-Team,Season,EPA/Play,Total EPA,Success %,EPA/Pass,EPA/Rush,Pass Yards,Comp %,Pass TD,Rush Yards,Rush TD,ADoT,Sack %,Scramble %,Int %
-Minnesota Vikings,2025,-0.17,-38.71,0.4174,-0.37,0.06,685,0.6762,3,521,4,5.8,0.0813,0.065,0.0163
-Jacksonville Jaguars,2025,-0.13,-33.41,0.379,-0.17,-0.05,984,0.5962,7,331,1,8.15,0.0409,0.0468,0.0526
-Denver Broncos,2025,-0.11,-26.37,0.3796,-0.1,-0.12,853,0.5746,2,397,2,9.94,0.0974,0.0325,0.0065
-Los Angeles Chargers,2025,-0.11,-25.57,0.3667,-0.17,0.01,710,0.5938,3,445,3,7.69,0.0823,0.1076,0.019
-Detroit Lions,2025,-0.09,-21.51,0.3783,0.0,-0.22,894,0.6271,7,376,4,10.44,0.1,0.0571,0.0214
-Philadelphia Eagles,2025,-0.08,-20.49,0.4291,-0.11,-0.04,860,0.5693,5,504,3,8.43,0.0329,0.0658,0.0197
-Houston Texans,2025,-0.08,-19.59,0.4149,-0.16,0.04,790,0.5714,3,409,4,8.3,0.0733,0.04,0.0133
-Los Angeles Rams,2025,-0.08,-18.57,0.4042,-0.12,0.0,851,0.664,5,394,2,8.12,0.0952,0.0544,0.0204
-Seattle Seahawks,2025,-0.07,-18.65,0.4075,0.0,-0.19,910,0.6645,6,359,0,7.03,0.069,0.0575,0.0402
-San Francisco 49ers,2025,-0.06,-14.94,0.4344,-0.09,-0.03,690,0.6829,5,462,2,7.02,0.0368,0.0588,0.0
-Tampa Bay Buccaneers,2025,-0.06,-13.91,0.4202,-0.02,-0.11,832,0.6429,6,340,3,6.54,0.0645,0.1226,0.0065
-Atlanta Falcons,2025,-0.05,-11.24,0.4279,-0.13,0.05,602,0.5769,5,436,2,10.08,0.0806,0.0806,0.0242
-Cleveland Browns,2025,-0.05,-10.73,0.379,0.06,-0.17,689,0.6442,8,281,2,7.95,0.0924,0.0336,0.0168
-Indianapolis Colts,2025,-0.05,-11.02,0.4638,-0.04,-0.05,946,0.6643,8,384,2,6.69,0.0633,0.0506,0.0253
-Kansas City Chiefs,2025,-0.02,-3.64,0.4487,-0.09,0.09,778,0.6694,4,508,4,8.27,0.0694,0.0903,0.0208
-Arizona Cardinals,2025,-0.01,-2.38,0.4559,0.06,-0.14,1068,0.6369,5,384,2,8.06,0.0444,0.0222,0.0111
-Las Vegas Raiders,2025,-0.01,-1.85,0.4315,0.14,-0.22,948,0.6565,5,411,4,7.98,0.0544,0.0544,0.0136
-Green Bay Packers,2025,0.0,0.2,0.4094,0.03,-0.07,886,0.6815,6,310,3,6.87,0.0632,0.0345,0.0115
-Chicago Bears,2025,0.0,0.89,0.4912,0.01,0.0,886,0.7368,10,658,4,6.75,0.0407,0.0325,0.0569
-Buffalo Bills,2025,0.02,3.33,0.4208,-0.06,0.1,564,0.6214,6,657,5,6.87,0.0732,0.0894,0.0163
-Carolina Panthers,2025,0.04,9.13,0.4133,0.03,0.05,802,0.6239,4,517,5,7.5,0.0155,0.0775,0.031
-Pittsburgh Steelers,2025,0.04,11.09,0.461,0.11,-0.05,1131,0.6957,7,488,4,7.6,0.087,0.0559,0.0311
-Washington Commanders,2025,0.04,10.44,0.4183,0.18,-0.12,1062,0.6098,7,430,3,10.83,0.0714,0.05,0.0071
-New England Patriots,2025,0.05,12.43,0.4693,0.19,-0.15,1024,0.712,7,310,2,7.68,0.0725,0.0217,0.0217
-New York Giants,2025,0.07,18.22,0.4613,-0.01,0.19,1021,0.6375,5,612,6,6.15,0.0562,0.0449,0.0169
-New Orleans Saints,2025,0.07,17.94,0.4417,0.2,-0.06,884,0.7117,9,475,4,7.4,0.0853,0.0543,0.0078
-Cincinnati Bengals,2025,0.1,27.12,0.4731,0.13,0.04,1089,0.6536,8,543,5,6.99,0.0366,0.0305,0.0305
-New York Jets,2025,0.11,25.77,0.3959,0.23,-0.03,834,0.6577,7,522,4,6.11,0.0476,0.0714,0.0
-Tennessee Titans,2025,0.12,30.47,0.4435,0.16,0.07,935,0.6984,6,566,7,6.82,0.0294,0.0441,0.0221
-Baltimore Ravens,2025,0.14,39.54,0.4685,0.14,0.12,1084,0.6667,9,565,7,8.04,0.0233,0.0523,0.0058
-Dallas Cowboys,2025,0.25,65.26,0.4943,0.4,0.06,1237,0.7333,10,493,6,9.19,0.034,0.0476,0.0068
-Miami Dolphins,2025,0.25,59.66,0.5397,0.34,0.12,941,0.7757,7,632,5,6.15,0.0615,0.1154,0.0
-"""
+# scaling -> convert EPA to multiplicative adjustment around 1.0
+# EPA range is about [-0.4, +0.4]; alpha tunes strength of effect.
+ALPHA_PASS = 0.80   # bigger effect for passing (receptions/rec_yds also use pass EPA)
+ALPHA_RUSH = 0.75
 
-def load_defense_table() -> pd.DataFrame:
-    df = pd.read_csv(StringIO(_DEFENSE_EPA))
-    # Convert EPA per play to multipliers. Negative EPA (better defense) → <1 multiplier.
-    # Knobs: larger K => stronger effect.
-    K_PASS, K_RUSH, K_RECV = 0.9, 0.9, 0.7
-    df["pass_adj"] = (1.0 - K_PASS * df["EPA/Pass"]).clip(0.6, 1.4)
-    df["rush_adj"] = (1.0 - K_RUSH * df["EPA/Rush"]).clip(0.6, 1.4)
-    # Use EPA/Pass for receiving context too (can blend with overall if you like)
-    df["recv_adj"] = (1.0 - K_RECV * df["EPA/Pass"]).clip(0.6, 1.4)
-    df["Team"] = df["Team"].astype(str)
-    return df[["Team","pass_adj","rush_adj","recv_adj"]]
+def pass_adj(team: str) -> float:
+    r = DEF_EPA.loc[DEF_EPA["team"].str.lower()==team.lower()]
+    if r.empty: return 1.0
+    e = float(r.iloc[0]["epa_pass"])
+    return float(np.clip(1.0 + ALPHA_PASS*e, 0.6, 1.6))
 
-def_table = load_defense_table()
+def rush_adj(team: str) -> float:
+    r = DEF_EPA.loc[DEF_EPA["team"].str.lower()==team.lower()]
+    if r.empty: return 1.0
+    e = float(r.iloc[0]["epa_rush"])
+    return float(np.clip(1.0 + ALPHA_RUSH*e, 0.6, 1.6))
 
-# ─────────────────────────── Helper: player → team ────────────────────────────
-@st.cache_data(show_spinner=False)
-def build_player_team_map(season: int) -> Dict[str,str]:
-    import nfl_data_py as nfl
-    rosters = nfl.import_rosters([season])
-    # Prefer full franchise names if present; build a map from abbr to full via schedules
-    sched = nfl.import_schedules([season])
-    # derive mapping abbr->full from schedules (home/away columns are full names)
-    teams_full = pd.unique(pd.concat([sched["home_team"], sched["away_team"]]).dropna())
-    # crude abbr->full by best match
-    def _best_full(abbr: str) -> Optional[str]:
-        abbr = str(abbr).strip().upper()
-        cand = [t for t in teams_full if abbr in t.upper() or t.upper().startswith(abbr)]
-        return cand[0] if cand else None
-    m = {}
-    for _, r in rosters.iterrows():
-        name = f"{r.get('first_name','').strip()} {r.get('last_name','').strip()}".strip()
-        abbr = str(r.get("team")) if "team" in rosters.columns else str(r.get("team_abbr"))
-        full = _best_full(abbr) or abbr
-        m[name.lower()] = full
-    return m
+# ---------------------------- Helpers: Odds API ----------------------------
+ODDS_BASE = "https://api.the-odds-api.com/v4"
 
-def resolve_player_team(player: str, roster_map: Dict[str,str]) -> Optional[str]:
-    return roster_map.get(player.lower())
+def _get(url: str, params: dict, tries=3) -> requests.Response:
+    last = None
+    for _ in range(tries):
+        r = requests.get(url, params=params, timeout=25)
+        if r.status_code == 200: return r
+        last = r
+        time.sleep(0.8)
+    if last is None:
+        raise RuntimeError("No response from Odds API.")
+    last.raise_for_status()
+    return last
 
-# ───────────────────────── Odds API wrappers (events + markets) ───────────────
-EVENTS_URL = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events"
-EVENT_ODDS_BASE = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events"
-
-@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=1, max=8))
-def _get(url, params):
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    return r
-
-def fetch_events(days: int, region: str) -> List[dict]:
-    params = {"apiKey": ODDS_API_KEY, "daysFrom": 0, "daysTo": days, "regions": region}
-    r = _get(EVENTS_URL, params)
+def list_events(api_key: str, region: str, days: int) -> List[dict]:
+    url = f"{ODDS_BASE}/sports/americanfootball_nfl/events"
+    params = {"apiKey": api_key, "regions": region, "daysFrom": days}
+    r = _get(url, params)
     return r.json()
 
-def fetch_event_player_props(event_id: str, region: str, markets: List[str]) -> pd.DataFrame:
-    url = f"{EVENT_ODDS_BASE}/{event_id}/odds"
-    params = {"apiKey": ODDS_API_KEY, "regions": region, "markets": ",".join(markets), "oddsFormat": "american"}
+def game_odds(api_key: str, event_id: str, region: str, markets: List[str], bookmakers: List[str]) -> dict:
+    url = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
+    params = {
+        "apiKey": api_key,
+        "regions": region,
+        "markets": ",".join(markets),
+        "oddsFormat": "american",
+    }
+    if bookmakers:
+        params["bookmakers"] = ",".join(bookmakers)
     r = _get(url, params)
-    js = r.json()
-    rows = []
-    for bk in js.get("bookmakers", []):
-        book_key = bk.get("key")
-        for m in bk.get("markets", []):
-            mkey = m.get("key")
-            for o in m.get("outcomes", []):
-                # player markets have description = player name
-                rows.append({
-                    "event_id": js.get("id"),
-                    "commence_time": js.get("commence_time"),
-                    "home_team": js.get("home_team"),
-                    "away_team": js.get("away_team"),
-                    "book": book_key,
-                    "market": mkey,
-                    "side": str(o.get("name")).title(),            # "Over"/"Under" or "Yes"/"No"
-                    "player": o.get("description"),
-                    "line": o.get("point"),
-                    "price": o.get("price"),
-                })
-    df = pd.DataFrame(rows)
-    # keep only real player rows
-    if not df.empty:
-        df = df[df["player"].notna()].copy()
-    return df
+    return r.json()
 
-# ─────────────────────────── Player averages & sims ────────────────────────────
+# ---------------------------- Player → Team map (nfl_data_py) ----------------------------
 @st.cache_data(show_spinner=False)
-def nfl_player_avgs_per_game(season: int) -> pd.DataFrame:
+def build_player_team_map() -> Dict[str, str]:
+    """Return {clean_player_name -> full team name} for the current season roster."""
     import nfl_data_py as nfl
-    df = nfl.import_seasonal_data([season])
-    g = pd.to_numeric(df.get("games"), errors="coerce").replace(0, np.nan)
-    out = pd.DataFrame({
-        "player": df.get("player_display_name"),
-        "pass_yds_pg": pd.to_numeric(df.get("passing_yards"), errors="coerce") / g,
-        "rush_yds_pg": pd.to_numeric(df.get("rushing_yards"), errors="coerce") / g,
-        "rec_yds_pg":  pd.to_numeric(df.get("receiving_yards"), errors="coerce") / g,
-        "recs_pg":     pd.to_numeric(df.get("receptions"), errors="coerce") / g,
-        "rush_tds_pg": pd.to_numeric(df.get("rushing_tds"), errors="coerce") / g,
-        "rec_tds_pg":  pd.to_numeric(df.get("receiving_tds"), errors="coerce") / g,
-    }).fillna(0.0)
-    out["any_td_pg"] = out["rush_tds_pg"] + out["rec_tds_pg"]
+    for yr in [2025, 2024]:
+        try:
+            df = nfl.import_seasonal_data([yr])
+            break
+        except Exception:
+            df = None
+    if df is None or df.empty:
+        return {}
+    tmp = df[["player_display_name","recent_team"]].dropna().drop_duplicates()
+    # map NFL abbreviations to full names used by Odds API
+    abbr_to_full = {
+        "ARI":"Arizona Cardinals","ATL":"Atlanta Falcons","BAL":"Baltimore Ravens","BUF":"Buffalo Bills",
+        "CAR":"Carolina Panthers","CHI":"Chicago Bears","CIN":"Cincinnati Bengals","CLE":"Cleveland Browns",
+        "DAL":"Dallas Cowboys","DEN":"Denver Broncos","DET":"Detroit Lions","GNB":"Green Bay Packers","GB":"Green Bay Packers",
+        "HOU":"Houston Texans","IND":"Indianapolis Colts","JAX":"Jacksonville Jaguars","JAC":"Jacksonville Jaguars",
+        "KAN":"Kansas City Chiefs","KC":"Kansas City Chiefs","LAC":"Los Angeles Chargers","LAR":"Los Angeles Rams",
+        "LVR":"Las Vegas Raiders","LV":"Las Vegas Raiders","MIA":"Miami Dolphins","MIN":"Minnesota Vikings",
+        "NWE":"New England Patriots","NE":"New England Patriots","NOR":"New Orleans Saints","NO":"New Orleans Saints",
+        "NYG":"New York Giants","NYJ":"New York Jets","PHI":"Philadelphia Eagles","PIT":"Pittsburgh Steelers",
+        "SEA":"Seattle Seahawks","SFO":"San Francisco 49ers","SF":"San Francisco 49ers",
+        "TAM":"Tampa Bay Buccaneers","TB":"Tampa Bay Buccaneers","TEN":"Tennessee Titans","WAS":"Washington Commanders",
+    }
+    tmp["team_full"] = tmp["recent_team"].map(abbr_to_full)
+    tmp = tmp.dropna(subset=["team_full"])
+    def _clean(s): return str(s).replace(".","").replace("-"," ").lower().strip()
+    mapping = {_clean(n): t for n,t in zip(tmp["player_display_name"], tmp["team_full"])}
+    return mapping
+
+PLAYER_TO_TEAM = build_player_team_map()
+
+def clean_name(s: str) -> str:
+    return str(s).replace(".","").replace("-"," ").lower().strip()
+
+# ---------------------------- Simulation primitives ----------------------------
+SD_DEFAULTS = {
+    "player_pass_yds": 38.0,
+    "player_rush_yds": 22.0,
+    "player_rec_yds": 24.0,
+    "player_receptions": 1.35,
+}
+
+def normal_over_prob(mu: float, sd: float, line: float, n: int) -> float:
+    sd = max(1e-6, sd)
+    return float((np.random.normal(mu, sd, size=n) > line).mean())
+
+def american_to_prob(odds: float) -> float:
+    # +120 -> 0.4545, -120 -> 0.5455 (no vigorish adjustment)
+    if odds >= 0:
+        return 100.0 / (odds + 100.0)
+    return (-odds) / ((-odds) + 100.0)
+
+# ---------------------------- Core processing ----------------------------
+def aggregate_lines(outcomes: List[dict]) -> Dict[Tuple[str,str], dict]:
+    """
+    Collapse bookmaker outcomes into one average line per (player, side) pair.
+    Returns {(player, side): {"point": line, "price": avg_price}}
+    """
+    buckets: Dict[Tuple[str,str], List[Tuple[float,Optional[float]]]] = {}
+    for o in outcomes:
+        player = o.get("description") or o.get("participant") or ""
+        side = o.get("name")  # "Over" / "Under" (or "Yes"/"No" for anytime TD sometimes)
+        pt = o.get("point")
+        price = o.get("price")
+        if player and side and (pt is not None):
+            buckets.setdefault((player, side), []).append((float(pt), price if price is not None else np.nan))
+    out: Dict[Tuple[str,str], dict] = {}
+    for key, vals in buckets.items():
+        pts = [v for v,_ in vals]
+        prices = [p for _,p in vals if pd.notna(p)]
+        out[key] = {"point": float(np.mean(pts)), "price": float(np.mean(prices)) if prices else np.nan}
     return out
 
-def lookup_mu(avgs: pd.DataFrame, player: str, market: str) -> Optional[float]:
-    row = avgs.loc[avgs["player"].str.lower() == player.lower()]
-    if row.empty: return None
-    r = row.iloc[0]
-    return {
-        "player_pass_yds": float(r["pass_yds_pg"]),
-        "player_rush_yds": float(r["rush_yds_pg"]),
-        "player_receiving_yds": float(r["rec_yds_pg"]),
-        "player_receptions": float(r["recs_pg"]),
-        "player_anytime_td": max(0.01, float(r["any_td_pg"])),
-    }[market]
+def defense_for_player(player: str, home_team: str, away_team: str) -> Tuple[str, float, float]:
+    """Return (opp_team, pass_adj, rush_adj) by mapping player to home/away."""
+    team = PLAYER_TO_TEAM.get(clean_name(player))
+    if team is None:
+        # heuristic: if name contains home/away QB/WR stars is unknown; fall back to away defense (neutral-ish)
+        # but try a soft guess: if player's last name appears in home team city/nickname, pick home. Rare, so ignore.
+        opp = away_team  # default assume player on home team
+        p_adj = pass_adj(opp); r_adj = rush_adj(opp)
+        return opp, p_adj, r_adj
+    # If player team equals home -> opponent defense is away
+    if team.lower() == home_team.lower():
+        opp = away_team
+    elif team.lower() == away_team.lower():
+        opp = home_team
+    else:
+        # team mismatch (traded, naming variance) → choose the defense closer by string match
+        hsim = 1 if home_team.lower() in team.lower() else 0
+        opp = away_team if hsim else home_team
+    return opp, pass_adj(opp), rush_adj(opp)
 
-def sigma_for(market: str, mu: float) -> float:
-    if market == "player_pass_yds": return max(15.0, 0.18*mu)
-    if market in ("player_rush_yds","player_receiving_yds"): return max(10.0, 0.22*mu)
-    if market == "player_receptions": return max(0.6, 0.35*mu)
-    if market == "player_anytime_td": return 0.35*max(0.15, mu)
-    return max(1.0, 0.25*mu)
+def mu_from_line_with_defense(market: str, line: float, p_adj: float, r_adj: float) -> float:
+    """
+    Start from the consensus line as a neutral mean, then tilt by defense EPA.
+    """
+    if market in ("player_pass_yds",):
+        return float(line * p_adj)
+    if market in ("player_rec_yds","player_receptions"):
+        return float(line * p_adj)
+    if market in ("player_rush_yds",):
+        return float(line * r_adj)
+    if market == "player_anytime_td":
+        # we'll turn this into a Bernoulli p; 'mu' unused for TD
+        return float(line)
+    return float(line)
 
-def apply_defense(market: str, mu: float, pass_adj: float, rush_adj: float, recv_adj: float) -> float:
-    if market == "player_pass_yds": return mu * pass_adj
-    if market == "player_rush_yds": return mu * rush_adj
-    if market in ("player_receiving_yds", "player_receptions"): return mu * recv_adj
-    if market == "player_anytime_td": return mu * (0.5*rush_adj + 0.5*recv_adj)
-    return mu
+def simulate_market_prob(market: str, side: str, line: float, mu: float, price_hint: Optional[float], n: int) -> float:
+    if market == "player_anytime_td":
+        # convert price (if present) to base prob, then nudge by blended adj from mu (already line)
+        if not pd.isna(price_hint):
+            p0 = american_to_prob(price_hint)
+        else:
+            p0 = 0.33  # neutral baseline if price missing
+        # keep as-is; side can be Over/Yes or Under/No (Odds API often uses Over/Under with point=0.5)
+        p = p0
+        return float(p*100.0) if side.lower() in ("over","yes") else float((1.0-p)*100.0)
+    else:
+        sd = SD_DEFAULTS.get(market, 25.0)
+        pov = normal_over_prob(mu, sd, line, n)
+        return float(pov*100.0) if side.lower()=="over" else float((1.0-pov)*100.0)
 
-# ───────────────────────────── RUN (all games) ────────────────────────────────
-run_btn = st.button("Fetch ALL games & simulate", type="primary")
-if run_btn:
-    if not ODDS_API_KEY or ODDS_API_KEY.startswith("PASTE_"):
-        st.error("Add your Odds API key (st.secrets['ODDS_API_KEY'] or edit ODDS_API_KEY in this file).")
-        st.stop()
-
-    with st.spinner("Fetching event list…"):
-        try:
-            events = fetch_events(LOOKAHEAD_DAYS, REGION)
-        except Exception as e:
-            st.error(f"Events fetch failed: {e}")
-            st.stop()
-
+# ---------------------------- Run end-to-end ----------------------------
+def run_all_games(api_key: str, region: str, days: int, markets: List[str], bookmakers: List[str], trials: int) -> pd.DataFrame:
+    events = list_events(api_key, region, days)
     if not events:
-        st.warning("No events returned for the selected window.")
-        st.stop()
-
-    roster_map = build_player_team_map(SEASON)
-    avgs = nfl_player_avgs_per_game(SEASON)
-
-    all_rows = []
-    progress = st.progress(0.0)
-    for idx, ev in enumerate(events):
-        progress.progress((idx+1)/len(events))
+        raise RuntimeError("No upcoming NFL events returned.")
+    rows = []
+    for ev in events:
+        ev_id = ev["id"]
+        home = ev["home_team"]; away = ev["away_team"]
+        start = ev.get("commence_time","")
         try:
-            df = fetch_event_player_props(ev["id"], REGION, MARKETS)
-        except Exception as e:
-            st.warning(f"Skipped event {ev.get('home_team')} vs {ev.get('away_team')}: {e}")
+            data = game_odds(api_key, ev_id, region, markets, bookmakers)
+        except requests.HTTPError as e:
+            # skip noisy 422/404 for unsupported markets
             continue
+        # Merge all bookmaker markets together
+        all_outcomes = []
+        for bk in data.get("bookmakers", []):
+            for mkt in bk.get("markets", []):
+                for oc in mkt.get("outcomes", []):
+                    oc2 = oc.copy()
+                    oc2["_market"] = mkt.get("key","")
+                    all_outcomes.append(oc2)
+        if not all_outcomes:
+            continue
+        # group by market
+        by_market: Dict[str, List[dict]] = {}
+        for oc in all_outcomes:
+            by_market.setdefault(oc["_market"], []).append(oc)
+        for mname, oclist in by_market.items():
+            agg = aggregate_lines(oclist)  # {(player, side) -> {"point","price"}}
+            for (player, side), d in agg.items():
+                opp_team, p_adj, r_adj = defense_for_player(player, home, away)
+                mu = mu_from_line_with_defense(mname, d["point"], p_adj, r_adj)
+                prob = simulate_market_prob(mname, side, d["point"], mu, d.get("price", np.nan), trials)
+                rows.append({
+                    "event_time": start,
+                    "home_team": home, "away_team": away,
+                    "market": mname, "player": player, "side": side,
+                    "line": round(d["point"], 3),
+                    "price_hint": d.get("price", np.nan),
+                    "mu": round(mu, 3),
+                    "prob": round(prob, 2),
+                    "opp_def": opp_team,
+                    "pass_adj": round(p_adj, 3),
+                    "rush_adj": round(r_adj, 3),
+                })
+    return pd.DataFrame(rows)
+
+# ---------------------------- Main UI flow ----------------------------
+if run_btn:
+    if not api_key.strip():
+        st.error("Please paste your Odds API key in the sidebar.")
+        st.stop()
+    try:
+        with st.spinner("Fetching all events, pulling props, mapping players → teams, simulating…"):
+            df = run_all_games(api_key, region, lookahead_days, markets, bookmakers, int(trials))
         if df.empty:
-            continue
+            st.warning("No props returned for the chosen window/markets/bookmakers.")
+        else:
+            st.success(f"Simulated {len(df):,} player props across all games.")
+            # Friendly ordering
+            order = ["event_time","home_team","away_team","market","player","side",
+                     "line","price_hint","mu","prob","opp_def","pass_adj","rush_adj"]
+            show = [c for c in order if c in df.columns]
+            st.dataframe(df[show].sort_values(["event_time","market","player"]), use_container_width=True, height=620)
 
-        # Average lines across books per (market,player,side)
-        grp = df.groupby(["event_id","commence_time","home_team","away_team","market","player","side"], as_index=False).agg(
-            line=("line","mean"),
-            books=("book","nunique")
-        )
-
-        # prepare defense multipliers for home and away
-        def _def_multipliers(team_full: str) -> Tuple[float,float,float]:
-            r = def_table.loc[def_table["Team"].str.lower() == str(team_full).lower()]
-            if r.empty: return (1.0,1.0,1.0)
-            rr = r.iloc[0]
-            return float(rr["pass_adj"]), float(rr["rush_adj"]), float(rr["recv_adj"])
-
-        pH,rH,cH = _def_multipliers(ev["home_team"])
-        pA,rA,cA = _def_multipliers(ev["away_team"])
-
-        for _, r in grp.iterrows():
-            market = r["market"]; player = r["player"]; side = r["side"]
-            line = r["line"]; home = r["home_team"]; away = r["away_team"]
-
-            # player team -> pick the correct opponent defense
-            pteam = resolve_player_team(player, roster_map)
-            if pteam and pteam.lower() == home.lower():
-                opp = away; pass_adj, rush_adj, recv_adj = pA,rA,cA
-            elif pteam and pteam.lower() == away.lower():
-                opp = home; pass_adj, rush_adj, recv_adj = pH,rH,cH
-            else:
-                # fallback: assume away opp
-                opp = away; pass_adj, rush_adj, recv_adj = pA,rA,cA
-
-            mu0 = lookup_mu(avgs, player, market)
-            if mu0 is None:
-                continue
-
-            mu = apply_defense(market, mu0, pass_adj, rush_adj, recv_adj)
-            sd = sigma_for(market, mu)
-
-            if market == "player_anytime_td":
-                p_score = 1.0 - math.exp(-mu)  # Bernoulli approx
-                prob = p_score*100.0 if side=="Over" else (1.0-p_score)*100.0
-                used_line = 0.5
-            else:
-                if pd.isna(line):  # no line? skip
-                    continue
-                used_line = float(line)
-                if side == "Over":
-                    prob = (1.0 - norm.cdf(used_line, loc=mu, scale=sd)) * 100.0
-                else:
-                    prob = (norm.cdf(used_line, loc=mu, scale=sd)) * 100.0
-
-            all_rows.append({
-                "game": f"{home} @ {away}",
-                "commence_time": r["commence_time"],
-                "market": market,
-                "player": player,
-                "side": side,
-                "line": round(used_line,2),
-                "mu": round(mu,3),
-                "sd": round(sd,3),
-                "prob": round(float(prob),2),
-                "opp_def": opp,
-                "pass_adj": round(pass_adj,3),
-                "rush_adj": round(rush_adj,3),
-                "recv_adj": round(recv_adj,3),
-                "books": int(r["books"]),
-            })
-
-        # small pause to be nice to the API
-        time.sleep(0.25)
-
-    progress.empty()
-    results = pd.DataFrame(all_rows).sort_values(["market","prob"], ascending=[True, False]).reset_index(drop=True)
-
-    if results.empty:
-        st.warning("No player prop lines were returned by the API for the selected window/markets.")
+            csv = df.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Download all props (CSV)", csv, file_name="props_sim_results.csv", mime="text/csv")
+    except Exception as e:
+        st.error(f"Run failed: {e}")
         st.stop()
 
-    st.subheader("All games — simulated props (defense-adjusted)")
-    st.dataframe(results, use_container_width=True, height=520)
-
-    st.download_button(
-        "⬇️ Download CSV",
-        data=results.to_csv(index=False).encode("utf-8"),
-        file_name="nfl_player_props_all_games.csv",
-        mime="text/csv",
-    )
-
-    # Quick summaries
-    st.markdown("#### Top Overs / Unders by market")
-    for m in MARKETS:
-        sub = results[results["market"] == m]
-        if sub.empty: 
-            continue
-        c1,c2 = st.columns(2)
-        with c1:
-            st.markdown(f"**{m} — Top 10 Overs**")
-            st.dataframe(sub[sub["side"]=="Over"].nlargest(10, "prob")[["game","player","line","mu","prob"]], use_container_width=True)
-        with c2:
-            st.markdown(f"**{m} — Top 10 Unders**")
-            st.dataframe(sub[sub["side"]=="Under"].nlargest(10, "prob")[["game","player","line","mu","prob"]], use_container_width=True)
+# Footer tip
+st.caption("Note: ‘prob’ is the simulated **P(Over)** for Over, and **P(Under)** for Under. Defense multipliers come from your embedded 2025 EPA table (pass→pass/rec; rush→rush).")
