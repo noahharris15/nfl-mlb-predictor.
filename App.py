@@ -23,12 +23,13 @@ RETRY_ATTEMPTS = 3
 RETRY_BASE_SLEEP = 0.8
 
 # The five markets you asked for
-MARKETS_ALL = [
+VALID_MARKETS = [
     "player_pass_yds",
+    "player_pass_tds",
     "player_rush_yds",
-    "player_rec_yds",
+    "player_receiving_yds",
     "player_receptions",
-    "player_anytime_td",
+    "player_anytime_td_scorer"
 ]
 
 # ---------------------- Embedded 2025 defense EPA multipliers ------------------
