@@ -1,4 +1,4 @@
-# Player Props — Odds API + ESPN (full-season box scores, better UI)
+# Player Props — Odds API + ESPN (full-season box scores, EB shrink + sample SD + t-dist)
 # Run: streamlit run app.py
 
 import re, math, time, unicodedata
@@ -14,8 +14,11 @@ from rapidfuzz import fuzz, process
 # ------------------ Page / theme ------------------
 st.set_page_config(page_title="NFL Player Props — Odds API + ESPN", layout="wide")
 st.title("📈 NFL Player Props — Odds API + ESPN (full-season box scores)")
-st.caption("Build per-game projections from ESPN box scores, apply defense EPA multipliers, "
-           "then simulate 5 player-prop markets with averaged bookmaker lines.")
+st.caption(
+    "Builds per-game projections from ESPN box scores, applies defense EPA multipliers, "
+    "shrinks to league averages, uses sample game-to-game variance for SD, then simulates "
+    "5 player-prop markets with averaged bookmaker lines."
+)
 
 SIM_TRIALS = 10_000
 VALID_MARKETS = [
@@ -93,19 +96,24 @@ def normalize_name(n: str) -> str:
     if len(parts) >= 2 and len(parts[0]) == 1:  # 'D Carr' -> 'Carr'
         n = " ".join(parts[1:])
     return n
-def norm_over_prob(mu: float, sd: float, line: float, trials: int = SIM_TRIALS) -> float:
+
+# heavy tails reduce extreme 99%s on yards/rec
+def t_over_prob(mu: float, sd: float, line: float, trials: int = SIM_TRIALS) -> float:
     sd = max(1e-6, float(sd))
-    return float((np.random.normal(mu, sd, size=trials) > line).mean())
+    draws = mu + sd * np.random.standard_t(df=5, size=trials)
+    return float((draws > line).mean())
+
 def anytime_yes_prob_poisson(lam: float) -> float:
     lam = max(1e-6, float(lam))
     return 1.0 - math.exp(-lam)
+
 def to_float(x) -> float:
     try: return float(x)
     except Exception: return float("nan")
 
 # ------------------ ESPN crawl: scoreboard -> summary box score ------------------
 SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-SUMMARY = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary"
+SUMMARY   = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary"
 
 def http_get(url, params=None, timeout=25) -> Optional[dict]:
     try:
@@ -173,40 +181,59 @@ def parse_boxscore_players(box: dict) -> pd.DataFrame:
     df = pd.DataFrame(out).groupby("Player", as_index=False).sum(numeric_only=True)
     return df
 
+# --------- NEW: season agg with sums AND sums-of-squares to compute sample SD ---------
 @st.cache_data(show_spinner=True)
 def build_espn_season_agg(year: int, weeks: List[int], seasontype: int) -> pd.DataFrame:
-    totals, games = {}, {}
+    totals = {}   # sums
+    sumsqs = {}   # sum of squares (for continuous stats)
+    games  = {}   # games with any positive stat (played)
+
+    def init_player(p):
+        if p not in totals:
+            totals[p] = {"pass_yds":0.0,"pass_tds":0.0,"rush_yds":0.0,"rush_tds":0.0,"rec":0.0,"rec_tds":0.0}
+            sumsqs[p] = {"pass_yds":0.0,"rush_yds":0.0,"rec":0.0}
+            games[p]  = 0
+
     all_events = []
     for wk in weeks:
         all_events.extend(list_week_event_ids(year, wk, seasontype))
     if not all_events:
-        return pd.DataFrame(columns=["Player","g","pass_yds","pass_tds","rush_yds","rush_tds","rec","rec_tds"])
+        return pd.DataFrame(columns=[
+            "Player","g","pass_yds","pass_tds","rush_yds","rush_tds","rec","rec_tds",
+            "sq_pass_yds","sq_rush_yds","sq_rec"
+        ])
 
     prog = st.progress(0.0, text=f"Crawling {len(all_events)} games...")
     for j, ev in enumerate(all_events, 1):
         box = fetch_boxscore_event(ev)
-        if not box: 
-            prog.progress(j/len(all_events)); continue
-        df = parse_boxscore_players(box)
-        if df.empty:
-            prog.progress(j/len(all_events)); continue
-        for _, r in df.iterrows():
-            p = r["Player"]
-            if p not in totals:
-                totals[p] = {"pass_yds":0.0,"pass_tds":0.0,"rush_yds":0.0,"rush_tds":0.0,"rec":0.0,"rec_tds":0.0}
-                games[p] = 0
-            played = any(to_float(r[k])>0 for k in ["pass_yds","pass_tds","rush_yds","rush_tds","rec","rec_tds"] if k in r)
-            if played: games[p] += 1
-            for k in totals[p]:
-                v = to_float(r.get(k, 0))
-                if not np.isnan(v):
-                    totals[p][k] += v
+        if box:
+            df = parse_boxscore_players(box)
+            if not df.empty:
+                for _, r in df.iterrows():
+                    p = r["Player"]; init_player(p)
+
+                    played = any(to_float(r[k]) > 0 for k in ["pass_yds","pass_tds","rush_yds","rush_tds","rec","rec_tds"] if k in r)
+                    if played: games[p] += 1
+
+                    for k in totals[p]:
+                        v = to_float(r.get(k, 0))
+                        if not np.isnan(v):
+                            totals[p][k] += v
+                    for k in ["pass_yds","rush_yds","rec"]:
+                        v = to_float(r.get(k, 0))
+                        if not np.isnan(v):
+                            sumsqs[p][k] += v * v
         prog.progress(j/len(all_events))
 
     rows = []
     for p, stat in totals.items():
         g = max(1, int(games.get(p, 0)))
-        rows.append({"Player": p, "g": g, **stat})
+        rows.append({
+            "Player": p, "g": g, **stat,
+            "sq_pass_yds": sumsqs[p]["pass_yds"] if p in sumsqs else 0.0,
+            "sq_rush_yds": sumsqs[p]["rush_yds"] if p in sumsqs else 0.0,
+            "sq_rec":      sumsqs[p]["rec"]      if p in sumsqs else 0.0
+        })
     return pd.DataFrame(rows)
 
 # ------------------ UI Step 1: scope & defense ------------------
@@ -237,22 +264,61 @@ if st.button("📥 Build projections"):
         st.error("No data returned from ESPN. Try adjusting weeks/season type.")
         st.stop()
 
-    # Per-game μ and SD heuristics (then scale by defense)
-    season_df["mu_pass_yds"] = (season_df["pass_yds"] / season_df["g"]) * scalers["pass_adj"]
-    season_df["mu_pass_tds"] = (season_df["pass_tds"] / season_df["g"]) * scalers["pass_adj"]
-    season_df["mu_rush_yds"] = (season_df["rush_yds"] / season_df["g"]) * scalers["rush_adj"]
-    season_df["mu_receptions"] = (season_df["rec"] / season_df["g"]) * scalers["recv_adj"]
+    # -------- Empirical Bayes shrink for μ (helps small samples) --------
+    K = 6.0  # prior games weight (tune 4–10)
 
-    season_df["sd_pass_yds"] = season_df["mu_pass_yds"].apply(lambda x: np.nan if np.isnan(x) else max(25.0, 0.20*x))
-    season_df["sd_pass_tds"] = season_df["mu_pass_tds"].apply(lambda x: np.nan if np.isnan(x) else max(0.25, 0.60*x))
-    season_df["sd_rush_yds"] = season_df["mu_rush_yds"].apply(lambda x: np.nan if np.isnan(x) else max(6.0, 0.22*x))
-    season_df["sd_receptions"] = season_df["mu_receptions"].apply(lambda x: np.nan if np.isnan(x) else max(1.0, 0.45*x))
+    lg_den = max(1.0, float(season_df["g"].sum()))
+    lg_mu_pass_yds = (season_df["pass_yds"].sum() / lg_den)
+    lg_mu_pass_tds = (season_df["pass_tds"].sum() / lg_den)
+    lg_mu_rush_yds = (season_df["rush_yds"].sum() / lg_den)
+    lg_mu_recs     = (season_df["rec"].sum()       / lg_den)
+    lg_mu_rec_tds  = (season_df["rec_tds"].sum()   / lg_den)
+    lg_mu_rush_tds = (season_df["rush_tds"].sum()  / lg_den)
 
-    season_df["lam_any_wr"] = (season_df["rec_tds"] / season_df["g"]) * scalers["recv_adj"]
-    season_df["lam_any_rb"] = ((season_df["rec_tds"] + season_df["rush_tds"]) / season_df["g"]) * scalers["rush_adj"]
+    w = season_df["g"] / (season_df["g"] + K)
+
+    raw_mu_pass_yds = season_df["pass_yds"] / season_df["g"]
+    raw_mu_pass_tds = season_df["pass_tds"] / season_df["g"]
+    raw_mu_rush_yds = season_df["rush_yds"] / season_df["g"]
+    raw_mu_recs     = season_df["rec"]      / season_df["g"]
+
+    season_df["mu_pass_yds"]   = w * raw_mu_pass_yds + (1 - w) * lg_mu_pass_yds
+    season_df["mu_pass_tds"]   = w * raw_mu_pass_tds + (1 - w) * lg_mu_pass_tds
+    season_df["mu_rush_yds"]   = w * raw_mu_rush_yds + (1 - w) * lg_mu_rush_yds
+    season_df["mu_receptions"] = w * raw_mu_recs     + (1 - w) * lg_mu_recs
+
+    # ---- Sample variance (per-game) with Bessel correction ----
+    def sample_sd(sum_x, sum_x2, g):
+        g = int(g)
+        if g <= 1: return np.nan
+        mean = sum_x / g
+        var = (sum_x2 / g) - (mean ** 2)
+        var = var * (g / (g - 1))  # Bessel correction
+        return float(np.sqrt(max(var, 1e-6)))
+
+    sd_pass_yds_raw = season_df.apply(lambda r: sample_sd(r["pass_yds"], r["sq_pass_yds"], r["g"]), axis=1)
+    sd_rush_yds_raw = season_df.apply(lambda r: sample_sd(r["rush_yds"], r["sq_rush_yds"], r["g"]), axis=1)
+    sd_recs_raw     = season_df.apply(lambda r: sample_sd(r["rec"],      r["sq_rec"],      r["g"]), axis=1)
+
+    # ---- Add extra uncertainty & floors ----
+    SD_INFLATE = 1.25
+    season_df["sd_pass_yds"]   = np.where(np.isnan(sd_pass_yds_raw), np.nan, np.maximum(30.0, sd_pass_yds_raw) * SD_INFLATE)
+    season_df["sd_rush_yds"]   = np.where(np.isnan(sd_rush_yds_raw), np.nan, np.maximum(15.0, sd_rush_yds_raw) * SD_INFLATE)
+    season_df["sd_receptions"] = np.where(np.isnan(sd_recs_raw),     np.nan, np.maximum(1.2,  sd_recs_raw)     * SD_INFLATE)
+
+    # ---- Defense scaling (clamped to avoid extreme boosts) ----
+    def clamp(x, lo=0.85, hi=1.15): return float(np.clip(x, lo, hi))
+    season_df["mu_pass_yds"]   *= clamp(scalers["pass_adj"])
+    season_df["mu_pass_tds"]   *= clamp(scalers["pass_adj"])
+    season_df["mu_rush_yds"]   *= clamp(scalers["rush_adj"])
+    season_df["mu_receptions"] *= clamp(scalers["recv_adj"])
+
+    # ---- Anytime TD lambdas (shrunken) ----
+    season_df["lam_any_wr"] = ( w * (season_df["rec_tds"]/season_df["g"])  + (1 - w) * lg_mu_rec_tds ) * clamp(scalers["recv_adj"])
+    season_df["lam_any_rb"] = ( w * ((season_df["rec_tds"]+season_df["rush_tds"])/season_df["g"]) + (1 - w) * (lg_mu_rec_tds+lg_mu_rush_tds) ) * clamp(scalers["rush_adj"])
 
     # Save slim projection tables (names normalized from parsing)
-    st.session_state["qb_proj"] = season_df[["Player","mu_pass_yds","sd_pass_yds","mu_pass_tds","sd_pass_tds"]].dropna(how="all")
+    st.session_state["qb_proj"] = season_df[["Player","mu_pass_yds","sd_pass_yds","mu_pass_tds"]].dropna(how="all")
     st.session_state["rb_proj"] = season_df[["Player","mu_rush_yds","sd_rush_yds","lam_any_rb"]].dropna(how="all")
     st.session_state["wr_proj"] = season_df[["Player","mu_receptions","sd_receptions","lam_any_wr"]].dropna(how="all")
 
@@ -299,7 +365,7 @@ event = events[event_labels.index(pick)]
 event_id = event["id"]
 
 # ------------------ Simulate ------------------
-st.markdown("### 4) Simulate props with averaged bookmaker lines")
+st.markdown("### 4) Simulate props with median bookmaker line")
 show_top_chart = st.toggle("Show Top Picks chart", value=True)
 go = st.button("🎲 Fetch lines & simulate")
 
@@ -335,9 +401,9 @@ if go:
         st.stop()
     raw_props = pd.DataFrame(rows)
 
-    # Collapse books -> one line per (market, player, side)
+    # Collapse books -> one line per (market, player, side), using MEDIAN line
     props_df = (raw_props.groupby(["market","player_norm","side"], as_index=False)
-                        .agg(line=("point","mean"), n_books=("point","size")))
+                        .agg(line=("point","median"), n_books=("point","size")))
 
     # Sim loop against per-game μ from projections
     out_rows = []
@@ -350,34 +416,39 @@ if go:
 
         if market == "player_pass_tds" and player in qb_names:
             row = qb_proj.loc[qb_proj["Player"] == player].iloc[0]
-            mu, sd = float(row["mu_pass_tds"]), float(row["sd_pass_tds"])
-            if np.isnan(mu) or np.isnan(sd) or pd.isna(point): 
+            lam = max(1e-6, float(row.get("mu_pass_tds", np.nan)))  # μ per game as λ
+            if pd.isna(point): 
                 continue
-            p_over = norm_over_prob(mu, sd, float(point), SIM_TRIALS)
+            draws = np.random.poisson(lam=lam, size=SIM_TRIALS)
+            p_over = float((draws > float(point)).mean())
             p = p_over if side == "Over" else 1.0 - p_over
+            mu, sd = lam, float("nan")
 
         elif market == "player_pass_yds" and player in qb_names:
             row = qb_proj.loc[qb_proj["Player"] == player].iloc[0]
-            mu, sd = float(row["mu_pass_yds"]), float(row["sd_pass_yds"])
+            mu = float(row.get("mu_pass_yds", np.nan))
+            sd = float(row.get("sd_pass_yds", np.nan))
             if np.isnan(mu) or np.isnan(sd) or pd.isna(point):
                 continue
-            p_over = norm_over_prob(mu, sd, float(point), SIM_TRIALS)
+            p_over = t_over_prob(mu, sd, float(point), SIM_TRIALS)
             p = p_over if side == "Over" else 1.0 - p_over
 
         elif market == "player_rush_yds" and player in rb_names:
             row = rb_proj.loc[rb_proj["Player"] == player].iloc[0]
-            mu, sd = float(row["mu_rush_yds"]), float(row["sd_rush_yds"])
+            mu = float(row.get("mu_rush_yds", np.nan))
+            sd = float(row.get("sd_rush_yds", np.nan))
             if np.isnan(mu) or np.isnan(sd) or pd.isna(point):
                 continue
-            p_over = norm_over_prob(mu, sd, float(point), SIM_TRIALS)
+            p_over = t_over_prob(mu, sd, float(point), SIM_TRIALS)
             p = p_over if side == "Over" else 1.0 - p_over
 
         elif market == "player_receptions" and player in wr_names:
             row = wr_proj.loc[wr_proj["Player"] == player].iloc[0]
-            mu, sd = float(row["mu_receptions"]), float(row["sd_receptions"])
+            mu = float(row.get("mu_receptions", np.nan))
+            sd = float(row.get("sd_receptions", np.nan))
             if np.isnan(mu) or np.isnan(sd) or pd.isna(point):
                 continue
-            p_over = norm_over_prob(mu, sd, float(point), SIM_TRIALS)
+            p_over = t_over_prob(mu, sd, float(point), SIM_TRIALS)
             p = p_over if side == "Over" else 1.0 - p_over
 
         elif market == "player_anytime_td":
@@ -388,8 +459,8 @@ if go:
                 lam = float(rb_proj.loc[rb_proj["Player"] == player, "lam_any_rb"].iloc[0])
             if lam is None or np.isnan(lam): 
                 continue
-            p = anytime_yes_prob_poisson(lam)
-            p = p if side in ("Yes","Over") else (1.0 - p)
+            p_yes = anytime_yes_prob_poisson(lam)
+            p = p_yes if side in ("Yes","Over") else (1.0 - p_yes)
             mu, sd = lam, float("nan")
             point = None
         else:
@@ -399,7 +470,7 @@ if go:
             "market": market, "player": player, "side": side,
             "line": (None if point is None else round(float(point), 3)),
             "mu": (None if (isinstance(mu, float) and math.isnan(mu)) else round(float(mu), 3)),
-            "sd": (None if (isinstance(sd, float) and math.isnan(sd)) else round(float(sd), 3)),
+            "sd": (None if (isinstance(sd, float) and math.isnan(sd)) else (None if pd.isna(sd) else round(float(sd), 3))),
             "prob": round(100 * p, 2),
             "opp_def": opp_team,
             "pass_adj": round(scalers["pass_adj"], 3),
@@ -430,7 +501,7 @@ if go:
     colcfg = {
         "player": st.column_config.TextColumn("Player", width="medium"),
         "side": st.column_config.TextColumn("Side", width="small"),
-        "line": st.column_config.NumberColumn("Line", format="%.2f", help="Averaged across books"),
+        "line": st.column_config.NumberColumn("Line", format="%.2f", help="Median across books"),
         "mu": st.column_config.NumberColumn("μ (per-game)", format="%.2f"),
         "sd": st.column_config.NumberColumn("σ (per-game)", format="%.2f"),
         "prob": st.column_config.ProgressColumn("Win Prob %", format="%.2f%%", min_value=0, max_value=100),
