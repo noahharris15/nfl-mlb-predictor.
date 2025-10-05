@@ -19,7 +19,6 @@ VALID_MARKETS = [
     "player_pass_yds",
     "player_rush_yds",
     "player_receptions",
-    "player_receiving_yards",  # (we'll also accept player_rec_yds in the response)
     "player_anytime_td",
 ]
 
