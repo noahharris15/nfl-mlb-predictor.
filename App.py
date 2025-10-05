@@ -14,7 +14,14 @@ st.set_page_config(page_title="NFL Player Props (Odds API + CSV + Defense EPA)",
 st.title("📈 NFL Player Props — Odds API + Your CSVs (defense EPA embedded)")
 
 SIM_TRIALS = 10000
-VALID_MARKETS = ["player_pass_tds", "player_rush_yds", "player_receptions"]
+# >>> CHANGED: expanded to your 5 markets <<<
+VALID_MARKETS = [
+    "player_pass_yds",
+    "player_rush_yds",
+    "player_receptions",
+    "player_receiving_yards",  # (we'll also accept player_rec_yds in the response)
+    "player_anytime_td",
+]
 
 # ---------------- Embedded 2025 defense EPA (from your sheet) ----------------
 DEFENSE_EPA_2025 = """Team,EPA_Pass,EPA_Rush,Comp_Pct
@@ -132,12 +139,17 @@ def qb_proj_from_csv(df: pd.DataFrame, pass_scale: float) -> Optional[pd.DataFra
     for _, r in df.iterrows():
         name = str(r.get("Player", r.get("player","")))
         g = float(r.get("G", 1) or 1)
-        td = r.get("TD", np.nan)
-        try: td_mu = float(td) / max(1.0, g)
-        except Exception: td_mu = 1.2
-        td_mu *= pass_scale
-        td_sd = max(0.25, 0.60 * td_mu)
-        rows.append({"Player": name, "mu_pass_tds": td_mu, "sd_pass_tds": td_sd})
+        # >>> ADDED: passing yards mean/sd <<<
+        ypg = r.get("Y/G", np.nan); yds = r.get("Yds", np.nan)
+        try: py_mu = float(ypg) if pd.notna(ypg) else float(yds) / max(1.0, g)
+        except Exception: py_mu = 235.0
+        py_mu *= pass_scale
+        py_sd = max(20.0, 0.18 * py_mu)
+
+        rows.append({
+            "Player": name,
+            "mu_pass_yds": py_mu, "sd_pass_yds": py_sd,
+        })
     return pd.DataFrame(rows)
 
 def rb_proj_from_csv(df: pd.DataFrame, rush_scale: float) -> Optional[pd.DataFrame]:
@@ -160,12 +172,23 @@ def wr_proj_from_csv(df: pd.DataFrame, recv_scale: float) -> Optional[pd.DataFra
     for _, r in df.iterrows():
         name = str(r.get("Player", r.get("player","")))
         g = float(r.get("G", 1) or 1)
+        # >>> ADDED: receiving yards mean/sd <<<
+        ypg = r.get("Y/G", np.nan); yds = r.get("Yds", np.nan)
+        try: rec_yds_mu = float(ypg) if pd.notna(ypg) else float(yds) / max(1.0, g)
+        except Exception: rec_yds_mu = 55.0
+        rec_yds_mu *= recv_scale
+        rec_yds_sd = max(8.0, 0.22 * rec_yds_mu)
+        # receptions
         rec = r.get("Rec", np.nan)
         try: rec_mu = float(rec) / max(1.0, g)
         except Exception: rec_mu = 4.5
         rec_mu *= recv_scale
         rec_sd = max(1.0, 0.45 * rec_mu)
-        rows.append({"Player": name, "mu_receptions": rec_mu, "sd_receptions": rec_sd})
+        rows.append({
+            "Player": name,
+            "mu_rec_yards": rec_yds_mu, "sd_rec_yards": rec_yds_sd,
+            "mu_receptions": rec_mu, "sd_receptions": rec_sd
+        })
     return pd.DataFrame(rows)
 
 qb_proj = qb_proj_from_csv(qb_df, scalers["pass_adj"])
@@ -234,11 +257,14 @@ if go:
         st.error(f"Props fetch failed: {e}")
         st.stop()
 
-    # Aggregate bookmaker outcomes → one row per (market, player, point, side) averaged over books
+    # Aggregate bookmaker outcomes → one row per (market, player, point, side)
     rows = []
     for bk in data.get("bookmakers", []):
         for m in bk.get("markets", []):
             mkey = m.get("key")
+            # accept player_rec_yds if a book returns it; map to player_receiving_yards
+            if mkey == "player_rec_yds":
+                mkey = "player_receiving_yards"
             for o in m.get("outcomes", []):
                 name = o.get("description")  # player name for player_* markets
                 side = o.get("name")         # "Over" or "Under"
@@ -267,27 +293,55 @@ if go:
     for _, r in df.iterrows():
         market = r["market"]; player = r["player_raw"]; point = r["point"]; side = r["side"]
 
-        if market == "player_pass_tds" and qb_proj is not None:
+        if market == "player_pass_yds" and qb_proj is not None:
             match = fuzzy_pick(player, qb_names, cutoff=82)
             if match:
                 row = qb_proj.loc[qb_proj["Player"] == match].iloc[0]
-                mu, sd = float(row["mu_pass_tds"]), float(row["sd_pass_tds"])
-            else: 
+                mu, sd = float(row["mu_pass_yds"]), float(row["sd_pass_yds"])
+            else:
                 continue
+
         elif market == "player_rush_yds" and rb_proj is not None:
             match = fuzzy_pick(player, rb_names, cutoff=82)
             if match:
                 row = rb_proj.loc[rb_proj["Player"] == match].iloc[0]
                 mu, sd = float(row["mu_rush_yds"]), float(row["sd_rush_yds"])
-            else: 
+            else:
                 continue
+
         elif market == "player_receptions" and wr_proj is not None:
             match = fuzzy_pick(player, wr_names, cutoff=82)
             if match:
                 row = wr_proj.loc[wr_proj["Player"] == match].iloc[0]
                 mu, sd = float(row["mu_receptions"]), float(row["sd_receptions"])
-            else: 
+            else:
                 continue
+
+        elif market == "player_receiving_yards" and wr_proj is not None:
+            match = fuzzy_pick(player, wr_names, cutoff=82)
+            if match:
+                row = wr_proj.loc[wr_proj["Player"] == match].iloc[0]
+                mu, sd = float(row["mu_rec_yards"]), float(row["sd_rec_yards"])
+            else:
+                continue
+
+        elif market == "player_anytime_td":
+            # Derive mean/sd from whichever table the player lives in (WR -> RB -> QB)
+            match = fuzzy_pick(player, wr_names, cutoff=82) if wr_proj is not None else None
+            base = wr_proj.loc[wr_proj["Player"] == match].iloc[0] if (wr_proj is not None and match) else None
+            if base is None and rb_proj is not None:
+                match = fuzzy_pick(player, rb_names, cutoff=82)
+                base = rb_proj.loc[rb_proj["Player"] == match].iloc[0] if match else None
+            if base is None and qb_proj is not None:
+                match = fuzzy_pick(player, qb_names, cutoff=82)
+                base = qb_proj.loc[qb_proj["Player"] == match].iloc[0] if match else None
+            if base is None:
+                continue
+            # simple rate model: receptions and rushing influence
+            mu = 0.10 * float(base.get("mu_receptions", 0)) + 0.06 * float(base.get("mu_rush_yds", 0))
+            if mu <= 0: mu = 0.35
+            sd = max(0.20, 0.60 * mu)
+
         else:
             continue
 
