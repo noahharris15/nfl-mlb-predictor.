@@ -1,29 +1,26 @@
-# app.py — NFL Player Props (ESPN + Odds API + Defense Scaling)
+# Player Props — Odds API + ESPN (pos-aware priors + dynamic shrink + sample SD + t-dist)
 # Run: streamlit run app.py
 
-import math
+import re, math, unicodedata
+from io import StringIO
+from typing import List, Optional
 import numpy as np
 import pandas as pd
-import streamlit as st
 import requests
-from io import StringIO
-from typing import List, Dict, Optional
+import streamlit as st
 from rapidfuzz import process, fuzz
 
-st.set_page_config(page_title="NFL Player Props — ESPN + Odds API", layout="wide")
-st.title("🏈 NFL Player Props — ESPN Stats + Odds API (2025)")
+# ------------------ Page / theme ------------------
+st.set_page_config(page_title="NFL Player Props — Odds API + ESPN", layout="wide")
+st.title("📈 NFL Player Props — Odds API + ESPN (pos-aware priors, calibrated)")
 
 SIM_TRIALS = 10_000
-EPS = 1e-9
 VALID_MARKETS = [
-    "player_pass_yds",
-    "player_pass_tds",
-    "player_rush_yds",
-    "player_receptions",
-    "player_rec_yds"
+    "player_pass_yds", "player_rush_yds",
+    "player_rec_yds", "player_receptions", "player_pass_tds"
 ]
 
-# ---------------- 2025 Defense EPA ----------------
+# ------------------ Embedded 2025 defense EPA ------------------
 DEFENSE_EPA_2025 = """Team,EPA_Pass,EPA_Rush,Comp_Pct
 Minnesota Vikings,-0.37,0.06,0.6762
 Jacksonville Jaguars,-0.17,-0.05,0.5962
@@ -58,211 +55,211 @@ Baltimore Ravens,0.14,0.12,0.6667
 Dallas Cowboys,0.40,0.06,0.7333
 Miami Dolphins,0.34,0.12,0.7757
 """
-
 @st.cache_data(show_spinner=False)
 def load_defense_table():
     df = pd.read_csv(StringIO(DEFENSE_EPA_2025))
-    for c in ["EPA_Pass", "EPA_Rush", "Comp_Pct"]:
+    for c in ["EPA_Pass","EPA_Rush","Comp_Pct"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    def adj(s, scale):
-        out = 1.0 - scale * s.fillna(0)
-        return out.clip(0.7, 1.3)
-    pass_adj = adj(df["EPA_Pass"], 0.8)
-    rush_adj = adj(df["EPA_Rush"], 0.8)
-    comp = df["Comp_Pct"].clip(0.45, 0.8)
-    comp_adj = (1 + (comp - comp.mean()) * 0.6).clip(0.7, 1.3)
-    recv_adj = (0.7 * pass_adj + 0.3 * comp_adj).clip(0.7, 1.3)
-    return pd.DataFrame({"Team": df["Team"], "pass_adj": pass_adj, "rush_adj": rush_adj, "recv_adj": recv_adj})
-
+    def adj_from_epa(s, scale):
+        x = s.fillna(0.0)
+        return (1.0 - scale * x).clip(0.7, 1.3)
+    pass_adj = adj_from_epa(df["EPA_Pass"], 0.8)
+    rush_adj = adj_from_epa(df["EPA_Rush"], 0.8)
+    comp = df["Comp_Pct"].clip(0.45,0.80).fillna(df["Comp_Pct"].mean())
+    comp_adj = (1.0 + (comp - comp.mean()) * 0.6).clip(0.7,1.3)
+    recv_adj = (0.7*pass_adj + 0.3*comp_adj).clip(0.7,1.3)
+    return pd.DataFrame({"Team":df["Team"],"pass_adj":pass_adj,"rush_adj":rush_adj,"recv_adj":recv_adj})
 DEF_TABLE = load_defense_table()
 
-# ---------------- ESPN Stats ----------------
-st.header("1️⃣ Pulling Live ESPN Player Stats")
+# ------------------ Helpers ------------------
+def strip_accents(s): return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+def normalize_name(n):
+    n=str(n or ""); n=n.split("(")[0]; n=n.replace("-"," "); n=re.sub(r"[.,']"," ",n)
+    return strip_accents(re.sub(r"\s+"," ",n).strip())
+def t_over_prob(mu, sd, line, trials=SIM_TRIALS):
+    sd=max(1e-6,float(sd))
+    draws = mu + sd*np.random.standard_t(df=5, size=trials)
+    return float((draws>line).mean())
+def to_float(x):
+    try: return float(x)
+    except Exception: return float("nan")
+
+# ------------------ ESPN API ------------------
+SCOREBOARD="https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+SUMMARY="https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary"
+
+def http_get(url, params=None, timeout=25):
+    try:
+        r=requests.get(url,params=params,timeout=timeout)
+        if r.status_code==200: return r.json()
+    except Exception: pass
+    return None
+
+@st.cache_data(show_spinner=False)
+def list_week_event_ids(year,week,seasontype=2):
+    js=http_get(SCOREBOARD,params={"year":year,"week":week,"seasontype":seasontype})
+    if not js: return []
+    return [str(e.get("id")) for e in js.get("events",[]) if e.get("id")]
+
+@st.cache_data(show_spinner=False)
+def fetch_boxscore_event(event_id): return http_get(SUMMARY,params={"event":event_id})
+
+def parse_boxscore_players(box):
+    out=[]
+    try:
+        for team in box.get("boxscore",{}).get("players",[]):
+            for cat in team.get("statistics",[]):
+                label=(cat.get("name") or "").lower()
+                for a in cat.get("athletes",[]):
+                    nm=normalize_name(a.get("athlete",{}).get("displayName"))
+                    vals=a.get("stats") or []
+                    if "passing" in label:
+                        yds,tds=to_float(vals[1]),to_float(vals[2])
+                        out.append({"Player":nm,"pass_yds":yds,"pass_tds":tds,
+                                    "rush_yds":0,"rec_yds":0,"rec":0})
+                    elif "rushing" in label:
+                        yds=to_float(vals[1])
+                        out.append({"Player":nm,"pass_yds":0,"pass_tds":0,
+                                    "rush_yds":yds,"rec_yds":0,"rec":0})
+                    elif "receiving" in label:
+                        recs,yds=to_float(vals[0]),to_float(vals[1])
+                        out.append({"Player":nm,"pass_yds":0,"pass_tds":0,
+                                    "rush_yds":0,"rec_yds":yds,"rec":recs})
+    except Exception: pass
+    if not out: return pd.DataFrame(columns=["Player","pass_yds","pass_tds","rush_yds","rec_yds","rec"])
+    return pd.DataFrame(out).groupby("Player",as_index=False).sum(numeric_only=True)
 
 @st.cache_data(show_spinner=True)
-def load_espn_2025_stats() -> pd.DataFrame:
-    url = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/statistics"
-    r = requests.get(url)
-    if r.status_code != 200:
-        st.error("ESPN API unavailable.")
-        return pd.DataFrame()
-    js = r.json()
-    tables = js.get("stats", [])
-    rows = []
-    for t in tables:
-        for cat in t.get("categories", []):
-            for stat in cat.get("stats", []):
-                name = stat.get("athlete", {}).get("displayName")
-                if not name:
-                    continue
-                values = stat.get("stats", {})
-                rows.append({
-                    "Player": name,
-                    "team": stat.get("team", {}).get("displayName"),
-                    "rush_yds": float(values.get("rushingYards", 0) or 0),
-                    "rec_yds": float(values.get("receivingYards", 0) or 0),
-                    "receptions": float(values.get("receptions", 0) or 0),
-                    "pass_yds": float(values.get("passingYards", 0) or 0),
-                    "pass_tds": float(values.get("passingTouchdowns", 0) or 0),
-                    "games": float(values.get("gamesPlayed", 1) or 1)
-                })
-    df = pd.DataFrame(rows)
-    df["rush_ypg"] = df["rush_yds"] / df["games"]
-    df["rec_ypg"] = df["rec_yds"] / df["games"]
-    df["receptions_pg"] = df["receptions"] / df["games"]
-    df["pass_ypg"] = df["pass_yds"] / df["games"]
-    df["pass_tdp"] = df["pass_tds"] / df["games"]
-    return df
+def build_espn_season_agg(year,weeks,seasontype):
+    totals,sumsqs,games={}, {}, {}
+    def init_p(p):
+        if p not in totals:
+            totals[p]={"pass_yds":0,"pass_tds":0,"rush_yds":0,"rec_yds":0,"rec":0}
+            sumsqs[p]={"pass_yds":0,"rush_yds":0,"rec_yds":0}
+            games[p]=0
+    events=[]
+    for wk in weeks: events+=list_week_event_ids(year,wk,seasontype)
+    prog=st.progress(0.0,text=f"Crawling {len(events)} games...")
+    for j,ev in enumerate(events,1):
+        box=fetch_boxscore_event(ev)
+        if box is None: continue
+        df=parse_boxscore_players(box)
+        for _,r in df.iterrows():
+            p=r["Player"]; init_p(p)
+            played=any(to_float(r[k])>0 for k in ["pass_yds","rush_yds","rec_yds","rec"])
+            if played: games[p]+=1
+            for k in totals[p]:
+                v=to_float(r.get(k,0))
+                if not np.isnan(v): totals[p][k]+=v
+            for k in sumsqs[p]:
+                v=to_float(r.get(k,0))
+                if not np.isnan(v): sumsqs[p][k]+=v*v
+        prog.progress(j/len(events))
+    rows=[]
+    for p,stat in totals.items():
+        g=max(1,int(games.get(p,0)))
+        rows.append({"Player":p,"g":g,**stat,
+                     "sq_pass_yds":sumsqs[p]["pass_yds"],
+                     "sq_rush_yds":sumsqs[p]["rush_yds"],
+                     "sq_rec_yds":sumsqs[p]["rec_yds"]})
+    return pd.DataFrame(rows)
 
-stats_df = load_espn_2025_stats()
-if stats_df.empty:
-    st.stop()
+# ------------------ Step 1: Build projections ------------------
+st.markdown("### 1) Build projections from ESPN")
+season=st.number_input("Season",2015,2100,2025)
+weeks=list(range(1,18+1))
+opp_team=st.selectbox("Opponent",DEF_TABLE["Team"].tolist(),index=0)
+scalers=DEF_TABLE.set_index("Team").loc[opp_team].to_dict()
 
-# ---------------- Opponent Scaling ----------------
-st.header("2️⃣ Choose Opponent Defense Scaling")
-opp_team = st.selectbox("Opponent Defense", DEF_TABLE["Team"].tolist(), index=0)
-scalers = DEF_TABLE.set_index("Team").loc[opp_team].to_dict()
+if st.button("📥 Build projections"):
+    df=build_espn_season_agg(season,weeks,2)
+    if df.empty: st.stop()
+    g=df["g"].clip(lower=1)
+    df["rush_ypg"]=df["rush_yds"]/g
+    df["rec_ypg"]=df["rec_yds"]/g
+    df["rec_pg"]=df["rec"]/g
+    df["pass_ypg"]=df["pass_yds"]/g
+    df["pass_tdp"]=df["pass_tds"]/g
+    rushers=df[df["rush_ypg"]>=15]; receivers=df[df["rec_pg"]>=1.5]; passers=df[df["pass_ypg"]>=100]
+    def trimmed_mean(s,t=0.2):
+        s=s.dropna().sort_values(); n=len(s); k=int(n*t)
+        return float(s.iloc[k:n-k].mean() if n>2*k else s.mean())
+    lg_mu_rush=trimmed_mean(rushers["rush_ypg"]) if not rushers.empty else df["rush_ypg"].median()
+    lg_mu_recyds=trimmed_mean(receivers["rec_ypg"]) if not receivers.empty else df["rec_ypg"].median()
+    lg_mu_recs=trimmed_mean(receivers["rec_pg"]) if not receivers.empty else df["rec_pg"].median()
+    lg_mu_pass=trimmed_mean(passers["pass_ypg"]) if not passers.empty else df["pass_ypg"].median()
+    lg_mu_passtd=trimmed_mean(passers["pass_tdp"]) if not passers.empty else df["pass_tdp"].median()
+    K=np.where(g>=6,1.0,np.where(g>=4,2.0,5.0)); w=g/(g+K)
+    df["mu_rush_yds"]=w*df["rush_ypg"]+(1-w)*lg_mu_rush
+    df["mu_rec_yds"]=w*df["rec_ypg"]+(1-w)*lg_mu_recyds
+    df["mu_receptions"]=w*df["rec_pg"]+(1-w)*lg_mu_recs
+    df["mu_pass_yds"]=w*df["pass_ypg"]+(1-w)*lg_mu_pass
+    df["mu_pass_tds"]=w*df["pass_tdp"]+(1-w)*lg_mu_passtd
+    df["sd_rush_yds"]=df["rush_yds"].std()*0.3 if not df.empty else 10
+    df["sd_rec_yds"]=df["rec_yds"].std()*0.25 if not df.empty else 8
+    df["sd_receptions"]=df["rec"].std()*0.25 if not df.empty else 1
+    df["sd_pass_yds"]=df["pass_yds"].std()*0.25 if not df.empty else 30
+    df["sd_pass_tds"]=0.6
+    df["mu_pass_yds"]*=scalers["pass_adj"]
+    df["mu_pass_tds"]*=scalers["pass_adj"]
+    df["mu_rush_yds"]*=scalers["rush_adj"]
+    df["mu_rec_yds"]*=scalers["recv_adj"]
+    df["mu_receptions"]*=scalers["recv_adj"]
+    st.session_state["proj"]=df
 
-# ---------------- Priors ----------------
-def trimmed_mean(s, trim=0.2):
-    s = s.dropna().sort_values()
-    if s.empty: return np.nan
-    n = len(s); k = int(n * trim)
-    return float(s.iloc[k:n - k].mean() if n > 2 * k else s.mean())
+# ------------------ Step 2: Odds API ------------------
+st.markdown("### 2) Fetch & simulate Odds API props")
+api_key=st.text_input("Odds API Key","",type="password")
+region=st.selectbox("Region",["us","us2","eu","uk"],0)
+lookahead=st.slider("Lookahead days",0,7,1)
 
-rushers = stats_df[stats_df["rush_ypg"] >= 15]
-receivers = stats_df[stats_df["receptions_pg"] >= 1.5]
-passers = stats_df[stats_df["pass_ypg"] >= 100]
+def odds_get(url,params):
+    r=requests.get(url,params=params,timeout=25)
+    r.raise_for_status(); return r.json()
+def list_nfl_events(api_key,lookahead,region):
+    return odds_get("https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events",
+                    {"apiKey":api_key,"daysFrom":0,"daysTo":lookahead,"regions":region})
+def fetch_event_props(api_key,event_id,region,markets):
+    return odds_get(f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events/{event_id}/odds",
+                    {"apiKey":api_key,"regions":region,"markets":",".join(markets),"oddsFormat":"american"})
 
-lg_mu_rush_yds = trimmed_mean(rushers["rush_ypg"])
-lg_mu_rec_yds = trimmed_mean(receivers["rec_ypg"])
-lg_mu_receptions = trimmed_mean(receivers["receptions_pg"])
-lg_mu_pass_yds = trimmed_mean(passers["pass_ypg"])
-lg_mu_pass_tds = trimmed_mean(passers["pass_tdp"])
-
-def shrink(mu, prior, w=0.15):
-    if pd.isna(mu) or pd.isna(prior): return mu
-    return (1 - w) * mu + w * prior
-
-for col in [
-    "rush_ypg", "rec_ypg", "receptions_pg", "pass_ypg", "pass_tdp"
-]:
-    stats_df[col] = pd.to_numeric(stats_df[col], errors="coerce")
-
-stats_df["rush_ypg_adj"] = stats_df["rush_ypg"].apply(lambda x: shrink(x, lg_mu_rush_yds)) * scalers["rush_adj"]
-stats_df["rec_ypg_adj"] = stats_df["rec_ypg"].apply(lambda x: shrink(x, lg_mu_rec_yds)) * scalers["recv_adj"]
-stats_df["receptions_pg_adj"] = stats_df["receptions_pg"].apply(lambda x: shrink(x, lg_mu_receptions)) * scalers["recv_adj"]
-stats_df["pass_ypg_adj"] = stats_df["pass_ypg"].apply(lambda x: shrink(x, lg_mu_pass_yds)) * scalers["pass_adj"]
-stats_df["pass_tdp_adj"] = stats_df["pass_tdp"].apply(lambda x: shrink(x, lg_mu_pass_tds)) * scalers["pass_adj"]
-
-# ---------------- SD Estimates ----------------
-stats_df["sd_rush_yds"] = (stats_df["rush_ypg_adj"] * 0.25).clip(lower=5)
-stats_df["sd_rec_yds"] = (stats_df["rec_ypg_adj"] * 0.35).clip(lower=5)
-stats_df["sd_receptions"] = (stats_df["receptions_pg_adj"] * 0.35).clip(lower=0.5)
-stats_df["sd_pass_yds"] = (stats_df["pass_ypg_adj"] * 0.20).clip(lower=25)
-stats_df["sd_pass_tds"] = (stats_df["pass_tdp_adj"] * 0.60).clip(lower=0.25)
-
-# ---------------- Odds API ----------------
-st.header("3️⃣ Fetch Props & Run Simulations (10,000 trials)")
-api_key = st.text_input("Odds API Key", value="", type="password")
-region = st.selectbox("Region", ["us", "us2", "eu", "uk"], index=0)
-lookahead = st.slider("Lookahead (days)", 0, 7, value=1)
-if not api_key:
-    st.stop()
-
-def odds_get(url, params):
-    r = requests.get(url, params=params, timeout=25)
-    if r.status_code != 200:
-        raise requests.HTTPError(f"HTTP {r.status_code}: {r.text[:300]}")
-    return r.json()
-
-def list_nfl_events(api_key, lookahead, region):
-    base = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events"
-    params = {"apiKey": api_key, "daysFrom": 0, "daysTo": lookahead, "regions": region}
-    return odds_get(base, params)
-
-def fetch_event_props(api_key, event_id, region):
-    base = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events/{event_id}/odds"
-    params = {"apiKey": api_key, "regions": region, "markets": ",".join(VALID_MARKETS), "oddsFormat": "american"}
-    return odds_get(base, params)
-
-try:
-    events = list_nfl_events(api_key, lookahead, region)
-except Exception as e:
-    st.error(f"Event fetch error: {e}")
-    st.stop()
-
-event_labels = [f'{e["away_team"]} @ {e["home_team"]}' for e in events]
-event_pick = st.selectbox("Choose Game", event_labels)
-event_id = events[event_labels.index(event_pick)]["id"]
-
-if st.button("Fetch & Simulate"):
-    try:
-        data = fetch_event_props(api_key, event_id, region)
-    except Exception as e:
-        st.error(f"Props fetch failed: {e}")
-        st.stop()
-
-    rows = []
-    for bk in data.get("bookmakers", []):
-        for m in bk.get("markets", []):
-            key = m.get("key")
-            for o in m.get("outcomes", []):
-                player = o.get("description")
-                side = o.get("name")
-                point = o.get("point")
-                if key not in VALID_MARKETS or not player or point is None:
-                    continue
-                rows.append({"market": key, "player": player, "side": side, "line": float(point)})
-
-    if not rows:
-        st.warning("No player props found.")
-        st.stop()
-
-    odds_df = pd.DataFrame(rows).drop_duplicates()
-
-    def simulate(mu, sd, line):
-        sd = max(sd, 1.0)
-        return round((np.random.normal(mu, sd, SIM_TRIALS) > line).mean() * 100, 2)
-
-    results = []
-    for _, row in odds_df.iterrows():
-        name = row["player"]; line = row["line"]; market = row["market"]; side = row["side"]
-        col_map = {
-            "player_pass_yds": ("pass_ypg_adj", "sd_pass_yds"),
-            "player_pass_tds": ("pass_tdp_adj", "sd_pass_tds"),
-            "player_rush_yds": ("rush_ypg_adj", "sd_rush_yds"),
-            "player_receptions": ("receptions_pg_adj", "sd_receptions"),
-            "player_rec_yds": ("rec_ypg_adj", "sd_rec_yds")
-        }
-        if market not in col_map: continue
-        mu_col, sd_col = col_map[market]
-        match = process.extractOne(name, stats_df["Player"].tolist(), scorer=fuzz.token_sort_ratio)
-        if not match or match[1] < 85:
-            continue
-        player = match[0]
-        p = stats_df[stats_df["Player"] == player].iloc[0]
-        mu, sd = p[mu_col], p[sd_col]
-        p_over = simulate(mu, sd, line)
-        prob = p_over if side == "Over" else 100 - p_over
-        results.append({
-            "Player": player,
-            "Market": market,
-            "Side": side,
-            "Line": round(line, 2),
-            "μ": round(mu, 2),
-            "σ": round(sd, 2),
-            "Win Prob %": round(prob, 2)
-        })
-
-    if not results:
-        st.warning("No matched player projections.")
-    else:
-        res = pd.DataFrame(results).sort_values("Win Prob %", ascending=False)
-        st.dataframe(res, use_container_width=True)
-        st.download_button(
-            "⬇️ Download CSV",
-            res.to_csv(index=False).encode("utf-8"),
-            file_name="props_sim_results.csv",
-            mime="text/csv"
-        )
+if api_key:
+    try: events=list_nfl_events(api_key,lookahead,region)
+    except Exception as e: st.error(e); st.stop()
+    event_labels=[f'{e["away_team"]} @ {e["home_team"]}' for e in events]
+    pick=st.selectbox("Game",event_labels)
+    event_id=events[event_labels.index(pick)]["id"]
+    if st.button("🎲 Simulate"):
+        data=fetch_event_props(api_key,event_id,region,VALID_MARKETS)
+        props=[]
+        for bk in data.get("bookmakers",[]):
+            for m in bk.get("markets",[]):
+                key=m.get("key")
+                for o in m.get("outcomes",[]):
+                    nm=normalize_name(o.get("description")); side=o.get("name"); pt=o.get("point")
+                    if key not in VALID_MARKETS or not nm or pt is None: continue
+                    props.append({"market":key,"player":nm,"side":side,"line":float(pt)})
+        if not props: st.warning("No props found."); st.stop()
+        props_df=pd.DataFrame(props).groupby(["market","player","side"],as_index=False).agg(line=("line","median"))
+        df=st.session_state["proj"]
+        results=[]
+        for _,r in props_df.iterrows():
+            name,side,market,line=r["player"],r["side"],r["market"],r["line"]
+            match=process.extractOne(name,df["Player"].tolist(),scorer=fuzz.token_sort_ratio)
+            if not match or match[1]<85: continue
+            p=match[0]; row=df[df["Player"]==p].iloc[0]
+            mu_col,sd_col={
+                "player_pass_yds":("mu_pass_yds","sd_pass_yds"),
+                "player_pass_tds":("mu_pass_tds","sd_pass_tds"),
+                "player_rush_yds":("mu_rush_yds","sd_rush_yds"),
+                "player_receptions":("mu_receptions","sd_receptions"),
+                "player_rec_yds":("mu_rec_yds","sd_rec_yds")
+            }[market]
+            mu,sd=float(row[mu_col]),float(row[sd_col])
+            p_over=t_over_prob(mu,sd,line)
+            prob=p_over if side=="Over" else 1-p_over
+            results.append({"market":market,"player":p,"side":side,"line":line,"μ":mu,"σ":sd,"Win Prob %":round(prob*100,2)})
+        res=pd.DataFrame(results).sort_values("Win Prob %",ascending=False)
+        st.dataframe(res,use_container_width=True)
+        st.bar_chart(res.head(15).set_index("player")["Win Prob %"])
+        st.download_button("⬇️ Download results CSV",res.to_csv(index=False).encode("utf-8"),"props_sim_results.csv","text/csv")
