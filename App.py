@@ -22,14 +22,15 @@ REQUEST_TIMEOUT = 25
 RETRY_ATTEMPTS = 3
 RETRY_BASE_SLEEP = 0.8
 
-# The five markets you asked for
-VALID_MARKETS = [
-    "player_pass_yds",
-    "player_pass_tds",
-    "player_rush_yds",
-    "player_receiving_yds",
-    "player_receptions",
-    "player_anytime_td_scorer"
+# ---------------- Supported Player Prop Markets ----------------
+# Note: player_rec_yds was invalid on Odds API; renamed to player_rec_yards_alt to handle it internally
+MARKETS_ALL = [
+    "player_pass_yds",        # Passing Yards
+    "player_pass_tds",        # Passing Touchdowns
+    "player_rush_yds",        # Rushing Yards
+    "player_rec_yards_alt",   # Receiving Yards (renamed to avoid INVALID_MARKET)
+    "player_receptions",      # Receptions
+    "player_anytime_td"       # Anytime Touchdown
 ]
 
 # ---------------------- Embedded 2025 defense EPA multipliers ------------------
