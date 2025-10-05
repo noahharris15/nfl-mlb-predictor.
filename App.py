@@ -1,5 +1,4 @@
 # Player Props Simulator — Odds API + nfl_data_py (no CSVs)
-# Single page; embedded 2025 defense EPA scalers
 # Run: streamlit run app.py
 
 import math
@@ -10,16 +9,12 @@ import requests
 from io import StringIO
 from typing import List, Optional, Dict, Tuple
 from rapidfuzz import process, fuzz
-
-# -------- NEW: pull live stats (season-to-date) from nfl_data_py --------
-import nfl_data_py as nfl   # pip install nfl_data_py
+import nfl_data_py as nfl  # pip install nfl_data_py
 
 st.set_page_config(page_title="NFL Player Props — Odds API + nfl_data_py", layout="wide")
 st.title("📈 NFL Player Props — Odds API + nfl_data_py (defense EPA embedded)")
 
 SIM_TRIALS = 10_000
-
-# EXACT FIVE MARKETS
 VALID_MARKETS = [
     "player_pass_yds",
     "player_rush_yds",
@@ -28,7 +23,7 @@ VALID_MARKETS = [
     "player_pass_tds",
 ]
 
-# ---------------- Embedded 2025 defense EPA (from your sheet) ----------------
+# ---------------- Embedded 2025 defense EPA (your table) ----------------
 DEFENSE_EPA_2025 = """Team,EPA_Pass,EPA_Rush,Comp_Pct
 Minnesota Vikings,-0.37,0.06,0.6762
 Jacksonville Jaguars,-0.17,-0.05,0.5962
@@ -83,7 +78,7 @@ def load_defense_table() -> pd.DataFrame:
 DEF_TABLE = load_defense_table()
 st.caption("Defense multipliers (1.0 = neutral) are embedded from your 2025 EPA sheet.")
 
-# ---------------- Small helpers ----------------
+# ---------------- Helpers ----------------
 def fuzzy_pick(name: str, candidates: List[str], cutoff=85) -> Optional[str]:
     if not candidates: return None
     res = process.extractOne(name, candidates, scorer=fuzz.token_sort_ratio)
@@ -101,57 +96,43 @@ def anytime_yes_prob_poisson(lam: float) -> float:
 st.header("1) Pull season/weekly stats from nfl_data_py (no CSVs)")
 c1, c2 = st.columns([1,1])
 with c1:
-    season = st.number_input("Season (e.g., 2025)", min_value=2010, max_value=2100, value=2025, step=1)
+    season = st.number_input("Season", min_value=2010, max_value=2100, value=2025, step=1)
 with c2:
     week_max = st.number_input("Use games through week (inclusive)", min_value=1, max_value=22, value=5, step=1)
 
 @st.cache_data(show_spinner=False)
 def load_weekly_player_stats(season: int, week_max: int) -> pd.DataFrame:
-    """
-    Pull weekly player stats and keep only the columns we need.
-    nfl_data_py exposes weekly player stats via `import_weekly_data`.
-    """
     df = nfl.import_weekly_data([season])
-    # keep through selected week
     df = df[df["week"].astype(int) <= int(week_max)].copy()
 
-    # standardize key columns we will use
-    # likely columns: player_name, position, recent_team, rushing_yards, receiving_yards, receptions, passing_yards, passing_tds, rushing_tds, receiving_tds, games
-    # (nfl_data_py column names are snake_case)
-    keep_cols = [
+    need = [
         "season","week","player_name","position","recent_team",
         "passing_yards","passing_tds",
         "rushing_yards","rushing_tds",
         "receptions","receiving_tds"
     ]
-    # some installs include slightly different names; fill missing if needed
-    for c in keep_cols:
+    for c in need:
         if c not in df.columns:
             df[c] = np.nan
+    return df[need].copy()
 
-    return df[keep_cols].copy()
+weekly = load_weekly_player_stats(season, week_max)
 
-try:
-    weekly = load_weekly_player_stats(season, week_max)
-except Exception as e:
-    st.error(f"Failed to load weekly player stats from nfl_data_py: {e}")
-    st.stop()
+st.header("2) Choose opponent defense to apply")
+opp_team = st.selectbox("Opponent (defense scaling)", DEF_TABLE["Team"].tolist(), index=0)
+scalers = DEF_TABLE.set_index("Team").loc[opp_team].to_dict()  # pass_adj, rush_adj, recv_adj
 
-# Build per-game projections by player & position
 @st.cache_data(show_spinner=False)
 def build_player_projections(weekly: pd.DataFrame, scalers: Dict[str, float]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if weekly.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    # Clean names and positions
     w = weekly.copy()
     w["player_name"] = w["player_name"].astype(str).str.strip()
     w["position"] = w["position"].astype(str).str.upper().str.strip()
 
-    # games played per player in this slice
     gp = w.groupby("player_name", dropna=False)["week"].nunique().rename("g").to_frame()
 
-    # aggregate sums, then per-game means
     agg = w.groupby(["player_name","position"], dropna=False).agg(
         pass_yds=("passing_yards","sum"),
         pass_tds=("passing_tds","sum"),
@@ -164,29 +145,54 @@ def build_player_projections(weekly: pd.DataFrame, scalers: Dict[str, float]) ->
     agg = agg.merge(gp, left_on="player_name", right_index=True, how="left")
     agg["g"] = agg["g"].clip(lower=1)
 
-    # per-game means
     agg["mu_pass_yds"] = (agg["pass_yds"] / agg["g"]) * scalers["pass_adj"]
     agg["mu_pass_tds"] = (agg["pass_tds"] / agg["g"]) * scalers["pass_adj"]
-
     agg["mu_rush_yds"] = (agg["rush_yds"] / agg["g"]) * scalers["rush_adj"]
-
     agg["mu_receptions"] = (agg["recs"] / agg["g"]) * scalers["recv_adj"]
 
-    # anytime TD lambda:
-    #   QB: passing TDs shouldn't count for Anytime, so default to very small (QBs run sometimes but we leave to RB/WR pool)
-    #   RB: rushing TDs + receiving TDs
-    #   WR/TE: receiving TDs
+    # Poisson λ for Anytime TD:
     agg["lam_any_rb"] = ((agg["rush_tds"] + agg["rec_tds"]) / agg["g"]) * scalers["rush_adj"]
     agg["lam_any_wr"] = (agg["rec_tds"] / agg["g"]) * scalers["recv_adj"]
 
-    # build position-specific frames with conservative SDs
     qb = agg[agg["position"] == "QB"].copy()
     rb = agg[agg["position"] == "RB"].copy()
     wr = agg[agg["position"].isin(["WR","TE"])].copy()
 
-    # SD heuristics (same spirit as before)
+    # ---- SD heuristics (fixed parentheses) ----
     qb["sd_pass_yds"] = (qb["mu_pass_yds"] * 0.20).clip(lower=25.0)
     qb["sd_pass_tds"] = (qb["mu_pass_tds"] * 0.60).clip(lower=0.25)
-
     rb["sd_rush_yds"] = (rb["mu_rush_yds"] * 0.22).clip(lower=6.0)
-    wr["sd_receptions"] = (wr["mu_receptions"] * 0.
+    wr["sd_receptions"] = (wr["mu_receptions"] * 0.45).clip(lower=1.0)
+
+    qb.rename(columns={"player_name":"Player"}, inplace=True)
+    rb.rename(columns={"player_name":"Player"}, inplace=True)
+    wr.rename(columns={"player_name":"Player"}, inplace=True)
+
+    for df in (qb, rb, wr):
+        df["Player"] = df["Player"].astype(str)
+
+    return qb, rb, wr
+
+qb_proj, rb_proj, wr_proj = build_player_projections(weekly, scalers)
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.subheader("QB (derived)")
+    st.dataframe(qb_proj[["Player","mu_pass_yds","sd_pass_yds","mu_pass_tds","sd_pass_tds"]].head(12), use_container_width=True)
+with c2:
+    st.subheader("RB (derived)")
+    st.dataframe(rb_proj[["Player","mu_rush_yds","sd_rush_yds","lam_any_rb"]].head(12), use_container_width=True)
+with c3:
+    st.subheader("WR/TE (derived)")
+    st.dataframe(wr_proj[["Player","mu_receptions","sd_receptions","lam_any_wr"]].head(12), use_container_width=True)
+
+# ---------------- Odds API (Event endpoint) ----------------
+st.header("3) Choose an NFL game & markets from The Odds API (event endpoint)")
+api_key = (st.secrets.get("odds_api_key") if hasattr(st, "secrets") else None) or st.text_input(
+    "Odds API Key (kept local to your session)", value="", type="password"
+)
+region = st.selectbox("Region", ["us","us2","eu","uk"], index=0)
+lookahead = st.slider("Lookahead days", 0, 7, value=1)
+markets = st.multiselect("Markets to fetch", VALID_MARKETS, default=VALID_MARKETS)
+
+def
