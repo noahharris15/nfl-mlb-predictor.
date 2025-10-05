@@ -1,4 +1,4 @@
-# Player Props Simulator — Odds API (event endpoint) + Your CSVs or Pasted CSVs
+# Player Props Simulator — Odds API + nfl_data_py (no CSVs)
 # Single page; embedded 2025 defense EPA scalers
 # Run: streamlit run app.py
 
@@ -11,20 +11,21 @@ from io import StringIO
 from typing import List, Optional, Dict, Tuple
 from rapidfuzz import process, fuzz
 
-st.set_page_config(page_title="NFL Player Props (Odds API + CSV + Defense EPA)", layout="wide")
-st.title("📈 NFL Player Props — Odds API + Your CSVs (defense EPA embedded)")
+# -------- NEW: pull live stats (season-to-date) from nfl_data_py --------
+import nfl_data_py as nfl   # pip install nfl_data_py
 
-SIM_TRIALS = 10000
+st.set_page_config(page_title="NFL Player Props — Odds API + nfl_data_py", layout="wide")
+st.title("📈 NFL Player Props — Odds API + nfl_data_py (defense EPA embedded)")
 
-# ---------------------------------------------------------------------
-# ✅ EXACT FIVE MARKETS YOU ASKED FOR
-# ---------------------------------------------------------------------
+SIM_TRIALS = 10_000
+
+# EXACT FIVE MARKETS
 VALID_MARKETS = [
-    "player_pass_yds",     # QB passing yards
-    "player_rush_yds",     # RB rushing yards
-    "player_receptions",   # WR/TE receptions
-    "player_anytime_td",   # WR/TE/RB anytime TD
-    "player_pass_tds"      # QB passing TDs
+    "player_pass_yds",
+    "player_rush_yds",
+    "player_receptions",
+    "player_anytime_td",
+    "player_pass_tds",
 ]
 
 # ---------------- Embedded 2025 defense EPA (from your sheet) ----------------
@@ -82,41 +83,7 @@ def load_defense_table() -> pd.DataFrame:
 DEF_TABLE = load_defense_table()
 st.caption("Defense multipliers (1.0 = neutral) are embedded from your 2025 EPA sheet.")
 
-# ---------------------------------------------------------------------
-# ✅ PASTE-IN CSVs (taken from your screenshots) — these take priority
-#    Keep only columns we actually need. You can replace the sample rows
-#    with your full CSV dump text.
-# ---------------------------------------------------------------------
-QB_PASTE_HEADER = (
-    "Rk,Player,Cmp,Att,Yds,Cmp%,TD,Int,Sk,Rate,Sk%,Y/A,AY/A,ANY/A,Y/C,Y/G,Succ%,W,L,T,4QC,GWD,Pos,-9999"
-)
-QB_PASTE_SAMPLE = """1,Bryce Young,87,144,753,60.4,5,2,17,77.1,6.5,5.2,4.2,7.0,188.3,42.7,1,3,0,0,0,0,QB,YoungBr01
-2,Zach Wilson,35,32,62,5.0,0,0,0,0.0,0.0,4.0,0.0,4.0,20.5,26.0,38.5,5.2,3,0,0,0,0,QB,WilsZa00
-3,Russell Wilson,66,111,786,59.5,5,3,2,7.8,96.2,5.3,7.2,7.8,9.6,196.5,39.5,0,3,0,0,0,0,QB,WilsRu00
-4,Caleb Williams,81,130,927,62.3,8,3,1,5.1,97.6,5.1,7.1,7.1,9.0,231.8,41.6,2,2,0,1,0,0,QB,WillCa03
-5,Carson Wentz,44,66,523,66.7,4,3,0,98.2,12.0,7.9,4.6,7.7,20.7,130.8,29.7,0,3,0,0,0,0,QB,WentCa00
-"""
-
-RB_PASTE_HEADER = (
-    "Rk,Player,Att,Yds,Y/A,TD,Y/G,1D,Succ%,Season,Age,Team,G,GS,Att,Yds,Y/A,TD,Y/G,1D,Succ%,Pos,-9999"
-)
-RB_PASTE_SAMPLE = """1,Jacardia Wright,5,20,4.0,0,20.0,1,40.0,2025,25,SEA,1,0,5,20,4.0,0,20.0,1,40.0,RB,WrigJa05
-2,Emanuel Wilson,15,73,4.9,0,18.3,4,53.3,2025,26,GNB,4,0,15,73,4.9,0,18.3,4,53.3,RB,WilEma00
-3,Kyren Williams,68,303,4.5,1,75.8,19,61.8,2025,25,LAR,4,4,68,303,4.5,1,75.8,19,61.8,RB,WillKy02
-4,Javonte Williams,63,312,5.0,4,78.0,19,65.1,2025,25,DAL,4,4,63,312,5.0,4,78.0,19,65.1,RB,WillJa10
-5,Zamir White,10,25,2.5,0,8.3,3,20.0,2025,26,LVR,3,0,10,25,2.5,0,8.3,3,20.0,RB,WhitZa01
-"""
-
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-def _coerce_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    for c in cols:
-        if c in df.columns:
-            df[c] = df[c].astype(str).str.replace(",","",regex=False).str.replace("%","",regex=False)
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
-
+# ---------------- Small helpers ----------------
 def fuzzy_pick(name: str, candidates: List[str], cutoff=85) -> Optional[str]:
     if not candidates: return None
     res = process.extractOne(name, candidates, scorer=fuzz.token_sort_ratio)
@@ -130,321 +97,96 @@ def anytime_yes_prob_poisson(lam: float) -> float:
     lam = max(1e-6, float(lam))
     return 1.0 - math.exp(-lam)
 
-# ---------------------------------------------------------------------
-# Uploads OR Pasted CSVs (pasted takes priority)
-# ---------------------------------------------------------------------
-st.header("1) QB / RB / WR data")
-c1, c2, c3 = st.columns(3)
-with c1: qb_file = st.file_uploader("QB CSV (optional if pasting)", type=["csv"])
-with c2: rb_file = st.file_uploader("RB CSV (optional if pasting)", type=["csv"])
-with c3: wr_file = st.file_uploader("WR/TE CSV (for receptions/anytime)", type=["csv"])
-
-st.subheader("Paste QB CSV (priority)")
-qb_paste = st.text_area("Paste QB CSV text here (headers included)", value="\n".join([QB_PASTE_HEADER, QB_PASTE_SAMPLE]), height=170)
-st.subheader("Paste RB CSV (priority)")
-rb_paste = st.text_area("Paste RB CSV text here (headers included)", value="\n".join([RB_PASTE_HEADER, RB_PASTE_SAMPLE]), height=170)
-
-def parse_csv_from_any(pasted: str, uploaded) -> Optional[pd.DataFrame]:
-    pasted = (pasted or "").strip()
-    if pasted and "," in pasted and "\n" in pasted:
-        try:
-            return pd.read_csv(StringIO(pasted))
-        except Exception:
-            st.warning("Could not parse pasted CSV; falling back to uploader.")
-    if uploaded is not None:
-        try:
-            return pd.read_csv(uploaded)
-        except Exception as e:
-            st.error(f"Could not read uploaded CSV: {e}")
-    return None
-
-qb_df = parse_csv_from_any(qb_paste, qb_file)
-rb_df = parse_csv_from_any(rb_paste, rb_file)
-wr_df = pd.read_csv(wr_file) if wr_file else None  # WR still via file (unchanged)
-
-# Normalize types for the few columns we need
-if qb_df is not None: qb_df = _coerce_numeric(qb_df, ["Y/G","Yds","TD","G","Att","Cmp"])
-if rb_df is not None: rb_df = _coerce_numeric(rb_df, ["Y/G","Yds","TD","G","Att"])
-if wr_df is not None: wr_df = _coerce_numeric(wr_df, ["Rec","TD","G"])
-
-# ---------------------------------------------------------------------
-# Opponent defense
-# ---------------------------------------------------------------------
-st.header("2) Opponent defense")
-opp_team = st.selectbox("Opponent (defense scaling)", DEF_TABLE["Team"].tolist(), index=0)
-scalers = DEF_TABLE.set_index("Team").loc[opp_team].to_dict()  # pass_adj, rush_adj, recv_adj
-
-# ---------------------------------------------------------------------
-# Build projections (only using fields we need)
-# ---------------------------------------------------------------------
-def qb_proj_from_csv(df: pd.DataFrame, pass_scale: float) -> Optional[pd.DataFrame]:
-    if df is None: return None
-    out = []
-    for _, r in df.iterrows():
-        name = str(r.get("Player", r.get("player","")))
-        g = float(r.get("G", 1) or 1)
-
-        # Passing TDs
-        td = r.get("TD", np.nan)
-        try: td_mu = float(td) / max(1.0, g)
-        except Exception: td_mu = 1.2
-        td_mu *= pass_scale
-        td_sd = max(0.25, 0.60 * td_mu)
-
-        # Passing Yards
-        ypg = r.get("Y/G", np.nan); yds_total = r.get("Yds", np.nan)
-        try:
-            py_mu = float(ypg) if pd.notna(ypg) else float(yds_total) / max(1.0, g)
-        except Exception:
-            py_mu = 235.0
-        py_mu *= pass_scale
-        py_sd = max(25.0, 0.20 * py_mu)
-
-        out.append({"Player": name, "mu_pass_tds": td_mu, "sd_pass_tds": td_sd,
-                    "mu_pass_yds": py_mu, "sd_pass_yds": py_sd})
-    return pd.DataFrame(out)
-
-def rb_proj_from_csv(df: pd.DataFrame, rush_scale: float) -> Optional[pd.DataFrame]:
-    if df is None: return None
-    out = []
-    for _, r in df.iterrows():
-        name = str(r.get("Player", r.get("player","")))
-        g = float(r.get("G", 1) or 1)
-
-        # Rushing yards
-        ypg = r.get("Y/G", np.nan); yds_total = r.get("Yds", np.nan)
-        try:
-            rush_mu = float(ypg) if pd.notna(ypg) else float(yds_total) / max(1.0, g)
-        except Exception:
-            # derive from Att and Y/A if present
-            try:
-                att_total = float(r.get("Att", np.nan))
-                ypa = float(r.get("Y/A", np.nan))
-                rush_mu = (att_total / max(1.0, g)) * ypa
-            except Exception:
-                rush_mu = 55.0
-        rush_mu *= rush_scale
-        rush_sd = max(6.0, 0.22 * rush_mu)
-
-        # Anytime TD lambda from RB TD per game
-        rb_td = r.get("TD", np.nan)
-        try: td_mu = float(rb_td) / max(1.0, g)
-        except Exception: td_mu = 0.45
-        td_mu *= rush_scale
-        td_mu = max(0.02, td_mu)
-
-        out.append({"Player": name, "mu_rush_yds": rush_mu, "sd_rush_yds": rush_sd,
-                    "mu_any_td": td_mu})
-    return pd.DataFrame(out)
-
-def wr_proj_from_csv(df: pd.DataFrame, recv_scale: float) -> Optional[pd.DataFrame]:
-    if df is None: return None
-    out = []
-    for _, r in df.iterrows():
-        name = str(r.get("Player", r.get("player","")))
-        g = float(r.get("G", 1) or 1)
-        rec_total = r.get("Rec", np.nan)
-        try: rec_mu = float(rec_total) / max(1.0, g)
-        except Exception: rec_mu = 4.5
-        rec_mu *= recv_scale
-        rec_sd = max(1.0, 0.45 * rec_mu)
-
-        wr_td = r.get("TD", np.nan)
-        try: td_mu = float(wr_td) / max(1.0, g)
-        except Exception: td_mu = 0.35
-        td_mu *= recv_scale
-        td_mu = max(0.02, td_mu)
-
-        out.append({"Player": name, "mu_receptions": rec_mu, "sd_receptions": rec_sd,
-                    "mu_any_td": td_mu})
-    return pd.DataFrame(out)
-
-qb_proj = qb_proj_from_csv(qb_df, scalers["pass_adj"])
-rb_proj = rb_proj_from_csv(rb_df, scalers["rush_adj"])
-wr_proj = wr_proj_from_csv(wr_df, scalers["recv_adj"]) if wr_df is not None else None
-
-c1, c2, c3 = st.columns(3)
+# ---------------- nfl_data_py loaders ----------------
+st.header("1) Pull season/weekly stats from nfl_data_py (no CSVs)")
+c1, c2 = st.columns([1,1])
 with c1:
-    if qb_proj is not None: st.dataframe(qb_proj.head(12), use_container_width=True)
+    season = st.number_input("Season (e.g., 2025)", min_value=2010, max_value=2100, value=2025, step=1)
 with c2:
-    if rb_proj is not None: st.dataframe(rb_proj.head(12), use_container_width=True)
-with c3:
-    if wr_proj is not None: st.dataframe(wr_proj.head(12), use_container_width=True)
+    week_max = st.number_input("Use games through week (inclusive)", min_value=1, max_value=22, value=5, step=1)
 
-# ---------------------------------------------------------------------
-# Odds API
-# ---------------------------------------------------------------------
-st.header("3) Select game & markets (Odds API event endpoint)")
-api_key = (st.secrets.get("odds_api_key") if hasattr(st, "secrets") else None) or st.text_input(
-    "Odds API Key (kept local to your session)", value="", type="password"
-)
-region = st.selectbox("Region", ["us","us2","eu","uk"], index=0)
-lookahead = st.slider("Lookahead days", 0, 7, value=1)
-markets = st.multiselect("Markets to fetch", VALID_MARKETS, default=VALID_MARKETS)
+@st.cache_data(show_spinner=False)
+def load_weekly_player_stats(season: int, week_max: int) -> pd.DataFrame:
+    """
+    Pull weekly player stats and keep only the columns we need.
+    nfl_data_py exposes weekly player stats via `import_weekly_data`.
+    """
+    df = nfl.import_weekly_data([season])
+    # keep through selected week
+    df = df[df["week"].astype(int) <= int(week_max)].copy()
 
-def odds_get(url: str, params: dict) -> dict:
-    r = requests.get(url, params=params, timeout=25)
-    if r.status_code != 200:
-        raise requests.HTTPError(f"HTTP {r.status_code}: {r.text[:300]}")
-    return r.json()
+    # standardize key columns we will use
+    # likely columns: player_name, position, recent_team, rushing_yards, receiving_yards, receptions, passing_yards, passing_tds, rushing_tds, receiving_tds, games
+    # (nfl_data_py column names are snake_case)
+    keep_cols = [
+        "season","week","player_name","position","recent_team",
+        "passing_yards","passing_tds",
+        "rushing_yards","rushing_tds",
+        "receptions","receiving_tds"
+    ]
+    # some installs include slightly different names; fill missing if needed
+    for c in keep_cols:
+        if c not in df.columns:
+            df[c] = np.nan
 
-def list_nfl_events(api_key: str, lookahead_days: int, region: str):
-    base = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events"
-    params = {"apiKey": api_key, "daysFrom": 0, "daysTo": lookahead_days, "regions": region}
-    return odds_get(base, params)
+    return df[keep_cols].copy()
 
-def fetch_event_props(api_key: str, event_id: str, region: str, markets: List[str]):
-    base = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events/{event_id}/odds"
-    params = {"apiKey": api_key, "regions": region, "markets": ",".join(markets), "oddsFormat": "american"}
-    return odds_get(base, params)
-
-events = []
-if api_key:
-    try:
-        events = list_nfl_events(api_key, lookahead, region)
-    except Exception as e:
-        st.error(f"Events fetch error: {e}")
-
-if not events:
-    st.info("Enter your Odds API key and pick a lookahead to list upcoming games.")
+try:
+    weekly = load_weekly_player_stats(season, week_max)
+except Exception as e:
+    st.error(f"Failed to load weekly player stats from nfl_data_py: {e}")
     st.stop()
 
-event_labels = [f'{e["away_team"]} @ {e["home_team"]} — {e.get("commence_time","")}' for e in events]
-pick = st.selectbox("Game", event_labels)
-event = events[event_labels.index(pick)]
-event_id = event["id"]
+# Build per-game projections by player & position
+@st.cache_data(show_spinner=False)
+def build_player_projections(weekly: pd.DataFrame, scalers: Dict[str, float]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if weekly.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-# ---------------------------------------------------------------------
-# Simulate
-# ---------------------------------------------------------------------
-st.header("4) Fetch props for this event and simulate")
-go = st.button("Fetch lines & simulate")
-if go:
-    if not markets:
-        st.warning("Pick at least one market."); st.stop()
-    if qb_proj is None and rb_proj is None and wr_proj is None:
-        st.warning("Provide at least one of QB / RB / WR tables (paste or upload)."); st.stop()
+    # Clean names and positions
+    w = weekly.copy()
+    w["player_name"] = w["player_name"].astype(str).str.strip()
+    w["position"] = w["position"].astype(str).str.upper().str.strip()
 
-    try:
-        data = fetch_event_props(api_key, event_id, region, markets)
-    except Exception as e:
-        st.error(f"Props fetch failed: {e}"); st.stop()
+    # games played per player in this slice
+    gp = w.groupby("player_name", dropna=False)["week"].nunique().rename("g").to_frame()
 
-    rows = []
-    for bk in data.get("bookmakers", []):
-        for m in bk.get("markets", []):
-            mkey = m.get("key")
-            for o in m.get("outcomes", []):
-                name = o.get("description")
-                side = o.get("name")         # "Over"/"Under" or "Yes"/"No"
-                point = o.get("point")       # None for anytime TD sometimes
-                if mkey not in VALID_MARKETS or name is None or side is None:
-                    continue
-                rows.append({"market": mkey, "player_raw": name, "side": side,
-                            "point": (None if point is None else float(point))})
+    # aggregate sums, then per-game means
+    agg = w.groupby(["player_name","position"], dropna=False).agg(
+        pass_yds=("passing_yards","sum"),
+        pass_tds=("passing_tds","sum"),
+        rush_yds=("rushing_yards","sum"),
+        rush_tds=("rushing_tds","sum"),
+        recs=("receptions","sum"),
+        rec_tds=("receiving_tds","sum"),
+    ).reset_index()
 
-    if not rows:
-        st.warning("No player outcomes returned for selected markets."); st.stop()
+    agg = agg.merge(gp, left_on="player_name", right_index=True, how="left")
+    agg["g"] = agg["g"].clip(lower=1)
 
-    df = pd.DataFrame(rows).drop_duplicates()
+    # per-game means
+    agg["mu_pass_yds"] = (agg["pass_yds"] / agg["g"]) * scalers["pass_adj"]
+    agg["mu_pass_tds"] = (agg["pass_tds"] / agg["g"]) * scalers["pass_adj"]
 
-    out_rows = []
-    qb_names = qb_proj["Player"].tolist() if qb_proj is not None else []
-    rb_names = rb_proj["Player"].tolist() if rb_proj is not None else []
-    wr_names = wr_proj["Player"].tolist() if wr_proj is not None else []
+    agg["mu_rush_yds"] = (agg["rush_yds"] / agg["g"]) * scalers["rush_adj"]
 
-    for _, r in df.iterrows():
-        market = r["market"]; player = r["player_raw"]; point = r["point"]; side = r["side"]
+    agg["mu_receptions"] = (agg["recs"] / agg["g"]) * scalers["recv_adj"]
 
-        # QB passing TDs
-        if market == "player_pass_tds" and qb_proj is not None:
-            match = fuzzy_pick(player, qb_names, cutoff=82)
-            if not match: continue
-            row = qb_proj.loc[qb_proj["Player"] == match].iloc[0]
-            mu, sd = float(row["mu_pass_tds"]), float(row["sd_pass_tds"])
-            if point is None: continue
-            p_over = norm_over_prob(mu, sd, float(point), SIM_TRIALS)
-            p = p_over if side == "Over" else 1.0 - p_over
+    # anytime TD lambda:
+    #   QB: passing TDs shouldn't count for Anytime, so default to very small (QBs run sometimes but we leave to RB/WR pool)
+    #   RB: rushing TDs + receiving TDs
+    #   WR/TE: receiving TDs
+    agg["lam_any_rb"] = ((agg["rush_tds"] + agg["rec_tds"]) / agg["g"]) * scalers["rush_adj"]
+    agg["lam_any_wr"] = (agg["rec_tds"] / agg["g"]) * scalers["recv_adj"]
 
-        # QB passing yards
-        elif market == "player_pass_yds" and qb_proj is not None:
-            match = fuzzy_pick(player, qb_names, cutoff=82)
-            if not match: continue
-            row = qb_proj.loc[qb_proj["Player"] == match].iloc[0]
-            mu, sd = float(row["mu_pass_yds"]), float(row["sd_pass_yds"])
-            if point is None: continue
-            p_over = norm_over_prob(mu, sd, float(point), SIM_TRIALS)
-            p = p_over if side == "Over" else 1.0 - p_over
+    # build position-specific frames with conservative SDs
+    qb = agg[agg["position"] == "QB"].copy()
+    rb = agg[agg["position"] == "RB"].copy()
+    wr = agg[agg["position"].isin(["WR","TE"])].copy()
 
-        # RB rushing yards
-        elif market == "player_rush_yds" and rb_proj is not None:
-            match = fuzzy_pick(player, rb_names, cutoff=82)
-            if not match: continue
-            row = rb_proj.loc[rb_proj["Player"] == match].iloc[0]
-            mu, sd = float(row["mu_rush_yds"]), float(row["sd_rush_yds"])
-            if point is None: continue
-            p_over = norm_over_prob(mu, sd, float(point), SIM_TRIALS)
-            p = p_over if side == "Over" else 1.0 - p_over
+    # SD heuristics (same spirit as before)
+    qb["sd_pass_yds"] = (qb["mu_pass_yds"] * 0.20).clip(lower=25.0)
+    qb["sd_pass_tds"] = (qb["mu_pass_tds"] * 0.60).clip(lower=0.25)
 
-        # WR/TE receptions
-        elif market == "player_receptions" and wr_proj is not None:
-            match = fuzzy_pick(player, wr_names, cutoff=82)
-            if not match: continue
-            row = wr_proj.loc[wr_proj["Player"] == match].iloc[0]
-            mu, sd = float(row["mu_receptions"]), float(row["sd_receptions"])
-            if point is None: continue
-            p_over = norm_over_prob(mu, sd, float(point), SIM_TRIALS)
-            p = p_over if side == "Over" else 1.0 - p_over
-
-        # Anytime TD (WR/TE/RB)
-        elif market == "player_anytime_td":
-            match = None; src = None
-            if wr_proj is not None:
-                m = fuzzy_pick(player, wr_names, cutoff=82)
-                if m: match, src = m, "WR"
-            if match is None and rb_proj is not None:
-                m = fuzzy_pick(player, rb_names, cutoff=82)
-                if m: match, src = m, "RB"
-            if match is None: continue
-            row = (wr_proj if src == "WR" else rb_proj).loc[(wr_proj if src == "WR" else rb_proj)["Player"] == match].iloc[0]
-            lam = float(row["mu_any_td"])
-            p_yes = anytime_yes_prob_poisson(lam)
-            if side in ("Yes","No"):
-                p = p_yes if side == "Yes" else (1.0 - p_yes)
-            elif side in ("Over","Under"):   # books that show O/U 0.5
-                p = p_yes if side == "Over" else (1.0 - p_yes)
-            else:
-                continue
-            mu, sd = lam, float("nan")
-            point = (0.5 if side in ("Over","Under") else None)
-
-        else:
-            continue
-
-        out_rows.append({
-            "market": market,
-            "player": match,
-            "side": side,
-            "line": (None if point is None else round(float(point), 3)),
-            "mu": (None if isinstance(mu, float) and math.isnan(mu) else round(float(mu), 3)),
-            "sd": (None if isinstance(sd, float) and math.isnan(sd) else round(float(sd), 3)),
-            "prob": round(100*p, 2),
-            "opp_def": opp_team,
-            "pass_adj": round(scalers["pass_adj"], 3),
-            "rush_adj": round(scalers["rush_adj"], 3),
-            "recv_adj": round(scalers["recv_adj"], 3),
-        })
-
-    if not out_rows:
-        st.warning("No props matched your players.")
-        st.stop()
-
-    results = pd.DataFrame(out_rows).sort_values("prob", ascending=False).reset_index(drop=True)
-    st.subheader("Simulated probabilities (Normal for yards/TDs; Poisson for Anytime TD)")
-    st.dataframe(results, use_container_width=True)
-    st.download_button(
-        "⬇️ Download results CSV",
-        results.to_csv(index=False).encode("utf-8"),
-        file_name="props_sim_results.csv",
-        mime="text/csv",
-    )
+    rb["sd_rush_yds"] = (rb["mu_rush_yds"] * 0.22).clip(lower=6.0)
+    wr["sd_receptions"] = (wr["mu_receptions"] * 0.
