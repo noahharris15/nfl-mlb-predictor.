@@ -28,7 +28,6 @@ MARKETS_ALL = [
     "player_pass_yds",        # Passing Yards
     "player_pass_tds",        # Passing Touchdowns
     "player_rush_yds",        # Rushing Yards
-    "player_rec_yards_alt",   # Receiving Yards (renamed to avoid INVALID_MARKET)
     "player_receptions",      # Receptions
     "player_anytime_td"       # Anytime Touchdown
 ]
