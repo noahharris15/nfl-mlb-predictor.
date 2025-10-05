@@ -17,8 +17,10 @@ st.title("📈 NFL Player Props — Odds API + ESPN (per-game averages, calibrat
 
 SIM_TRIALS = 10_000
 VALID_MARKETS = [
-    "player_pass_yds", "player_rush_yds",
-    "player_rec_yds", "player_receptions",
+    "player_pass_yds",
+    "player_rush_yds",
+    "player_receiving_yds",   # ✅ correct Odds API key
+    "player_receptions",
     "player_pass_tds",
 ]
 
@@ -229,6 +231,13 @@ if st.button("📥 Build projections"):
     mu_rec_yds_pg  = season_df["rec_yds"]  / g
     mu_recs_pg     = season_df["rec"]      / g
 
+    # Keep raw (pre-defense, pre-knockback) for display
+    season_df["mu_pass_yds_raw"]   = mu_pass_yds_pg
+    season_df["mu_pass_tds_raw"]   = mu_pass_tds_pg
+    season_df["mu_rush_yds_raw"]   = mu_rush_yds_pg
+    season_df["mu_rec_yds_raw"]    = mu_rec_yds_pg
+    season_df["mu_receptions_raw"] = mu_recs_pg
+
     # Sample SD from sums & sum of squares (Bessel-corrected)
     def sample_sd(sum_x, sum_x2, g_val):
         gv = int(g_val)
@@ -256,15 +265,34 @@ if st.button("📥 Build projections"):
     season_df["mu_rec_yds"]    = mu_rec_yds_pg  * clamp(scalers["recv_adj"]) * kb
     season_df["mu_receptions"] = mu_recs_pg     * clamp(scalers["recv_adj"]) * kb
 
-    # Save slim projections to session (include rec yards for ALL players)
-    st.session_state["qb_proj"] = season_df[["Player","mu_pass_yds","sd_pass_yds","mu_pass_tds"]].dropna(how="all")
-    st.session_state["rb_proj"] = season_df[["Player","mu_rush_yds","sd_rush_yds"]].dropna(how="all")
-    st.session_state["wr_proj"] = season_df[["Player","mu_receptions","sd_receptions","mu_rec_yds","sd_rec_yds"]].dropna(how="all")
+    # Save slim projections (+ raw means + games) to session
+    st.session_state["qb_proj"] = season_df[[
+        "Player","g",
+        "mu_pass_yds_raw","mu_pass_yds","sd_pass_yds",
+        "mu_pass_tds_raw","mu_pass_tds"
+    ]].dropna(how="all")
+
+    st.session_state["rb_proj"] = season_df[[
+        "Player","g",
+        "mu_rush_yds_raw","mu_rush_yds","sd_rush_yds"
+    ]].dropna(how="all")
+
+    st.session_state["wr_proj"] = season_df[[
+        "Player","g",
+        "mu_receptions_raw","mu_receptions","sd_receptions",
+        "mu_rec_yds_raw","mu_rec_yds","sd_rec_yds"
+    ]].dropna(how="all")
 
     c1, c2, c3 = st.columns(3)
-    with c1: st.subheader("QB (per-game from ESPN)"); st.dataframe(st.session_state["qb_proj"].head(12), use_container_width=True)
-    with c2: st.subheader("RB (per-game from ESPN)"); st.dataframe(st.session_state["rb_proj"].head(12), use_container_width=True)
-    with c3: st.subheader("WR/TE (per-game from ESPN)"); st.dataframe(st.session_state["wr_proj"].head(12), use_container_width=True)
+    with c1:
+        st.subheader("QB (per-game from ESPN)")
+        st.dataframe(st.session_state["qb_proj"].head(12), use_container_width=True)
+    with c2:
+        st.subheader("RB (per-game from ESPN)")
+        st.dataframe(st.session_state["rb_proj"].head(12), use_container_width=True)
+    with c3:
+        st.subheader("WR/TE (per-game from ESPN)")
+        st.dataframe(st.session_state["wr_proj"].head(12), use_container_width=True)
 
 # ------------------ Odds API ------------------
 st.markdown("### 3) Pick a game & markets from The Odds API (event endpoint)")
@@ -323,14 +351,13 @@ if go:
         st.error(f"Props fetch failed: {e}")
         st.stop()
 
-    # Aggregate bookmaker outcomes → one row per (market, player, point, side) averaged over books
     rows = []
     for bk in data.get("bookmakers", []):
         for m in bk.get("markets", []):
             mkey = m.get("key")
             for o in m.get("outcomes", []):
-                name = normalize_name(o.get("description"))  # player name
-                side = o.get("name")         # "Over" or "Under"
+                name = normalize_name(o.get("description"))
+                side = o.get("name")
                 point = o.get("point")
                 if mkey not in VALID_MARKETS or not name or side not in ("Over","Under"):
                     continue
@@ -350,15 +377,15 @@ if go:
                         .agg(line=("point","median"), n_books=("point","size")))
 
     out_rows = []
-    qb_names = set(qb_proj["Player"])
-    rb_names = set(rb_proj["Player"])
-    wr_names = set(wr_proj["Player"])  # includes all players with rec stats
+    qb_names = set(qb_proj["Player"]); rb_names = set(rb_proj["Player"]); wr_names = set(wr_proj["Player"])
 
     for _, r in props_df.iterrows():
         market = r["market"]; player = r["player_norm"]; point = r["line"]; side = r["side"]
 
         if market == "player_pass_tds" and player in qb_names:
-            lam = float(qb_proj.loc[qb_proj["Player"] == player, "mu_pass_tds"].iloc[0])
+            lam      = float(qb_proj.loc[qb_proj["Player"] == player, "mu_pass_tds"].iloc[0])
+            mu_raw   = float(qb_proj.loc[qb_proj["Player"] == player, "mu_pass_tds_raw"].iloc[0])
+            g_used   = int(qb_proj.loc[qb_proj["Player"] == player, "g"].iloc[0])
             if pd.isna(point): continue
             p_over = float((np.random.poisson(lam=lam, size=SIM_TRIALS) > float(point)).mean())
             p = p_over if side == "Over" else 1.0 - p_over
@@ -367,6 +394,7 @@ if go:
         elif market == "player_pass_yds" and player in qb_names:
             row = qb_proj.loc[qb_proj["Player"] == player].iloc[0]
             mu, sd = float(row["mu_pass_yds"]), float(row["sd_pass_yds"])
+            mu_raw = float(row["mu_pass_yds_raw"]); g_used = int(row["g"])
             if np.isnan(mu) or np.isnan(sd) or pd.isna(point): continue
             p_over = t_over_prob(mu, sd, float(point), SIM_TRIALS)
             p = p_over if side == "Over" else 1.0 - p_over
@@ -374,6 +402,7 @@ if go:
         elif market == "player_rush_yds" and player in rb_names:
             row = rb_proj.loc[rb_proj["Player"] == player].iloc[0]
             mu, sd = float(row["mu_rush_yds"]), float(row["sd_rush_yds"])
+            mu_raw = float(row["mu_rush_yds_raw"]); g_used = int(row["g"])
             if np.isnan(mu) or np.isnan(sd) or pd.isna(point): continue
             p_over = t_over_prob(mu, sd, float(point), SIM_TRIALS)
             p = p_over if side == "Over" else 1.0 - p_over
@@ -381,13 +410,15 @@ if go:
         elif market == "player_receptions" and player in wr_names:
             row = wr_proj.loc[wr_proj["Player"] == player].iloc[0]
             mu, sd = float(row["mu_receptions"]), float(row["sd_receptions"])
+            mu_raw = float(row["mu_receptions_raw"]); g_used = int(row["g"])
             if np.isnan(mu) or np.isnan(sd) or pd.isna(point): continue
             p_over = t_over_prob(mu, sd, float(point), SIM_TRIALS)
             p = p_over if side == "Over" else 1.0 - p_over
 
-        elif market == "player_rec_yds" and player in wr_names:
+        elif market == "player_receiving_yds" and player in wr_names:
             row = wr_proj.loc[wr_proj["Player"] == player].iloc[0]
             mu, sd = float(row["mu_rec_yds"]), float(row["sd_rec_yds"])
+            mu_raw = float(row["mu_rec_yds_raw"]); g_used = int(row["g"])
             if np.isnan(mu) or np.isnan(sd) or pd.isna(point): continue
             p_over = t_over_prob(mu, sd, float(point), SIM_TRIALS)
             p = p_over if side == "Over" else 1.0 - p_over
@@ -400,8 +431,10 @@ if go:
             "player": player,
             "side": side,
             "line": None if pd.isna(point) else round(float(point), 2),
-            "μ (per-game)": None if np.isnan(mu) else round(float(mu), 2),
+            "Avg (raw)": round(mu_raw, 2),        # ✅ actual per-game average from ESPN
+            "μ (scaled)": None if np.isnan(mu) else round(float(mu), 2),
             "σ (per-game)": None if (isinstance(sd, float) and np.isnan(sd)) else (None if pd.isna(sd) else round(float(sd), 2)),
+            "Games": g_used,
             "Win Prob %": round(100*p, 2),
             "books": int(r["n_books"]),
         })
@@ -421,15 +454,17 @@ if go:
         "Passing Yards": "player_pass_yds",
         "Rushing Yards": "player_rush_yds",
         "Receptions": "player_receptions",
-        "Receiving Yards": "player_rec_yds",
+        "Receiving Yards": "player_receiving_yds",
         "Passing TDs": "player_pass_tds",
     }
     colcfg = {
         "player": st.column_config.TextColumn("Player", width="medium"),
         "side": st.column_config.TextColumn("Side", width="small"),
         "line": st.column_config.NumberColumn("Line", format="%.2f"),
-        "μ (per-game)": st.column_config.NumberColumn("μ (per-game)", format="%.2f"),
+        "Avg (raw)": st.column_config.NumberColumn("Avg (raw)", format="%.2f"),
+        "μ (scaled)": st.column_config.NumberColumn("μ (scaled)", format="%.2f"),
         "σ (per-game)": st.column_config.NumberColumn("σ (per-game)", format="%.2f"),
+        "Games": st.column_config.NumberColumn("Games", width="small"),
         "Win Prob %": st.column_config.ProgressColumn("Win Prob %", format="%.2f%%", min_value=0, max_value=100),
         "books": st.column_config.NumberColumn("#Books", width="small"),
     }
