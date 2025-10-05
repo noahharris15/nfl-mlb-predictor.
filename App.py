@@ -1,9 +1,9 @@
-# app.py — NFL Player Props (Odds API + CSVs + Defense EPA), all-in-one
+# app.py — NFL Player Props (Odds API + CSVs + Defense EPA), all-in-one (robust name matching)
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-import requests, unicodedata, time
+import requests, unicodedata, time, math
 from io import StringIO
 from typing import Optional, List, Dict, Tuple
 from rapidfuzz import process, fuzz
@@ -66,15 +66,15 @@ Miami Dolphins,0.34,0.12,0.7757
 """
 
 # ------------------------------------------------------------------------------
-# Helpers: name cleaning / matching
+# Helpers: name cleaning / matching (HARDENED)
 # ------------------------------------------------------------------------------
 def _strip_accents(s: str) -> str:
     return ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
 
 def clean_name(s: str) -> str:
-    if not s: return ""
+    if s is None or (isinstance(s, float) and math.isnan(s)): return ""
     s = str(s)
-    # Drop team tags like " (MIN)"
+    # Drop trailing team tag e.g. "Justin Jefferson (MIN)"
     if "(" in s and s.endswith(")"):
         s = s[:s.rfind("(")]
     s = _strip_accents(s).lower().replace(".", " ").replace("-", " ").replace("'", "")
@@ -86,7 +86,14 @@ def clean_name(s: str) -> str:
     s = ALIASES.get(s, s)
     return " ".join(s.split())
 
+def safe_last_token(s: str) -> Optional[str]:
+    s = clean_name(s)
+    if not s: return None
+    parts = s.split()
+    return parts[-1] if parts else None
+
 def best_match(target: str, candidates: List[str]) -> Tuple[Optional[str], int]:
+    """Robust fuzzy match; never throws on empty/NaN candidate names."""
     t = clean_name(target)
     if not t: return (None, 0)
 
@@ -95,23 +102,31 @@ def best_match(target: str, candidates: List[str]) -> Tuple[Optional[str], int]:
         if clean_name(c) == t:
             return (c, 100)
 
-    # Unique last name
-    t_last = t.split()[-1]
-    last_hits = [c for c in candidates if clean_name(c).split()[-1] == t_last]
-    if len(last_hits) == 1:
-        return (last_hits[0], 95)
+    # Unique last-name shortcut, guarded
+    t_last = safe_last_token(t)
+    if t_last:
+        last_hits = []
+        for c in candidates:
+            c_last = safe_last_token(c)
+            if c_last and c_last == t_last:
+                last_hits.append(c)
+        if len(last_hits) == 1:
+            return (last_hits[0], 95)
 
-    # Fuzzy: strong then relaxed
-    choices = list(candidates)
-    m1 = process.extractOne(t, choices, scorer=fuzz.token_sort_ratio)
+    # Fuzzy: strong then relaxed, skipping empties
+    pool = [c for c in candidates if clean_name(c)]
+    if not pool:
+        return (None, 0)
+    m1 = process.extractOne(t, pool, scorer=fuzz.token_sort_ratio)
     if m1 and m1[1] >= NAME_CUTOFF_STRONG:
         return (m1[0], int(m1[1]))
-    m2 = process.extractOne(t, choices, scorer=fuzz.token_set_ratio)
+    m2 = process.extractOne(t, pool, scorer=fuzz.token_set_ratio)
     if m2 and m2[1] >= NAME_CUTOFF_MAIN:
         return (m2[0], int(m2[1]))
     return (None, int(m2[1] if m2 else 0))
 
 def clean_team(s: str) -> str:
+    if s is None or (isinstance(s, float) and math.isnan(s)): return ""
     return " ".join(_strip_accents(str(s)).lower().replace("-", " ").split())
 
 # ------------------------------------------------------------------------------
@@ -141,7 +156,6 @@ def load_defense_table() -> pd.DataFrame:
     return out
 
 DEF = load_defense_table()
-DEF_TEAMS = DEF["Team"].tolist()
 
 # ------------------------------------------------------------------------------
 # CSV loading + projections
@@ -163,21 +177,18 @@ def _load_any_csv(uploaded) -> pd.DataFrame:
     return pd.read_csv(StringIO("\n".join(lines[header_idx:])))
 
 def build_player_team_map(*dfs: pd.DataFrame) -> Dict[str, str]:
-    """Map player -> team (full name from DEF table) using CSV 'Team' if present."""
     names = {}
     for df in dfs:
-        if df is None: continue
-        if "Team" not in df.columns: continue
+        if df is None or "Team" not in df.columns: continue
         for _, r in df.iterrows():
             p = str(r.get("Player", r.get("player","")))
-            if not p: continue
+            if not clean_name(p): continue
             raw_team = str(r.get("Team",""))
             if not raw_team: continue
-            # Fuzzy team match to DEF names
             m = process.extractOne(clean_team(raw_team), DEF["team_clean"].tolist(), scorer=fuzz.token_sort_ratio)
             if m and m[1] >= 88:
-                team_full = DEF.iloc[[i for i,t in enumerate(DEF["team_clean"]) if t == m[0]][0]]["Team"]
-                names[p] = team_full
+                idx = DEF.index[DEF["team_clean"] == m[0]][0]
+                names[p] = DEF.loc[idx, "Team"]
     return names
 
 def qb_proj_from_csv(df: pd.DataFrame, pass_scale: float) -> Optional[pd.DataFrame]:
@@ -185,23 +196,22 @@ def qb_proj_from_csv(df: pd.DataFrame, pass_scale: float) -> Optional[pd.DataFra
     rows = []
     for _, r in df.iterrows():
         name = str(r.get("Player", r.get("player","")))
+        if not clean_name(name): continue
         g = float(r.get("G", 1) or 1)
+        # TDs
         td = r.get("TD", np.nan)
         try: td_mu = float(td) / max(1.0, g)
         except Exception: td_mu = 1.2
         td_mu *= pass_scale
         td_sd = max(0.25, 0.60 * td_mu)
-        # OPTIONAL: pass yards from Y/G if you want
+        # Pass yards
         ypg = r.get("Y/G", np.nan); yds = r.get("Yds", np.nan)
         try: py_mu = float(ypg) if pd.notna(ypg) else float(yds) / max(1.0, g)
         except Exception: py_mu = 235.0
         py_mu *= pass_scale
         py_sd = max(20.0, 0.18 * py_mu)
-        rows.append({
-            "Player": name,
-            "mu_pass_tds": td_mu, "sd_pass_tds": td_sd,
-            "mu_pass_yds": py_mu, "sd_pass_yds": py_sd,
-        })
+        rows.append({"Player": name, "mu_pass_tds": td_mu, "sd_pass_tds": td_sd,
+                     "mu_pass_yds": py_mu, "sd_pass_yds": py_sd})
     return pd.DataFrame(rows)
 
 def rb_proj_from_csv(df: pd.DataFrame, rush_scale: float) -> Optional[pd.DataFrame]:
@@ -209,6 +219,7 @@ def rb_proj_from_csv(df: pd.DataFrame, rush_scale: float) -> Optional[pd.DataFra
     rows = []
     for _, r in df.iterrows():
         name = str(r.get("Player", r.get("player","")))
+        if not clean_name(name): continue
         g = float(r.get("G", 1) or 1)
         ypg = r.get("Y/G", np.nan); yds = r.get("Yds", np.nan)
         try: rush_mu = float(ypg) if pd.notna(ypg) else float(yds) / max(1.0, g)
@@ -223,8 +234,9 @@ def wr_proj_from_csv(df: pd.DataFrame, recv_scale: float) -> Optional[pd.DataFra
     rows = []
     for _, r in df.iterrows():
         name = str(r.get("Player", r.get("player","")))
+        if not clean_name(name): continue
         g = float(r.get("G", 1) or 1)
-        # Receiving yards
+        # Rec yards
         ypg = r.get("Y/G", np.nan); yds = r.get("Yds", np.nan)
         try: rec_yds_mu = float(ypg) if pd.notna(ypg) else float(yds) / max(1.0, g)
         except Exception: rec_yds_mu = 55.0
@@ -236,11 +248,9 @@ def wr_proj_from_csv(df: pd.DataFrame, recv_scale: float) -> Optional[pd.DataFra
         except Exception: rec_mu = 4.5
         rec_mu *= recv_scale
         rec_sd = max(1.0, 0.45 * rec_mu)
-        rows.append({
-            "Player": name,
-            "mu_rec_yards": rec_yds_mu, "sd_rec_yards": rec_yds_sd,
-            "mu_receptions": rec_mu,   "sd_receptions": rec_sd,
-        })
+        rows.append({"Player": name,
+                     "mu_rec_yards": rec_yds_mu, "sd_rec_yards": rec_yds_sd,
+                     "mu_receptions": rec_mu,   "sd_receptions": rec_sd})
     return pd.DataFrame(rows)
 
 def norm_over_prob(mu: float, sd: float, line: float, trials: int = SIM_TRIALS) -> float:
@@ -264,12 +274,10 @@ if qb_df is not None: qb_df = _coerce_numeric(qb_df, ["Y/G","Yds","TD","G","Att"
 if rb_df is not None: rb_df = _coerce_numeric(rb_df, ["Y/G","Yds","TD","G","Att"])
 if wr_df is not None: wr_df = _coerce_numeric(wr_df, ["Y/G","Yds","TD","G","Tgt","Rec"])
 
-# Start with neutral (will be replaced by event-specific opponent later)
 qb_proj = qb_proj_from_csv(qb_df, 1.0) if qb_df is not None else None
 rb_proj = rb_proj_from_csv(rb_df, 1.0) if rb_df is not None else None
 wr_proj = wr_proj_from_csv(wr_df, 1.0) if wr_df is not None else None
 
-# Precompute player→team (from CSV 'Team' column)
 PLAYER_TO_TEAM = build_player_team_map(qb_df, rb_df, wr_df)
 
 # ------------------------------------------------------------------------------
@@ -292,7 +300,6 @@ def fetch_event_with_markets(api_key: str, event_id: str, region: str, markets: 
     if bookmakers:
         params["bookmakers"] = ",".join(bookmakers)
 
-    # Some accounts don’t support certain market keys. We iteratively drop the offender on 422.
     remaining = markets[:]
     last_err = None
     for _ in range(6):
@@ -301,11 +308,9 @@ def fetch_event_with_markets(api_key: str, event_id: str, region: str, markets: 
         try:
             return odds_get(base, params)
         except requests.HTTPError as e:
-            msg = str(e)
-            last_err = msg
-            # try to parse offending 'invalid market'
+            msg = str(e); last_err = msg
             bad = None
-            for m in remaining:
+            for m in list(remaining):
                 if m in msg:
                     bad = m; break
             if bad:
@@ -317,14 +322,12 @@ def fetch_event_with_markets(api_key: str, event_id: str, region: str, markets: 
         raise requests.HTTPError(last_err)
     return {"bookmakers": []}
 
-# Preferred market keys (we’ll request all; backend will drop invalids)
 MARKETS_ALL = [
     "player_pass_yds",
     "player_pass_tds",
     "player_rush_yds",
     "player_receptions",
-    # try several receiving-yards spellings; the fetch function will drop invalid ones
-    "player_receiving_yards",
+    "player_receiving_yards",  # we normalize player_rec_yds to this
     "player_rec_yds",
     "player_anytime_td",
 ]
@@ -357,7 +360,7 @@ except Exception as e:
 st.caption(f"Found **{len(events)}** events in the next **{lookahead}** day(s).")
 
 # ------------------------------------------------------------------------------
-# Core: simulate all events
+# Core: defense scaling + simulation
 # ------------------------------------------------------------------------------
 def multipliers_for_opponent(opponent_team_full: str) -> Dict[str,float]:
     row = DEF.loc[DEF["Team"] == opponent_team_full]
@@ -367,54 +370,40 @@ def multipliers_for_opponent(opponent_team_full: str) -> Dict[str,float]:
     return {"pass":float(r["pass_adj"]), "rush":float(r["rush_adj"]), "recv":float(r["recv_adj"])}
 
 def apply_defense_scaling(player: str, market: str, home_team: str, away_team: str) -> Tuple[float,float]:
-    """
-    Returns (mu_scale, sd_scale) for the player in this event using his TEAM from CSV,
-    so we can pick the correct **opponent** multipliers.
-    """
-    # Which team is the player on?
     p_team = PLAYER_TO_TEAM.get(player)
     if not p_team:
         return (1.0, 1.0)
-    # Figure opponent
-    cleaned_home = clean_team(home_team)
-    cleaned_away = clean_team(away_team)
-    cleaned_player_team = clean_team(p_team)
-    if cleaned_player_team == cleaned_home:
+    ch, ca, cp = clean_team(home_team), clean_team(away_team), clean_team(p_team)
+    if cp == ch:
         opp = away_team
-    elif cleaned_player_team == cleaned_away:
+    elif cp == ca:
         opp = home_team
     else:
-        # couldn’t tell; neutral
         return (1.0, 1.0)
-
     m = multipliers_for_opponent(opp)
     if market in ("player_pass_tds","player_pass_yds"):
         sc = m["pass"]
-    elif market in ("player_rush_yds",):
+    elif market == "player_rush_yds":
         sc = m["rush"]
-    elif market in ("player_receptions","player_receiving_yards","player_rec_yds"):
+    elif market in ("player_receptions","player_receiving_yards"):
         sc = m["recv"]
     else:
-        # anytime TD: blend by guess
         sc = 0.5*m["rush"] + 0.5*m["recv"]
-    # very mild SD scaling
     return (sc, max(0.9, min(1.1, sc)))
 
 def simulate_from_row(market: str, player: str, side: str, line: float,
                       base_row: pd.Series, home: str, away: str) -> Optional[dict]:
-    # get base mu/sd from projections
     if market == "player_pass_tds":
         mu, sd = base_row["mu_pass_tds"], base_row["sd_pass_tds"]
     elif market == "player_pass_yds":
         mu, sd = base_row["mu_pass_yds"], base_row["sd_pass_yds"]
     elif market == "player_rush_yds":
         mu, sd = base_row["mu_rush_yds"], base_row["sd_rush_yds"]
-    elif market in ("player_receptions",):
+    elif market == "player_receptions":
         mu, sd = base_row["mu_receptions"], base_row["sd_receptions"]
-    elif market in ("player_receiving_yards","player_rec_yds"):
+    elif market in ("player_receiving_yards", "player_rec_yds"):
         mu, sd = base_row["mu_rec_yards"], base_row["sd_rec_yards"]
-    else:  # anytime TD (heuristic: use receptions or rush yards proxy already pre-scaled later)
-        # basic fallback: convert a usage metric to TD rate (very conservative)
+    else:  # anytime TD
         if "mu_receptions" in base_row:
             mu = 0.10 * float(base_row["mu_receptions"])
         elif "mu_rush_yds" in base_row:
@@ -423,10 +412,8 @@ def simulate_from_row(market: str, player: str, side: str, line: float,
             return None
         sd = max(0.20, 0.60 * mu)
 
-    # apply defense scaling by opponent
     sc_mu, sc_sd = apply_defense_scaling(player, market, home, away)
-    mu *= sc_mu
-    sd *= sc_sd
+    mu *= sc_mu; sd *= sc_sd
     p_over = norm_over_prob(mu, sd, line, SIM_TRIALS)
     p = p_over if side == "Over" else 1.0 - p_over
 
@@ -444,37 +431,37 @@ def collect_book_outcomes(event_json: dict) -> pd.DataFrame:
         for m in bk.get("markets", []):
             mkey = m.get("key")
             for o in m.get("outcomes", []):
-                name = o.get("description")  # player name for player_* markets
+                name = o.get("description")
                 side = o.get("name")
                 point = o.get("point")
                 if name is None or point is None or side not in ("Over","Under"):
                     continue
-                rows.append({"market": mkey, "player_raw": name, "side": side, "point": float(point)})
+                try:
+                    pt = float(point)
+                except Exception:
+                    continue
+                rows.append({"market": mkey, "player_raw": name, "side": side, "point": pt})
     if not rows:
         return pd.DataFrame(columns=["market","player_raw","side","point"])
     df = pd.DataFrame(rows).drop_duplicates()
-    # normalize receiving yard keys
     df["market"] = df["market"].replace({"player_rec_yds":"player_receiving_yards"})
     return df
 
 def simulate_event(event: dict, markets: List[str], api_key: str, region: str, limit_books: List[str]|None,
                    qb_proj: pd.DataFrame|None, rb_proj: pd.DataFrame|None, wr_proj: pd.DataFrame|None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     home, away, eid = event["home_team"], event["away_team"], event["id"]
-    # fetch props (dropping unsupported markets as needed)
     data = fetch_event_with_markets(api_key, eid, region, markets, limit_books)
     df = collect_book_outcomes(data)
     if df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    # Prepare projection name lists
-    qb_names = qb_proj["Player"].tolist() if qb_proj is not None else []
-    rb_names = rb_proj["Player"].tolist() if rb_proj is not None else []
-    wr_names = wr_proj["Player"].tolist() if wr_proj is not None else []
+    qb_names = qb_proj["Player"].dropna().astype(str).tolist() if qb_proj is not None else []
+    rb_names = rb_proj["Player"].dropna().astype(str).tolist() if rb_proj is not None else []
+    wr_names = wr_proj["Player"].dropna().astype(str).tolist() if wr_proj is not None else []
 
     out_rows, unmatched = [], []
     for _, r in df.iterrows():
         mkt, raw, side, line = r["market"], r["player_raw"], r["side"], r["point"]
-        # Choose the correct pool to match
         base, match, score = None, None, 0
         if mkt in ("player_pass_tds","player_pass_yds") and qb_proj is not None:
             match, score = best_match(raw, qb_names)
@@ -489,7 +476,6 @@ def simulate_event(event: dict, markets: List[str], api_key: str, region: str, l
             if match is not None:
                 base = wr_proj.loc[wr_proj["Player"] == match].iloc[0]
         elif mkt == "player_anytime_td":
-            # try WR, then RB, then QB
             if wr_proj is not None:
                 match, score = best_match(raw, wr_names)
                 if match is not None:
@@ -531,7 +517,6 @@ if go_all:
         try:
             sim, um = simulate_event(ev, MARKETS_ALL, api_key, region, limit_books, qb_proj, rb_proj, wr_proj)
             if not sim.empty:
-                # include event meta
                 sim["event"] = f'{ev["away_team"]} @ {ev["home_team"]}'
                 all_rows.append(sim)
             if not um.empty:
@@ -549,8 +534,6 @@ if go_all:
     results = pd.concat(all_rows, ignore_index=True).sort_values(["prob","event"], ascending=[False, True])
     st.subheader("Simulated probabilities (all games)")
     st.dataframe(results, use_container_width=True)
-
-    # Download
     st.download_button(
         "⬇️ Download all-game results CSV",
         results.to_csv(index=False).encode("utf-8"),
@@ -558,7 +541,6 @@ if go_all:
         mime="text/csv",
     )
 
-    # Show unmatched (debug)
     if all_unmatched:
         dbg = pd.concat(all_unmatched, ignore_index=True).sort_values(["market","fuzzy_score"], ascending=[True, False])
         st.markdown("#### Unmatched props (debug)")
