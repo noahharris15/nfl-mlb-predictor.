@@ -710,13 +710,8 @@ def mlb_matchup_mu(rates: pd.DataFrame, home: str, away: str) -> Tuple[float,flo
 # -------------------------- CSV helpers (props) ----------------------
 def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.columns = (
-        pd.Series(df.columns)
-        .astype(str).str.strip()
-        .str.replace(r"\s+", " ", regex=True)
-    )
+    df.columns = pd.Series(df.columns).astype(str).str.strip().str.replace(r"\s+", " ", regex=True)
     low = {c.lower(): c for c in df.columns}
-    # common variants → canonical
     mapping = {
         next((low[k] for k in low if k in ("player","player name","name")), None): "Player",
         next((low[k] for k in low if k in ("team","tm","club")), None): "Team",
@@ -733,45 +728,34 @@ def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
     for src, dst in mapping.items():
         if src and dst:
             df.rename(columns={src: dst}, inplace=True)
-    # final fallback for Player
     if "Player" not in df.columns:
         for c in df.columns:
             nonnum_ratio = df[c].apply(lambda x: not pd.to_numeric(pd.Series([x]), errors="coerce").notna()[0]).mean()
             if nonnum_ratio > 0.8:
-                df.rename(columns={c: "Player"}, inplace=True)
-                break
+                df.rename(columns={c: "Player"}, inplace=True); break
     return df
 
 def _coerce_numeric_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for c in ("Y/G","Yds","TD","G","Att","Cmp","Rate","Tgt","Rec"):
         if c in df.columns:
-            df[c] = (df[c].astype(str)
-                     .str.replace(",", "", regex=False)
-                     .str.replace("%", "", regex=False)
-                     .str.strip())
+            df[c] = (df[c].astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False).str.strip())
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
 def _load_any(uploaded_file) -> pd.DataFrame:
-    """
-    Robust reader for your CSVs that sometimes include a junk first row like:
-    'Passing,Passing,Passing,...'
-    We scan the first ~200 lines and start at the first line that contains 'player'.
-    """
+    """Robust reader that skips junk first rows (e.g., 'Passing,Passing,...')."""
     if uploaded_file.name.lower().endswith(".csv"):
         raw = uploaded_file.read().decode("utf-8", errors="ignore")
         lines = raw.splitlines()
         header_idx = 0
         for i, ln in enumerate(lines[:200]):
             if "player" in ln.lower() and "," in ln:
-                header_idx = i
-                break
+                header_idx = i; break
         cleaned = "\n".join(lines[header_idx:])
         df = pd.read_csv(StringIO(cleaned))
     else:
         df = pd.read_excel(uploaded_file)
-
     df = _norm_cols(df)
     df = _coerce_numeric_cols(df)
     return df
@@ -846,8 +830,7 @@ if page == "NFL":
     try:
         nfl_rates, upcoming = nfl_team_rates_2025()
     except Exception as e:
-        st.error(f"Couldn't build NFL rates: {e}")
-        st.stop()
+        st.error(f"Couldn't build NFL rates: {e}"); st.stop()
 
     if upcoming.empty:
         st.info("No upcoming games found yet."); st.stop()
@@ -878,8 +861,7 @@ elif page == "MLB":
     try:
         mlb_rates = mlb_team_rates_2025()
     except Exception as e:
-        st.error(f"Couldn't load MLB data: {e}")
-        st.stop()
+        st.error(f"Couldn't load MLB data: {e}"); st.stop()
 
     left, right = st.columns([1, 2], gap="large")
     with left:
@@ -915,39 +897,59 @@ else:
         st.dataframe(def_factors.sort_values("abbr").reset_index(drop=True),
                      use_container_width=True, height=260)
 
-    # One uploader, accept multiple; auto-detect QB/RB/WR
-    uploads = st.file_uploader("Drop your CSV/XLSX files (QB / RB / WR). I’ll auto-detect.",
-                               type=["csv","xlsx"], accept_multiple_files=True)
+    # -------- One uploader, robust detect + manual override per file --------
+    uploads = st.file_uploader(
+        "Drop your CSV/XLSX files (QB / RB / WR). I’ll auto-detect, and you can override.",
+        type=["csv","xlsx"], accept_multiple_files=True
+    )
 
     raw_qb = raw_rb = raw_wr = None
+
+    def detect_position(cols_lower: set) -> str:
+        # Priority matters: WR first, then QB, then RB
+        if {"tgt","rec"}.intersection(cols_lower):                      # WR/TE markers
+            return "WR"
+        if {"cmp","att"}.issubset(cols_lower) and \
+           {"int%","rate","sk%","y/a","succ%"}.intersection(cols_lower):  # real QB markers
+            return "QB"
+        if "att" in cols_lower and {"y/g","yds","yds/g"}.intersection(cols_lower):  # RB markers
+            return "RB"
+        return "WR"  # safe default
+
     if uploads:
         previews = []
-        for f in uploads:
+        for i, f in enumerate(uploads):
             try:
                 df = _load_any(f)
             except Exception as e:
                 st.error(f"Failed to read {f.name}: {e}")
                 continue
-            cols = {c.lower() for c in df.columns}
-            is_qb = {"cmp","att","y/g"}.intersection(cols) or "rate" in cols
-            is_wr = {"tgt","rec"}.intersection(cols)
-            is_rb = ("att" in cols and "y/g" in cols) or ("rush" in " ".join(cols))
-            if is_qb:
+
+            cols_lower = {c.lower() for c in df.columns}
+            guess = detect_position(cols_lower)
+
+            with st.expander(f"📄 {f.name} — detected as **{guess}** (override if needed)", expanded=False):
+                choice = st.radio("Treat this file as:", ["QB","RB","WR"],
+                                  index=["QB","RB","WR"].index(guess), key=f"pos_{i}")
+                st.caption(f"Columns: {list(df.columns)}")
+                st.dataframe(df.head(5), use_container_width=True, height=140)
+
+            if choice == "QB":
                 raw_qb = df if raw_qb is None else pd.concat([raw_qb, df], ignore_index=True)
                 previews.append(("QB", f.name, df.head(3)))
-            elif is_wr:
-                raw_wr = df if raw_wr is None else pd.concat([raw_wr, df], ignore_index=True)
-                previews.append(("WR/TE", f.name, df.head(3)))
-            else:
+            elif choice == "RB":
                 raw_rb = df if raw_rb is None else pd.concat([raw_rb, df], ignore_index=True)
                 previews.append(("RB", f.name, df.head(3)))
+            else:
+                raw_wr = df if raw_wr is None else pd.concat([raw_wr, df], ignore_index=True)
+                previews.append(("WR/TE", f.name, df.head(3)))
 
         with st.expander("👀 Parsed previews (top 3 rows from each file)", expanded=False):
             for pos, name, head3 in previews:
-                st.caption(f"**{pos}** · {name} · columns: {list(head3.columns)}")
-                st.dataframe(head3, use_container_width=True, height=120)
+                st.caption(f"**{pos}** · {name}")
+                st.dataframe(head3, use_container_width=True, height=110)
 
-    # Controls strip
+    # ---------------- Controls strip ----------------
     st.markdown("---")
     col1, col2, col3 = st.columns([1, 1.2, 1])
     with col1:
@@ -977,7 +979,7 @@ else:
 
     line = st.number_input("Yardage line", value=188.3, step=0.1)
 
-    # Compute
+    # ---------------- Compute ----------------
     if st.button("Compute"):
         if not isinstance(player_source, pd.DataFrame) or player_source.empty or not players:
             st.warning("Upload a file for this market first. (Scroll up to the uploader.)")
