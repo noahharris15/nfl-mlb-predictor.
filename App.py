@@ -21,6 +21,12 @@ VALID_MARKETS = [
     "player_rush_yds",
     "player_receptions",
     "player_pass_tds",
+    "player_rush_reception_yds"
+    "player_rush_attempts"
+    "player_reception_yds"
+    "player_pass_completions"
+    "player_pass_attempts"
+    "player_field_goals"
 ]
 
 # ------------------ Embedded 2025 defense EPA ------------------
