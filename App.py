@@ -431,10 +431,16 @@ if go:
     st.subheader("Simulated probabilities (per-game averages + defense multipliers)")
     tabs = st.tabs(["All", "Passing Yards", "Rushing Yards", "Receptions", "Passing TDs"])
     market_map = {
-        "Passing Yards": "player_pass_yds",
-        "Rushing Yards": "player_rush_yds",
-        "Receptions": "player_receptions",
-        "Passing TDs": "player_pass_tds",
+        "player_pass_yds",
+    "player_rush_yds",
+    "player_receptions",
+    "player_pass_tds",
+    "player_rush_reception_yds"
+    "player_rush_attempts"
+    "player_reception_yds"
+    "player_pass_completions"
+    "player_pass_attempts"
+    "player_field_goals"
     }
     colcfg = {
         "player": st.column_config.TextColumn("Player", width="medium"),
