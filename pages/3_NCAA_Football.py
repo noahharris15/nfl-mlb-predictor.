@@ -236,37 +236,6 @@ if st.button("📥 Build NCAA projections"):
     st.session_state["ncaa_proj"] = season_df.copy()
     st.success(f"Built projections for {len(season_df)} players.")
     st.dataframe(season_df[["Player","g","mu_pass_yds","mu_rush_yds","mu_receptions","mu_rec_yds"]].sort_values("Player").head(20), use_container_width=True)
-# === NEW: Raw per-game averages tables (NCAA) ===
-st.markdown("### 2a) Raw per-game averages (μ)")
-
-ncaa_mu = season_df.copy()
-view_cols_pass = ["Player","g","mu_pass_yds","mu_pass_tds","mu_pass_cmp","mu_pass_att"]
-view_cols_rush = ["Player","g","mu_rush_yds","mu_rush_att","mu_rush_rec_yds"]
-view_cols_recv = ["Player","g","mu_receptions","mu_rec_yds"]
-view_cols_kick = ["Player","g","mu_fg_made"]
-
-name_filter = st.text_input("Filter players (NCAA)", value="").strip().lower()
-
-tabs = st.tabs(["Passing", "Rushing", "Receiving", "Kicking"])
-with tabs[0]:
-    dfv = ncaa_mu[view_cols_pass].copy()
-    if name_filter: dfv = dfv[dfv["Player"].str.lower().str.contains(name_filter)]
-    st.dataframe(dfv.sort_values("mu_pass_yds", ascending=False), use_container_width=True)
-
-with tabs[1]:
-    dfv = ncaa_mu[view_cols_rush].copy()
-    if name_filter: dfv = dfv[dfv["Player"].str.lower().str.contains(name_filter)]
-    st.dataframe(dfv.sort_values("mu_rush_yds", ascending=False), use_container_width=True)
-
-with tabs[2]:
-    dfv = ncaa_mu[view_cols_recv].copy()
-    if name_filter: dfv = dfv[dfv["Player"].str.lower().str.contains(name_filter)]
-    st.dataframe(dfv.sort_values("mu_rec_yds", ascending=False), use_container_width=True)
-
-with tabs[3]:
-    dfv = ncaa_mu[view_cols_kick].copy()
-    if name_filter: dfv = dfv[dfv["Player"].str.lower().str.contains(name_filter)]
-    st.dataframe(dfv.sort_values("mu_fg_made", ascending=False), use_container_width=True)
 # ---------------- Odds API ----------------
 st.markdown("### 3) Pick a game & markets from The Odds API")
 api_key = (st.secrets.get("odds_api_key") if hasattr(st, "secrets") else None) or st.text_input(
