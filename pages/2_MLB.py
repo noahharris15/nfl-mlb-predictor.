@@ -1,11 +1,11 @@
-# pages/2_MLB.py
-# MLB Player Props — Odds API + ESPN (batters & pitchers)
-# Run: streamlit run App.py
+# 2_MLB.py
+# MLB Player Props — Odds API + ESPN (robust boxscore fetch, batters + pitchers)
+# Run: streamlit run 2_MLB.py    (or as a Streamlit multipage in pages/)
 
-import re
 import math
-import datetime as dt
-from collections import defaultdict
+import re
+import unicodedata
+from datetime import date, timedelta, datetime
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -19,7 +19,8 @@ st.title("⚾ MLB Player Props — Odds API + ESPN (batters & pitchers)")
 
 SIM_TRIALS = 10_000
 
-VALID_MARKETS = [
+# Odds API MLB player markets (exact keys)
+VALID_MLB_MARKETS = [
     # Batters
     "batter_hits",
     "batter_total_bases",
@@ -42,32 +43,19 @@ VALID_MARKETS = [
     "pitcher_record_a_win",
 ]
 
-# ---------------- Odds API helpers ----------------
-def odds_get(url: str, params: dict) -> dict:
-    r = requests.get(url, params=params, timeout=30)
-    if r.status_code != 200:
-        raise requests.HTTPError(f"HTTP {r.status_code}: {r.text[:300]}")
-    return r.json()
+# ------------- helpers -------------
+def strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 
-def list_mlb_events(api_key: str, lookahead_days: int, region: str):
-    return odds_get(
-        "https://api.the-odds-api.com/v4/sports/baseball_mlb/events",
-        {"apiKey": api_key, "daysFrom": 0, "daysTo": lookahead_days, "regions": region},
-    )
+def normalize_name(n: str) -> str:
+    n = str(n or "")
+    n = n.split("(")[0]            # "John Smith (L)" -> "John Smith"
+    n = n.replace("-", " ")
+    n = re.sub(r"[.,']", " ", n)
+    n = re.sub(r"\s+", " ", n).strip()
+    return strip_accents(n)
 
-def fetch_event_props(api_key: str, event_id: str, region: str, markets: List[str]):
-    return odds_get(
-        f"https://api.the-odds-api.com/v4/sports/baseball_mlb/events/{event_id}/odds",
-        {
-            "apiKey": api_key,
-            "regions": region,
-            "markets": ",".join(markets),
-            "oddsFormat": "american",
-        },
-    )
-
-# ---------------- ESPN HTTP helpers ----------------
-def http_get(url, params=None, timeout=25) -> Optional[dict]:
+def http_get(url: str, params: Optional[dict] = None, timeout: int = 25) -> Optional[dict]:
     try:
         r = requests.get(url, params=params, timeout=timeout)
         if r.status_code == 200:
@@ -76,272 +64,338 @@ def http_get(url, params=None, timeout=25) -> Optional[dict]:
         pass
     return None
 
-SCOREBOARD_SITE = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard"
-EVENTS_CORE     = "https://sports.core.api.espn.com/v2/sports/baseball/leagues/mlb/events"
-SUMMARY_SITE    = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/summary"
-
-# Robust “date → event-ids” (tries site → site(groups=9) → core)
-@st.cache_data(show_spinner=False)
-def list_event_ids_by_date(day: dt.date) -> List[str]:
-    ymd = day.strftime("%Y%m%d")
-    ids: List[str] = []
-
-    # 1) Site API (plain)
-    js = http_get(SCOREBOARD_SITE, params={"dates": ymd})
-    if js and js.get("events"):
-        try:
-            ids = [str(e["id"]) for e in js["events"] if e.get("id")]
-        except Exception:
-            ids = []
-    if ids:
-        st.write(f"ESPN site scoreboard OK for {ymd} → {len(ids)} events")
-        return sorted(set(ids))
-
-    # 2) Site API with groups/limit
-    js = http_get(SCOREBOARD_SITE, params={"dates": ymd, "groups": 9, "limit": 500})
-    if js and js.get("events"):
-        try:
-            ids = [str(e["id"]) for e in js["events"] if e.get("id")]
-        except Exception:
-            ids = []
-    if ids:
-        st.write(f"ESPN site scoreboard (groups=9) OK for {ymd} → {len(ids)} events")
-        return sorted(set(ids))
-
-    # 3) Core API fallback
-    core = http_get(EVENTS_CORE, params={"dates": ymd, "limit": 500})
-    ids_core = []
-    if core:
-        items = core.get("items")
-        if isinstance(items, list):
-            for it in items:
-                ref = it.get("$ref") or it.get("href") or ""
-                m = re.search(r"/events/(\d+)", ref)
-                if m:
-                    ids_core.append(m.group(1))
-                elif it.get("id"):
-                    ids_core.append(str(it["id"]))
-    if ids_core:
-        st.write(f"ESPN core events OK for {ymd} → {len(ids_core)} events")
-        return sorted(set(ids_core))
-
-    st.write(f"ESPN returned 0 events for {ymd} (all strategies).")
-    return []
-
-@st.cache_data(show_spinner=False)
-def fetch_boxscore(event_id: str) -> Optional[dict]:
-    return http_get(SUMMARY_SITE, params={"event": event_id})
-
-# ------------- Parsing (reads labels so order doesn’t matter) -------------
-def _valmap_from_labels(stat_block: dict) -> Dict[str, float]:
-    labels = (stat_block or {}).get("labels") or []
-    athletes = (stat_block or {}).get("athletes") or []
-    out: Dict[str, float] = {}
-    for a in athletes:
-        vals = a.get("stats") or []
-        amap = {lbl: vals[i] if i < len(vals) else None for i, lbl in enumerate(labels)}
-        # coerce to float where possible
-        for k, v in amap.items():
-            try:
-                out[k] = float(str(v).replace("+","").replace(",",""))
-            except Exception:
-                out[k] = np.nan
-    return out
-
-def _ip_to_outs(ip_val: str) -> float:
-    # ESPN IP like "5.1" == 5 and 1/3; "5.2" == 5 and 2/3
-    try:
-        s = str(ip_val)
-        if "." in s:
-            whole, frac = s.split(".")
-            whole = int(whole or 0)
-            frac = int(frac or 0)
-            return whole * 3 + frac  # 0,1,2 represent outs in the partial inning
-        return float(ip_val) * 3.0
-    except Exception:
-        return np.nan
-
-def parse_game_players(box: dict) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    bat_rows, pit_rows = [], []
-    try:
-        teams = (box or {}).get("boxscore", {}).get("players", []) or []
-        for team in teams:
-            tname = team.get("team", {}).get("shortDisplayName")
-            for stat_block in team.get("statistics", []):
-                name = (stat_block.get("name") or "").lower()
-                labels = stat_block.get("labels") or []
-                for a in stat_block.get("athletes", []) or []:
-                    player = a.get("athlete", {}).get("displayName") or ""
-                    vals = a.get("stats") or []
-                    amap = {lbl: (vals[i] if i < len(vals) else None) for i, lbl in enumerate(labels)}
-
-                    def f(key):
-                        try:
-                            return float(str(amap.get(key)).replace("+","").replace(",",""))
-                        except Exception:
-                            return np.nan
-
-                    if "batting" in name:
-                        bat_rows.append({
-                            "Player": player, "Team": tname,
-                            "H": f("H") if "H" in labels else f("Hits"),
-                            "TB": f("TB") if "TB" in labels else np.nan,
-                            "HR": f("HR") if "HR" in labels else np.nan,
-                            "RBI": f("RBI") if "RBI" in labels else np.nan,
-                            "R": f("R") if "R" in labels else np.nan,
-                            "1B": f("1B") if "1B" in labels else np.nan,
-                            "2B": f("2B") if "2B" in labels else np.nan,
-                            "3B": f("3B") if "3B" in labels else np.nan,
-                            "BB": f("BB") if "BB" in labels else np.nan,
-                            "SO": f("K") if "K" in labels else (f("SO") if "SO" in labels else np.nan),
-                            "SB": f("SB") if "SB" in labels else np.nan,
-                        })
-
-                    if "pitching" in name:
-                        ip_raw = amap.get("IP")
-                        outs = _ip_to_outs(ip_raw) if ip_raw is not None else np.nan
-                        pit_rows.append({
-                            "Player": player, "Team": tname,
-                            "SO": f("SO") if "SO" in labels else (f("K") if "K" in labels else np.nan),
-                            "H": f("H") if "H" in labels else np.nan,
-                            "BB": f("BB") if "BB" in labels else np.nan,
-                            "ER": f("ER") if "ER" in labels else np.nan,
-                            "OUTS": outs,
-                            "W": 1.0 if str(amap.get("W","0")).strip() in ("1","True","true","Yes") else 0.0,
-                        })
-    except Exception:
-        pass
-
-    bat_df = pd.DataFrame(bat_rows) if bat_rows else pd.DataFrame(
-        columns=["Player","Team","H","TB","HR","RBI","R","1B","2B","3B","BB","SO","SB"]
-    )
-    pit_df = pd.DataFrame(pit_rows) if pit_rows else pd.DataFrame(
-        columns=["Player","Team","SO","H","BB","ER","OUTS","W"]
-    )
-    # Sum in case the same player appears multiple lines
-    bat_df = bat_df.groupby(["Player","Team"], as_index=False).sum(numeric_only=True)
-    pit_df = pit_df.groupby(["Player","Team"], as_index=False).sum(numeric_only=True)
-    return bat_df, pit_df
-
-# ------------- Aggregate to per-game means + sample SD -------------
-@st.cache_data(show_spinner=True)
-def build_mlb_agg(start_date: dt.date, end_date: dt.date) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    # walk each day; gather all event ids
-    days = [start_date + dt.timedelta(days=i) for i in range((end_date - start_date).days + 1)]
-    all_ids: List[str] = []
-    for d in days:
-        all_ids.extend(list_event_ids_by_date(d))
-    all_ids = sorted(set(all_ids))
-    if not all_ids:
-        return pd.DataFrame(), pd.DataFrame()
-
-    # accumulators
-    sums_b = defaultdict(lambda: defaultdict(float))
-    sums2_b = defaultdict(lambda: defaultdict(float))
-    games_b = defaultdict(int)
-
-    sums_p = defaultdict(lambda: defaultdict(float))
-    sums2_p = defaultdict(lambda: defaultdict(float))
-    games_p = defaultdict(int)
-
-    prog = st.progress(0.0, text=f"Crawling {len(all_ids)} games...")
-    for j, ev in enumerate(all_ids, 1):
-        bx = fetch_boxscore(ev)
-        if bx:
-            bat_df, pit_df = parse_game_players(bx)
-
-            for _, r in bat_df.iterrows():
-                key = (r["Player"], r.get("Team",""))
-                # metrics we support for batters:
-                for k in ["H","TB","HR","RBI","R","1B","2B","3B","BB","SO","SB"]:
-                    v = float(r.get(k, 0.0) or 0.0)
-                    sums_b[key][k] += v
-                    sums2_b[key][k] += v*v
-                games_b[key] += 1
-
-            for _, r in pit_df.iterrows():
-                key = (r["Player"], r.get("Team",""))
-                for k in ["SO","H","BB","ER","OUTS","W"]:
-                    v = float(r.get(k, 0.0) or 0.0)
-                    sums_p[key][k] += v
-                    sums2_p[key][k] += v*v
-                games_p[key] += 1
-
-        prog.progress(j / len(all_ids))
-
-    # to dataframe (batters)
-    brow = []
-    for (player, team), g in games_b.items():
-        row = {"Player": player, "Team": team, "g": g}
-        for k in ["H","TB","HR","RBI","R","1B","2B","3B","BB","SO","SB"]:
-            sx, sx2 = sums_b[(player,team)][k], sums2_b[(player,team)][k]
-            mu = sx / g
-            var = max(0.0, (sx2 / g) - mu*mu)
-            var = var * (g / (g - 1)) if g > 1 else var
-            row[f"mu_{k}"] = mu
-            row[f"sd_{k}"] = math.sqrt(var) if g > 1 else np.nan
-        brow.append(row)
-    bat_agg = pd.DataFrame(brow)
-
-    # pitchers
-    prow = []
-    for (player, team), g in games_p.items():
-        row = {"Player": player, "Team": team, "g": g}
-        for k in ["SO","H","BB","ER","OUTS","W"]:
-            sx, sx2 = sums_p[(player,team)][k], sums2_p[(player,team)][k]
-            mu = sx / g
-            var = max(0.0, (sx2 / g) - mu*mu)
-            var = var * (g / (g - 1)) if g > 1 else var
-            row[f"mu_{k}"] = mu
-            row[f"sd_{k}"] = math.sqrt(var) if g > 1 else np.nan
-        prow.append(row)
-    pit_agg = pd.DataFrame(prow)
-
-    return bat_agg, pit_agg
-
-# t-draw helper for O/U
 def t_over_prob(mu: float, sd: float, line: float, trials: int = SIM_TRIALS) -> float:
     sd = max(1e-6, float(sd))
     draws = mu + sd * np.random.standard_t(df=5, size=trials)
     return float((draws > line).mean())
 
-# ---------------- UI 1: Date range ----------------
+def bernoulli_yes_prob(p: float) -> float:
+    p = float(np.clip(p, 1e-6, 1 - 1e-6))
+    return p
+
+def sample_sd(sum_x: float, sum_x2: float, n: int, floor: float = 0.1) -> float:
+    """Bessel-corrected SD from sums; returns NaN if n <= 1."""
+    if n <= 1:
+        return float("nan")
+    mean = sum_x / n
+    var = max((sum_x2 / n) - mean**2, 0.0)
+    var *= n / (n - 1)
+    return float(max(math.sqrt(var), floor))
+
+# ---------------- ESPN endpoints ----------------
+SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard"
+SITE_SUMMARY = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/summary"
+CORE_BOX_FMT = "https://sports.core.api.espn.com/v2/sports/baseball/leagues/mlb/events/{eid}/competitions/{eid}/boxscore"
+
+@st.cache_data(show_spinner=False)
+def list_events_for_day(yyyymmdd: str) -> List[str]:
+    """Return ESPN event ids for a specific calendar day (YYYYMMDD)."""
+    dt = datetime.strptime(yyyymmdd, "%Y%m%d")
+    js = http_get(SCOREBOARD, params={"dates": dt.strftime("%Y%m%d")})
+    if not js:
+        return []
+    return [e.get("id") for e in js.get("events", []) if e.get("id")]
+
+@st.cache_data(show_spinner=False)
+def fetch_boxscore(event_id: str) -> Optional[dict]:
+    """
+    Fetch MLB boxscore. Try site 'summary?event=' first; if that has no players,
+    fall back to Core API boxscore and re-shape to a site-like schema.
+    """
+    site = http_get(SITE_SUMMARY, params={"event": event_id})
+    if site and site.get("boxscore", {}).get("players"):
+        return site
+
+    core = http_get(CORE_BOX_FMT.format(eid=event_id))
+    if not core:
+        return None
+
+    # Convert Core schema -> Site-like
+    try:
+        players = []
+        for t in core.get("teams", []):
+            team_name = t.get("team", {}).get("displayName") or t.get("team", {}).get("abbreviation")
+            team_block = {"team": {"shortDisplayName": team_name}, "statistics": []}
+
+            for cat in t.get("statistics", []):
+                # cat example: {"name":"batting","labels":[...],"athletes":[...]}
+                team_block["statistics"].append({
+                    "name": cat.get("name", ""),
+                    "labels": cat.get("labels", []),
+                    "athletes": cat.get("athletes", []),
+                })
+            players.append(team_block)
+        return {"boxscore": {"players": players}}
+    except Exception:
+        return None
+
+def _to_float(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return float("nan")
+
+def _pull_stat(labels: List[str], stats: List[str], key: str, default=np.nan) -> float:
+    """Find a stat by label name, tolerant to slight label differences (e.g., 'TB', 'Total Bases')."""
+    if not labels or not stats:
+        return default
+    # map label -> value
+    m = {str(labels[i]).strip().lower(): stats[i] for i in range(min(len(labels), len(stats)))}
+    # possible aliases
+    aliases = {
+        "ab": ["ab", "at bats", "at-bats"],
+        "h": ["h", "hits"],
+        "1b": ["1b", "singles"],
+        "2b": ["2b", "doubles"],
+        "3b": ["3b", "triples"],
+        "hr": ["hr", "home runs", "home run"],
+        "r": ["r", "runs"],
+        "rbi": ["rbi", "runs batted in"],
+        "bb": ["bb", "walks"],
+        "so": ["so", "strikeouts", "k", "k's"],
+        "sb": ["sb", "stolen bases"],
+        "tb": ["tb", "total bases"],
+        "outs": ["outs", "outs recorded"],
+        "er": ["er", "earned runs"],
+        "h_allowed": ["h", "hits"],
+        "bb_allowed": ["bb", "walks"],
+        "so_pitch": ["so", "strikeouts", "k"],
+        "ip": ["ip", "innings pitched"],
+        "win": ["decision", "dec"],
+    }
+    for alias in aliases.get(key, [key]):
+        for lab, val in m.items():
+            if alias == lab:
+                return _to_float(val)
+    return default
+
+def parse_mlb_boxscore(box: dict) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Return (batters_df, pitchers_df) with per-game stats for one event.
+    Site-like schema is required (we handle core->site conversion in fetch_boxscore).
+    """
+    bat_rows, pit_rows = [], []
+    try:
+        teams = box.get("boxscore", {}).get("players", [])
+        for team in teams:
+            team_name = team.get("team", {}).get("shortDisplayName", "")
+            for sec in team.get("statistics", []):
+                label = (sec.get("name") or "").lower()
+                labels = sec.get("labels") or []
+                for guy in sec.get("athletes", []):
+                    nm = normalize_name(guy.get("athlete", {}).get("displayName"))
+                    stats = guy.get("stats") or []
+
+                    if "bat" in label:  # batting
+                        row = {
+                            "Player": nm, "Team": team_name,
+                            "H": _pull_stat(labels, stats, "h"),
+                            "TB": _pull_stat(labels, stats, "tb"),
+                            "HR": _pull_stat(labels, stats, "hr"),
+                            "R": _pull_stat(labels, stats, "r"),
+                            "RBI": _pull_stat(labels, stats, "rbi"),
+                            "BB": _pull_stat(labels, stats, "bb"),
+                            "SO": _pull_stat(labels, stats, "so"),
+                            "SB": _pull_stat(labels, stats, "sb"),
+                            "1B": _pull_stat(labels, stats, "1b", default=np.nan),
+                            "2B": _pull_stat(labels, stats, "2b", default=np.nan),
+                            "3B": _pull_stat(labels, stats, "3b", default=np.nan),
+                        }
+                        bat_rows.append(row)
+                    elif "pitch" in label:  # pitching
+                        # Pitching labels are similar but represent allowed stats
+                        row = {
+                            "Player": nm, "Team": team_name,
+                            "IP": _pull_stat(labels, stats, "ip"),
+                            "H_allowed": _pull_stat(labels, stats, "h_allowed"),
+                            "ER": _pull_stat(labels, stats, "er"),
+                            "BB_allowed": _pull_stat(labels, stats, "bb_allowed"),
+                            "SO_pitch": _pull_stat(labels, stats, "so_pitch"),
+                            "Outs": _pull_stat(labels, stats, "outs"),
+                            # Decision parsing (win / loss). If label present and includes 'W', mark win = 1 else 0.
+                            "Win": 1.0 if isinstance(_pull_stat(labels, stats, "win", default=np.nan), float) and not np.isnan(_pull_stat(labels, stats, "win")) and str(guy.get("shortText","")).upper().startswith("W") else 0.0,
+                        }
+                        pit_rows.append(row)
+    except Exception:
+        pass
+
+    bat_df = pd.DataFrame(bat_rows) if bat_rows else pd.DataFrame(
+        columns=["Player","Team","H","TB","HR","R","RBI","BB","SO","SB","1B","2B","3B"]
+    )
+    pit_df = pd.DataFrame(pit_rows) if pit_rows else pd.DataFrame(
+        columns=["Player","Team","IP","H_allowed","ER","BB_allowed","SO_pitch","Outs","Win"]
+    )
+    # Some core boxscores omit 1B but give H and (2B,3B,HR). Infer 1B if missing.
+    if "1B" in bat_df.columns:
+        mask = bat_df["1B"].isna()
+        bat_df.loc[mask, "1B"] = (
+            bat_df.loc[mask, "H"].fillna(0)
+            - bat_df.loc[mask, ["2B","3B","HR"]].fillna(0).sum(axis=1)
+        ).clip(lower=0)
+    return bat_df, pit_df
+
+# ------------- Build season window from ESPN -------------
 st.header("1) Date range")
 col1, col2 = st.columns(2)
 with col1:
-    start_date = st.date_input("Start date (YYYY/MM/DD)", value=dt.date(2025, 9, 1))
+    d0 = st.text_input("Start date (YYYY/MM/DD)", value="2025/09/01")
 with col2:
-    end_date = st.date_input("End date (YYYY/MM/DD)", value=dt.date(2025, 9, 7))
+    d1 = st.text_input("End date (YYYY/MM/DD)", value="2025/09/07")
 
-# ---------------- Build projections ----------------
+def _dates_yyyymmdd(a: str, b: str) -> List[str]:
+    start = datetime.strptime(a, "%Y/%m/%d").date()
+    end   = datetime.strptime(b, "%Y/%m/%d").date()
+    days = []
+    cur = start
+    while cur <= end:
+        days.append(cur.strftime("%Y%m%d"))
+        cur += timedelta(days=1)
+    return days
+
+@st.cache_data(show_spinner=False)
+def crawl_event_ids(a: str, b: str) -> List[str]:
+    out = []
+    for d in _dates_yyyymmdd(a, b):
+        ids = list_events_for_day(d)
+        st.write(f"ESPN site scoreboard OK for {d} → {len(ids)} events")
+        out.extend(ids)
+    # de-dup; keep order
+    seen, uniq = set(), []
+    for e in out:
+        if e and e not in seen:
+            uniq.append(e); seen.add(e)
+    return uniq
+
+@st.cache_data(show_spinner=True)
+def build_mlb_averages(a: str, b: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Crawl day-by-day between [a,b], fetch boxscores, aggregate to per-player
+    sums, games, and sample SDs. Returns (batters_proj, pitchers_proj).
+    """
+    eids = crawl_event_ids(a, b)
+    if not eids:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # rolling sums
+    bat_sum: Dict[str, Dict[str, float]] = {}
+    bat_sum2: Dict[str, Dict[str, float]] = {}
+    bat_g: Dict[str, int] = {}
+
+    pit_sum: Dict[str, Dict[str, float]] = {}
+    pit_sum2: Dict[str, Dict[str, float]] = {}
+    pit_g: Dict[str, int] = {}
+
+    def binit(p):
+        if p not in bat_sum:
+            bat_sum[p]  = {"H":0,"TB":0,"HR":0,"R":0,"RBI":0,"BB":0,"SO":0,"SB":0,"1B":0,"2B":0,"3B":0}
+            bat_sum2[p] = {k:0.0 for k in bat_sum[p]}
+            bat_g[p]    = 0
+    def pinit(p):
+        if p not in pit_sum:
+            pit_sum[p]  = {"SO_pitch":0,"H_allowed":0,"BB_allowed":0,"ER":0,"Outs":0,"Win":0}
+            pit_sum2[p] = {k:0.0 for k in pit_sum[p]}
+            pit_g[p]    = 0
+
+    prog = st.progress(0.0, text="Fetching boxscores…")
+    for j, eid in enumerate(eids, 1):
+        box = fetch_boxscore(eid)
+        if not box:
+            prog.progress(j/len(eids)); continue
+        bat_df, pit_df = parse_mlb_boxscore(box)
+
+        # batters
+        for _, r in bat_df.iterrows():
+            p = normalize_name(r["Player"]); binit(p)
+            played = any(_to_float(r.get(k, 0)) > 0 for k in bat_sum[p].keys())
+            if played: bat_g[p] += 1
+            for k in bat_sum[p]:
+                v = _to_float(r.get(k, 0))
+                if not np.isnan(v):
+                    bat_sum[p][k]  += v
+                    bat_sum2[p][k] += v*v
+
+        # pitchers
+        for _, r in pit_df.iterrows():
+            p = normalize_name(r["Player"]); pinit(p)
+            # treat any pitching stat > 0 as an appearance
+            played = any(_to_float(r.get(k, 0)) > 0 for k in pit_sum[p].keys())
+            if played: pit_g[p] += 1
+            for k in pit_sum[p]:
+                v = _to_float(r.get(k, 0))
+                if not np.isnan(v):
+                    pit_sum[p][k]  += v
+                    pit_sum2[p][k] += v*v
+        prog.progress(j/len(eids))
+
+    # Build per-game avgs + SDs
+    bat_rows = []
+    for p, sums in bat_sum.items():
+        g = max(1, bat_g[p])
+        row = {"Player": p, "g": g}
+        for k, s in sums.items():
+            row[f"mu_{k.lower()}"] = s / g
+            row[f"sd_{k.lower()}"] = sample_sd(s, bat_sum2[p][k], g, floor=0.15)
+        # composite H+R+RBI
+        row["mu_hrr"] = row["mu_h"] + row["mu_r"] + row["mu_rbi"]
+        row["sd_hrr"] = math.sqrt(row["sd_h"]**2 + row["sd_r"]**2 + row["sd_rbi"]**2)
+        bat_rows.append(row)
+    pit_rows = []
+    for p, sums in pit_sum.items():
+        g = max(1, pit_g[p])
+        row = {"Player": p, "g": g}
+        for k, s in sums.items():
+            row[f"mu_{k.lower()}"] = s / g
+            row[f"sd_{k.lower()}"] = sample_sd(s, pit_sum2[p][k], g, floor=0.15)
+        # convert outs->IP if needed (keep outs per game too)
+        pit_rows.append(row)
+
+    bat_proj = pd.DataFrame(bat_rows)
+    pit_proj = pd.DataFrame(pit_rows)
+    return bat_proj, pit_proj
+
+# ---------------- Step 2 — build projections ----------------
 st.header("2) Build per-player projections from ESPN 🔗")
 if st.button("📥 Build MLB projections"):
-    bat_agg, pit_agg = build_mlb_agg(start_date, end_date)
-    if bat_agg.empty and pit_agg.empty:
+    bat_proj, pit_proj = build_mlb_averages(d0, d1)
+    if bat_proj.empty and pit_proj.empty:
         st.error("No data returned from ESPN for this date range.")
     else:
-        st.success(f"Built projections. Batters: {len(bat_agg)} | Pitchers: {len(pit_agg)}")
-        st.session_state["bat_proj"] = bat_agg
-        st.session_state["pit_proj"] = pit_agg
+        st.success(f"Built projections — Batters: {len(bat_proj)} | Pitchers: {len(pit_proj)}")
+        st.session_state["bat_proj"] = bat_proj
+        st.session_state["pit_proj"] = pit_proj
+        with st.expander("Preview — Batters (per-game μ / σ)"):
+            cols = ["Player","g","mu_h","sd_h","mu_tb","sd_tb","mu_hr","sd_hr","mu_r","sd_r","mu_rbi","sd_rbi","mu_hrr","sd_hrr"]
+            st.dataframe(bat_proj[cols].sort_values("mu_tb", ascending=False).head(25), use_container_width=True)
+        with st.expander("Preview — Pitchers (per-game μ / σ)"):
+            cols = ["Player","g","mu_so_pitch","sd_so_pitch","mu_h_allowed","sd_h_allowed","mu_bb_allowed","sd_bb_allowed","mu_er","sd_er","mu_outs","sd_outs","mu_win","sd_win"]
+            # ensure win rate exists (if not, set zeros)
+            for c in cols:
+                if c not in pit_proj.columns:
+                    pit_proj[c] = 0.0
+            st.dataframe(pit_proj[cols].sort_values("mu_so_pitch", ascending=False).head(25), use_container_width=True)
 
-    # Small diagnostic table: how many events per day ESPN returned
-    with st.expander("ESPN day-by-day event counts", expanded=False):
-        rows = []
-        d = start_date
-        while d <= end_date:
-            cnt = len(list_event_ids_by_date(d))
-            rows.append({"date": d.strftime("%Y%m%d"), "events": cnt})
-            d += dt.timedelta(days=1)
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
-
-# ---------------- Odds API selection ----------------
+# ---------------- Odds API ----------------
 st.header("3) Pick a game & markets from The Odds API")
 api_key = (st.secrets.get("odds_api_key") if hasattr(st, "secrets") else None) or st.text_input(
     "Odds API Key (kept local to your session)", value="", type="password"
 )
 region = st.selectbox("Region", ["us","us2","eu","uk"], index=0)
 lookahead = st.slider("Lookahead days", 0, 7, value=1)
-markets = st.multiselect("Markets to fetch", VALID_MARKETS, default=VALID_MARKETS)
+markets = st.multiselect("Markets to fetch", VALID_MLB_MARKETS, default=["batter_hits","batter_total_bases","pitcher_strikeouts"])
+
+def odds_get(url: str, params: dict) -> dict:
+    r = requests.get(url, params=params, timeout=25)
+    if r.status_code != 200:
+        raise requests.HTTPError(f"HTTP {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+def list_mlb_events(api_key: str, lookahead_days: int, region: str):
+    return odds_get("https://api.the-odds-api.com/v4/sports/baseball_mlb/events",
+                    {"apiKey": api_key, "daysFrom": 0, "daysTo": lookahead_days, "regions": region})
+
+def fetch_event_props(api_key: str, event_id: str, region: str, markets: List[str]):
+    return odds_get(f"https://api.the-odds-api.com/v4/sports/baseball_mlb/events/{event_id}/odds",
+                    {"apiKey": api_key, "regions": region, "markets": ",".join(markets), "oddsFormat": "american"})
 
 events = []
 if api_key:
@@ -354,174 +408,174 @@ if not events:
     st.info("Enter your Odds API key and pick a lookahead to list upcoming games.")
     st.stop()
 
-labels = [f'{e["away_team"]} @ {e["home_team"]} — {e.get("commence_time","")}' for e in events]
-pick = st.selectbox("Game", labels)
-event = events[labels.index(pick)]
+event_labels = [f'{e["away_team"]} @ {e["home_team"]} — {e.get("commence_time","")}' for e in events]
+pick = st.selectbox("Game", event_labels)
+event = events[event_labels.index(pick)]
 event_id = event["id"]
 
-# ---------------- Simulation ----------------
+# ---------------- Simulate ----------------
 st.header("4) Fetch lines & simulate")
-if st.button("🎲 Fetch lines & simulate (MLB)"):
+go = st.button("🎲 Fetch lines & simulate (MLB)")
+if go:
     bat_proj = st.session_state.get("bat_proj", pd.DataFrame())
     pit_proj = st.session_state.get("pit_proj", pd.DataFrame())
     if bat_proj.empty and pit_proj.empty:
-        st.warning("Build MLB projections first (Step 2).")
-        st.stop()
-
-    # quick lookup frames
-    bat_idx = bat_proj.set_index("Player") if not bat_proj.empty else pd.DataFrame()
-    pit_idx = pit_proj.set_index("Player") if not pit_proj.empty else pd.DataFrame()
+        st.warning("Build MLB projections first (Step 2)."); st.stop()
 
     try:
-        odds = fetch_event_props(api_key, event_id, region, markets)
+        data = fetch_event_props(api_key, event_id, region, markets)
     except Exception as e:
-        st.error(f"Props fetch failed: {e}")
-        st.stop()
+        st.error(f"Props fetch failed: {e}"); st.stop()
 
-    # flatten odds → one row per (market, player, side) with median 'point' across books
+    # Collate bookmaker outcomes -> median line per (market, player, side)
     rows = []
-    for bk in odds.get("bookmakers", []):
+    for bk in data.get("bookmakers", []):
         for m in bk.get("markets", []):
-            key = m.get("key")
+            mkey = m.get("key")
             for o in m.get("outcomes", []):
-                name = (o.get("description") or "").strip()
+                name = normalize_name(o.get("description"))
                 side = o.get("name")
                 point = o.get("point")
-                if key not in VALID_MARKETS or not name or not side:
+                # For Yes/No markets (pitcher_record_a_win), point can be None
+                if mkey not in VALID_MLB_MARKETS or not name or not side:
                     continue
                 rows.append({
-                    "market": key, "player": name, "side": side,
-                    "point": None if point is None else float(point),
+                    "market": mkey,
+                    "player": name,
+                    "side": side,
+                    "point": (None if point is None else float(point)),
                 })
     if not rows:
         st.warning("No player outcomes returned for selected markets.")
         st.stop()
 
     props = (pd.DataFrame(rows)
-             .groupby(["market","player","side"], as_index=False)
-             .agg(line=("point","median"), n_books=("point","size")))
+               .groupby(["market","player","side"], as_index=False)
+               .agg(line=("point","median"), n_books=("point","size")))
 
-    # map lines to player mean/sd
     out = []
+    bat_idx = {normalize_name(p): i for i, p in enumerate(bat_proj["Player"])} if not bat_proj.empty else {}
+    pit_idx = {normalize_name(p): i for i, p in enumerate(pit_proj["Player"])} if not pit_proj.empty else {}
+
     for _, r in props.iterrows():
-        mkt, player, side, line = r["market"], r["player"], r["side"], r["line"]
+        market, player, side, line = r["market"], r["player"], r["side"], r["line"]
 
-        def sim_cont(mu, sd, line):
+        # --- batters ---
+        if player in bat_idx:
+            row = bat_proj.iloc[bat_idx[player]]
+            if market == "batter_hits":
+                mu, sd = float(row["mu_h"]), float(row["sd_h"])
+            elif market == "batter_total_bases":
+                mu, sd = float(row["mu_tb"]), float(row["sd_tb"])
+            elif market == "batter_home_runs":
+                mu, sd = float(row["mu_hr"]), float(row["sd_hr"])
+            elif market == "batter_rbis":
+                mu, sd = float(row["mu_rbi"]), float(row["sd_rbi"])
+            elif market == "batter_runs_scored":
+                mu, sd = float(row["mu_r"]), float(row["sd_r"])
+            elif market == "batter_hits_runs_rbis":
+                mu, sd = float(row["mu_hrr"]), float(row["sd_hrr"])
+            elif market == "batter_singles":
+                mu, sd = float(row["mu_1b"]), float(row["sd_1b"])
+            elif market == "batter_doubles":
+                mu, sd = float(row["mu_2b"]), float(row["sd_2b"])
+            elif market == "batter_triples":
+                mu, sd = float(row["mu_3b"]), float(row["sd_3b"])
+            elif market == "batter_walks":
+                mu, sd = float(row["mu_bb"]), float(row["sd_bb"])
+            elif market == "batter_strikeouts":
+                mu, sd = float(row["mu_so"]), float(row["sd_so"])
+            elif market == "batter_stolen_bases":
+                mu, sd = float(row["mu_sb"]), float(row["sd_sb"])
+            else:
+                continue
+
+            if pd.isna(line):
+                continue
             p_over = t_over_prob(mu, sd, float(line), SIM_TRIALS)
-            return p_over if side == "Over" else 1.0 - p_over
-
-        if mkt.startswith("batter_") and not bat_idx.empty and player in bat_idx.index:
-            b = bat_idx.loc[player]
-            mu = sd = mu_raw = None
-
-            if mkt == "batter_hits":
-                mu, sd = b["mu_H"], b["sd_H"]
-            elif mkt == "batter_total_bases":
-                mu, sd = b["mu_TB"], b["sd_TB"]
-            elif mkt == "batter_home_runs":
-                mu, sd = b["mu_HR"], b["sd_HR"]
-            elif mkt == "batter_rbis":
-                mu, sd = b["mu_RBI"], b["sd_RBI"]
-            elif mkt == "batter_runs_scored":
-                mu, sd = b["mu_R"], b["sd_R"]
-            elif mkt == "batter_hits_runs_rbis":
-                mu  = float(b["mu_H"]  + b["mu_R"] + b["mu_RBI"])
-                sd2 = float((b["sd_H"] or 0)**2 + (b["sd_R"] or 0)**2 + (b["sd_RBI"] or 0)**2)
-                sd  = math.sqrt(sd2)
-            elif mkt == "batter_singles":
-                mu, sd = b["mu_1B"], b["sd_1B"]
-            elif mkt == "batter_doubles":
-                mu, sd = b["mu_2B"], b["sd_2B"]
-            elif mkt == "batter_triples":
-                mu, sd = b["mu_3B"], b["sd_3B"]
-            elif mkt == "batter_walks":
-                mu, sd = b["mu_BB"], b["sd_BB"]
-            elif mkt == "batter_strikeouts":
-                mu, sd = b["mu_SO"], b["sd_SO"]
-            elif mkt == "batter_stolen_bases":
-                mu, sd = b["mu_SB"], b["sd_SB"]
-            else:
-                continue
-
-            if pd.isna(line) or pd.isna(mu) or pd.isna(sd):
-                continue
-            p = sim_cont(float(mu), float(sd), float(line))
+            p = p_over if side == "Over" else 1.0 - p_over
             out.append({
-                "market": mkt, "player": player, "side": side,
-                "line": round(float(line),2),
-                "μ (per-game)": round(float(mu),2),
-                "σ (per-game)": None if pd.isna(sd) else round(float(sd),2),
-                "Win Prob %": round(100*p,2),
-                "books": int(r["n_books"]),
+                "market": market, "player": player, "side": side,
+                "line": None if pd.isna(line) else round(float(line), 2),
+                "μ (per-game)": round(mu, 3), "σ (per-game)": round(sd, 3),
+                "Win Prob %": round(100*p, 2), "books": int(r["n_books"])
             })
+            continue
 
-        elif mkt.startswith("pitcher_") and not pit_idx.empty and player in pit_idx.index:
-            prow = pit_idx.loc[player]
-            mu = sd = None
-            if mkt == "pitcher_strikeouts":
-                mu, sd = prow["mu_SO"], prow["sd_SO"]
-            elif mkt == "pitcher_hits_allowed":
-                mu, sd = prow["mu_H"], prow["sd_H"]
-            elif mkt == "pitcher_walks":
-                mu, sd = prow["mu_BB"], prow["sd_BB"]
-            elif mkt == "pitcher_earned_runs":
-                mu, sd = prow["mu_ER"], prow["sd_ER"]
-            elif mkt == "pitcher_outs":
-                mu, sd = prow["mu_OUTS"], prow["sd_OUTS"]
-            elif mkt == "pitcher_record_a_win":
-                # treat as Yes/No market: use empirical win rate
-                win_rate = float(prow["mu_W"]) if not pd.isna(prow["mu_W"]) else 0.0
-                if side in ("Yes","Over"):
-                    p = np.clip(win_rate, 0.0, 1.0)
-                else:
-                    p = 1.0 - np.clip(win_rate, 0.0, 1.0)
-                out.append({
-                    "market": mkt, "player": player, "side": side,
-                    "line": None, "μ (per-game)": round(win_rate,3),
-                    "σ (per-game)": None, "Win Prob %": round(100*p,2),
-                    "books": int(r["n_books"]),
-                })
-                continue
+        # --- pitchers ---
+        if player in pit_idx:
+            row = pit_proj.iloc[pit_idx[player]]
+            if market == "pitcher_strikeouts":
+                mu, sd = float(row["mu_so_pitch"]), float(row["sd_so_pitch"])
+                if pd.isna(line): continue
+                p_over = t_over_prob(mu, sd, float(line), SIM_TRIALS)
+                p = p_over if side == "Over" else 1.0 - p_over
+            elif market == "pitcher_hits_allowed":
+                mu, sd = float(row["mu_h_allowed"]), float(row["sd_h_allowed"])
+                if pd.isna(line): continue
+                p_over = t_over_prob(mu, sd, float(line), SIM_TRIALS)
+                p = p_over if side == "Over" else 1.0 - p_over
+            elif market == "pitcher_walks":
+                mu, sd = float(row["mu_bb_allowed"]), float(row["sd_bb_allowed"])
+                if pd.isna(line): continue
+                p_over = t_over_prob(mu, sd, float(line), SIM_TRIALS)
+                p = p_over if side == "Over" else 1.0 - p_over
+            elif market == "pitcher_earned_runs":
+                mu, sd = float(row["mu_er"]), float(row["sd_er"])
+                if pd.isna(line): continue
+                p_over = t_over_prob(mu, sd, float(line), SIM_TRIALS)
+                p = p_over if side == "Over" else 1.0 - p_over
+            elif market == "pitcher_outs":
+                mu, sd = float(row["mu_outs"]), float(row["sd_outs"])
+                if pd.isna(line): continue
+                p_over = t_over_prob(mu, sd, float(line), SIM_TRIALS)
+                p = p_over if side == "Over" else 1.0 - p_over
+            elif market == "pitcher_record_a_win":
+                # Yes/No market — probability from per-appearance win rate
+                mu = float(row.get("mu_win", 0.0))
+                p_yes = bernoulli_yes_prob(mu)
+                p = p_yes if side in ("Yes","Over") else (1.0 - p_yes)
+                line = None; sd = float("nan")
             else:
                 continue
 
-            if pd.isna(line) or pd.isna(mu) or pd.isna(sd):
-                continue
-            p = t_over_prob(float(mu), float(sd), float(line), SIM_TRIALS)
-            p = p if side == "Over" else 1.0 - p
             out.append({
-                "market": mkt, "player": player, "side": side,
-                "line": round(float(line),2),
-                "μ (per-game)": round(float(mu),2),
-                "σ (per-game)": None if pd.isna(sd) else round(float(sd),2),
-                "Win Prob %": round(100*p,2),
-                "books": int(r["n_books"]),
+                "market": market, "player": player, "side": side,
+                "line": None if line is None or pd.isna(line) else round(float(line), 2),
+                "μ (per-game)": None if np.isnan(mu) else round(mu, 3),
+                "σ (per-game)": None if (isinstance(sd, float) and np.isnan(sd)) else round(sd, 3),
+                "Win Prob %": round(100*p, 2),
+                "books": int(r["n_books"])
             })
 
     if not out:
-        st.warning("No props matched the players we built projections for.")
+        st.warning("Could not match any props to built projections.")
         st.stop()
 
     results = (pd.DataFrame(out)
-               .drop_duplicates(subset=["market","player","side"])
-               .sort_values(["market","Win Prob %"], ascending=[True, False])
-               .reset_index(drop=True))
+                 .drop_duplicates(subset=["market","player","side"])
+                 .sort_values(["market","Win Prob %"], ascending=[True, False])
+                 .reset_index(drop=True))
 
     st.subheader("Results")
-    cfg = {
-        "player": st.column_config.TextColumn("Player", width="large"),
-        "side": st.column_config.TextColumn("Side", width="small"),
-        "line": st.column_config.NumberColumn("Line", format="%.2f"),
-        "μ (per-game)": st.column_config.NumberColumn("μ (per-game)", format="%.2f"),
-        "σ (per-game)": st.column_config.NumberColumn("σ (per-game)", format="%.2f"),
-        "Win Prob %": st.column_config.ProgressColumn("Win Prob %", format="%.2f%%", min_value=0, max_value=100),
-        "books": st.column_config.NumberColumn("#Books", width="small"),
-    }
-    st.dataframe(results, use_container_width=True, hide_index=True, column_config=cfg)
+    st.dataframe(
+        results,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "player": st.column_config.TextColumn("Player", width="medium"),
+            "side": st.column_config.TextColumn("Side", width="small"),
+            "line": st.column_config.NumberColumn("Line", format="%.2f"),
+            "μ (per-game)": st.column_config.NumberColumn("μ (per-game)", format="%.2f"),
+            "σ (per-game)": st.column_config.NumberColumn("σ (per-game)", format="%.2f"),
+            "Win Prob %": st.column_config.ProgressColumn("Win Prob %", format="%.2f%%", min_value=0, max_value=100),
+            "books": st.column_config.NumberColumn("#Books", width="small"),
+        },
+    )
 
     st.download_button(
-        "⬇️ Download MLB results CSV",
+        "⬇️ Download CSV",
         results.to_csv(index=False).encode("utf-8"),
-        file_name="mlb_props_results.csv",
+        file_name="mlb_props_sim_results.csv",
         mime="text/csv",
     )
