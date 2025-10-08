@@ -1,6 +1,7 @@
 # pages/5_Soccer.py
-# Soccer Player Props — Odds API + ESPN (per-game means; 10k sims)
+# Soccer Player Props — Odds API + soccerdata (FBref) (per-game means; 10k sims)
 # Drop this file into your Streamlit "pages/" folder.
+# Requires: soccerdata (FBref backend)
 
 import math
 import re
@@ -13,9 +14,15 @@ import pandas as pd
 import requests
 import streamlit as st
 
+# ---- NEW: soccerdata (FBref) ----
+try:
+    from soccerdata import Fbref
+except Exception as e:
+    Fbref = None
+
 # ---------------- UI / constants ----------------
-st.set_page_config(page_title="Soccer Player Props — Odds API + ESPN", layout="wide")
-st.title("⚽ Soccer Player Props — Odds API + ESPN")
+st.set_page_config(page_title="Soccer Player Props — Odds API + soccerdata", layout="wide")
+st.title("⚽ Soccer Player Props — Odds API + soccerdata (FBref)")
 
 SIM_TRIALS = 10_000
 
@@ -32,15 +39,15 @@ VALID_MARKETS = [
     "player_assists",
 ]
 
-# League mapping: (UI name, ESPN league key, Odds API sport key)
+# League mapping: (UI name, FBref code for soccerdata, Odds API sport key)
 LEAGUES = [
-    ("English Premier League",   "eng.1",   "soccer_epl"),
-    ("La Liga (Spain)",          "esp.1",   "soccer_spain_la_liga"),
-    ("Serie A (Italy)",          "ita.1",   "soccer_italy_serie_a"),
-    ("Bundesliga (Germany)",     "ger.1",   "soccer_germany_bundesliga"),
-    ("Ligue 1 (France)",         "fra.1",   "soccer_france_ligue_one"),
-    ("UEFA Champions League",    "uefa.champions", "soccer_uefa_champs_league"),
-    ("MLS (USA)",                "usa.1",   "soccer_usa_mls"),
+    ("English Premier League",   "ENG-Premier League",     "soccer_epl"),
+    ("La Liga (Spain)",          "ESP-La Liga",            "soccer_spain_la_liga"),
+    ("Serie A (Italy)",          "ITA-Serie A",            "soccer_italy_serie_a"),
+    ("Bundesliga (Germany)",     "GER-Bundesliga",         "soccer_germany_bundesliga"),
+    ("Ligue 1 (France)",         "FRA-Ligue 1",            "soccer_france_ligue_one"),
+    ("UEFA Champions League",    "UEFA-Champions League",  "soccer_uefa_champs_league"),
+    ("MLS (USA)",                "USA-MLS",                "soccer_usa_mls"),
 ]
 
 # ---------------- Helpers ----------------
@@ -72,130 +79,105 @@ def _sd_from_sums(sum_x, sum_x2, n, floor=0.1) -> float:
     var *= n / (n - 1)
     return float(max(var**0.5, floor))
 
-# ---------------- ESPN API ----------------
-def http_get(url, params=None, timeout=25) -> Optional[dict]:
-    try:
-        r = requests.get(url, params=params, timeout=timeout)
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
-    return None
-
-def _dates_list(start_slash: str, end_slash: str) -> List[str]:
-    # return ESPN-friendly YYYYMMDD strings
-    start = datetime.strptime(start_slash, "%Y/%m/%d").date()
-    end   = datetime.strptime(end_slash, "%Y/%m/%d").date()
-    out, cur = [], start
-    while cur <= end:
-        out.append(cur.strftime("%Y%m%d"))
-        cur += timedelta(days=1)
-    return out
-
-def list_soccer_events(espn_key: str, dates: List[str]) -> List[str]:
-    # ESPN soccer scoreboard accepts a single "dates" per call, so loop.
-    SB_URL = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{espn_key}/scoreboard"
-    evs = []
-    for d in dates:
-        js = http_get(SB_URL, {"dates": d})
-        if not js: 
-            continue
-        evs += [str(e.get("id")) for e in js.get("events", []) if e.get("id")]
-    # unique preserve order
-    return list(dict.fromkeys(evs))
-
-def fetch_box_soccer(espn_key: str, event_id: str) -> Optional[dict]:
-    SUM_URL = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{espn_key}/summary"
-    return http_get(SUM_URL, {"event": event_id})
-
-# ---------------- ESPN soccer boxscore parser ----------------
-def _parse_soccer_box(box: dict) -> pd.DataFrame:
+def _season_list_for_dates(start_ymd: str, end_ymd: str) -> List[int]:
     """
-    Return one row per player for a single match with:
-      goals, assists, shots, sog, yc, rc
-    Tries multiple formats used by ESPN soccer boxscores.
+    FBref seasons are labeled by the SPRING year (e.g., 2025 season spans ~Aug 2024–May 2025).
+    We'll include both start.year and end.year to be safe.
     """
-    rows: List[Dict] = []
-    try:
-        players_sections = (box.get("boxscore", {}) or {}).get("players", []) or []
-        for team_blk in players_sections:
-            team_abbr = (team_blk.get("team", {}) or {}).get("abbreviation") or (team_blk.get("team", {}) or {}).get("shortDisplayName")
-            for stat_table in team_blk.get("statistics", []) or []:
-                label = (stat_table.get("name") or "").lower()
-                # Preferred: if headers provided, build a name->index map
-                headers = stat_table.get("labels") or stat_table.get("keys") or stat_table.get("descriptions")
-                idx = {}
-                if headers and isinstance(headers, list):
-                    for i, h in enumerate(headers):
-                        hlow = str(h).lower()
-                        if "goal" in hlow and "allowed" not in hlow:
-                            idx["goals"] = i
-                        if hlow in ("a", "assists") or "assist" in hlow:
-                            idx["assists"] = i
-                        if ("sog" == hlow) or ("shots on goal" in hlow):
-                            idx["sog"] = i
-                        if ("sh" == hlow) or ("shots" == hlow) or ("total shots" in hlow):
-                            idx["shots"] = i
-                        if ("yc" == hlow) or ("yellow" in hlow and "card" in hlow):
-                            idx["yc"] = i
-                        if ("rc" == hlow) or ("red" in hlow and "card" in hlow):
-                            idx["rc"] = i
-                for a in stat_table.get("athletes", []) or []:
-                    nm = _norm_name(a.get("athlete", {}).get("displayName"))
-                    stats = a.get("stats") or []
-                    # Fallback guesses if headers are absent: many ESPN tables use fixed orders:
-                    # Common skater row order: MIN, G, A, SH, SOG, YC, RC, ...
-                    g   = _f(stats[idx["goals"]])   if "goals"   in idx and idx["goals"]   < len(stats) else (_f(stats[1]) if len(stats) > 1 else 0.0)
-                    ast = _f(stats[idx["assists"]]) if "assists" in idx and idx["assists"] < len(stats) else (_f(stats[2]) if len(stats) > 2 else 0.0)
-                    sh  = _f(stats[idx["shots"]])   if "shots"   in idx and idx["shots"]   < len(stats) else (_f(stats[3]) if len(stats) > 3 else np.nan)
-                    sog = _f(stats[idx["sog"]])     if "sog"     in idx and idx["sog"]     < len(stats) else (_f(stats[4]) if len(stats) > 4 else np.nan)
-                    yc  = _f(stats[idx["yc"]])      if "yc"      in idx and idx["yc"]      < len(stats) else (_f(stats[5]) if len(stats) > 5 else 0.0)
-                    rc  = _f(stats[idx["rc"]])      if "rc"      in idx and idx["rc"]      < len(stats) else (_f(stats[6]) if len(stats) > 6 else 0.0)
-                    if any(x > 0 for x in [g, ast, _f(sh if not np.isnan(sh) else 0), _f(sog if not np.isnan(sog) else 0), yc, rc]):
-                        rows.append({
-                            "Player": nm, "team": team_abbr,
-                            "goals": g, "assists": ast,
-                            "shots": sh, "sog": sog,
-                            "yc": yc, "rc": rc
-                        })
-    except Exception:
-        pass
+    s = datetime.strptime(start_ymd, "%Y/%m/%d").year
+    e = datetime.strptime(end_ymd, "%Y/%m/%d").year
+    years = list(range(min(s, e), max(s, e)+1))
+    # Also include +1 to capture spring if spanning autumn → spring
+    if e == s:
+        years.append(e+1)
+    return sorted(list(dict.fromkeys(years)))
 
-    if not rows:
-        return pd.DataFrame(columns=["Player","team","goals","assists","shots","sog","yc","rc"])
-    df = pd.DataFrame(rows)
-    num_cols = [c for c in df.columns if c not in ["Player","team"]]
-    return df.groupby(["Player","team"], as_index=False)[num_cols].sum(numeric_only=True)
-
-# ---------------- Aggregation over date range ----------------
+# ---------------- soccerdata / FBref loader ----------------
 @st.cache_data(show_spinner=True)
-def build_soccer_means(espn_key: str, start_slash: str, end_slash: str) -> pd.DataFrame:
-    dates = _dates_list(start_slash, end_slash)
-    events = list_soccer_events(espn_key, dates)
-    if not events:
+def build_soccer_means_fbref(fbref_league: str, start_slash: str, end_slash: str) -> pd.DataFrame:
+    """
+    Uses soccerdata.Fbref to pull player match logs for the league across seasons that
+    cover the desired date range, filters by date, and aggregates per-player per-game means/SDs.
+    """
+    if Fbref is None:
+        st.error("soccerdata not installed. Add 'soccerdata' to your requirements and restart.")
         return pd.DataFrame()
 
-    totals, sumsqs, games = {}, {}, {}
-    def init_p(p):
+    # Seasons to request (see helper above)
+    seasons = _season_list_for_dates(start_slash, end_slash)
+
+    # Read player match stats (standard table) → includes: date, player, team, gls, ast, sh, sog, crdy, crdr, etc.
+    try:
+        fb = Fbref(leagues=[fbref_league], seasons=seasons, data_dir=None)
+        df = fb.read_player_match_stats(stat_type="standard")
+    except Exception as e:
+        st.error(f"FBref read failed for {fbref_league}, seasons {seasons}: {e}")
+        return pd.DataFrame()
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # Normalize column names we need
+    # Typical FBref columns: 'date', 'player', 'team', 'gls', 'ast', 'sh', 'sot', 'crdy', 'crdr'
+    # Some installs may use full names; standardize to expected set.
+    cols = {c.lower(): c for c in df.columns}
+    def pick(*names):
+        for n in names:
+            if n in cols: return cols[n]
+        return None
+
+    col_date  = pick("date")
+    col_player= pick("player")
+    col_team  = pick("team","squad")
+    col_goals = pick("gls","goals")
+    col_ast   = pick("ast","assists")
+    col_sh    = pick("sh","shots")
+    col_sot   = pick("sot","shots_on_target","sot.1")
+    col_yc    = pick("crdy","cards_yellow","yellow_cards")
+    col_rc    = pick("crdr","cards_red","red_cards")
+    col_min   = pick("min","minutes")
+
+    need = [col_date, col_player, col_goals, col_ast, col_sh, col_sot, col_yc, col_rc]
+    if any(x is None for x in need):
+        st.error("FBref schema missing expected columns (date/player/goals/assists/shots/SoT/YC/RC).")
+        return pd.DataFrame()
+
+    df1 = df[[col_date, col_player, col_goals, col_ast, col_sh, col_sot, col_yc, col_rc] + ([col_team] if col_team else [])].copy()
+    df1.columns = ["date","player","goals","assists","shots","sog","yc","rc"] + (["team"] if col_team else [])
+    # Filter by date range
+    df1["date"] = pd.to_datetime(df1["date"], errors="coerce")
+    sdt = datetime.strptime(start_slash, "%Y/%m/%d")
+    edt = datetime.strptime(end_slash, "%Y/%m/%d") + timedelta(days=1)
+    df1 = df1[(df1["date"] >= sdt) & (df1["date"] < edt)].copy()
+    if df1.empty:
+        return pd.DataFrame()
+
+    # Coerce numerics
+    for c in ["goals","assists","shots","sog","yc","rc"]:
+        df1[c] = pd.to_numeric(df1[c], errors="coerce").fillna(0.0)
+
+    # Normalize names
+    df1["Player"] = df1["player"].astype(str).map(_norm_name)
+
+    # Build sums, sumsqs, and game count (appearance if any stat > 0)
+    totals: Dict[str, Dict[str, float]] = {}
+    sumsqs: Dict[str, Dict[str, float]] = {}
+    games: Dict[str, int] = {}
+
+    def pinit(p):
         if p not in totals:
             totals[p] = {"goals":0.0,"assists":0.0,"shots":0.0,"sog":0.0,"yc":0.0,"rc":0.0}
             sumsqs[p] = {k:0.0 for k in totals[p]}
             games[p]  = 0
 
-    prog = st.progress(0.0, text=f"Crawling {len(events)} matches…")
-    for j, ev in enumerate(events, 1):
-        box = fetch_box_soccer(espn_key, ev)
-        if box:
-            df = _parse_soccer_box(box)
-            for _, r in df.iterrows():
-                p = _norm_name(r["Player"]); init_p(p)
-                if any(_f(r.get(k, 0)) > 0 for k in totals[p].keys()):
-                    games[p] += 1
-                for k in totals[p]:
-                    v = _f(r.get(k, 0.0))
-                    totals[p][k] += 0.0 if np.isnan(v) else v
-                    sumsqs[p][k] += 0.0 if np.isnan(v) else (v*v)
-        prog.progress(j/len(events))
+    for _, r in df1.iterrows():
+        p = r["Player"]; pinit(p)
+        if any(float(r[k]) > 0 for k in totals[p].keys()):
+            games[p] += 1
+        for k in totals[p]:
+            v = float(r.get(k, 0.0))
+            totals[p][k] += v
+            sumsqs[p][k] += v*v
 
     rows = []
     for p, sums in totals.items():
@@ -205,6 +187,7 @@ def build_soccer_means(espn_key: str, start_slash: str, end_slash: str) -> pd.Da
             row[f"mu_{k}"] = s / g
             row[f"sd_{k}"] = _sd_from_sums(s, sumsqs[p][k], g, floor=0.25 if k in ["goals","assists"] else 0.6)
         rows.append(row)
+
     return pd.DataFrame(rows)
 
 # ---------------- Odds API helpers ----------------
@@ -231,26 +214,32 @@ st.header("1) League & Date Range")
 col0, col1, col2 = st.columns([1.6,1,1])
 with col0:
     league = st.selectbox("League", LEAGUES, format_func=lambda x: x[0])
-    LEAGUE_NAME, ESPN_KEY, ODDS_KEY = league
+    LEAGUE_NAME, FBREF_LEAGUE, ODDS_KEY = league
 with col1:
     start_date = st.text_input("Start (YYYY/MM/DD)", value=datetime.now().strftime("%Y/%m/01"))
 with col2:
     end_date   = st.text_input("End (YYYY/MM/DD)",   value=datetime.now().strftime("%Y/%m/%d"))
 
 # ---------------- Build projections ----------------
-st.header("2) Build per-player averages from ESPN")
+st.header("2) Build per-player averages from soccerdata / FBref")
 if st.button("📥 Build Soccer projections"):
-    soc = build_soccer_means(ESPN_KEY, start_date, end_date)
+    soc = build_soccer_means_fbref(FBREF_LEAGUE, start_date, end_date)
     if soc.empty:
-        st.error("No data returned from ESPN for this league/date window.")
+        st.error("No data returned from soccerdata/FBref for this league/date window.")
         st.stop()
     # Store
     st.session_state["soc_proj"] = soc.copy()
 
     # Preview: raw μ table
     with st.expander("Preview — Per-game averages (μ) & σ", expanded=False):
-        cols = ["Player","g","mu_goals","sd_goals","mu_assists","sd_assists","mu_shots","sd_shots","mu_sog","sd_sog","mu_yc","sd_yc","mu_rc","sd_rc"]
-        st.dataframe(soc[cols].sort_values("mu_goals", ascending=False).head(40), use_container_width=True)
+        cols = ["Player","g",
+                "mu_goals","sd_goals",
+                "mu_assists","sd_assists",
+                "mu_shots","sd_shots",
+                "mu_sog","sd_sog",
+                "mu_yc","sd_yc","mu_rc","sd_rc"]
+        view = [c for c in cols if c in soc.columns]
+        st.dataframe(soc[view].sort_values("mu_goals", ascending=False).head(50), use_container_width=True)
     st.success(f"Built projections for {len(soc)} players.")
 
 # ---------------- Odds API: pick match + markets ----------------
@@ -331,7 +320,8 @@ if st.button("🎲 Fetch lines & simulate (Soccer)"):
 
         # Yes/No markets
         if mkt == "player_goal_scorer_anytime":
-            lam = float(pr["mu_goals"])
+            lam = float(pr.get("mu_goals", np.nan))
+            if np.isnan(lam): continue
             p_yes = poisson_yes(lam)
             p = p_yes if side in ("Yes","Over") else (1.0 - p_yes)
             out.append({"market": mkt, "player": pl, "side": side, "line": None,
@@ -340,11 +330,11 @@ if st.button("🎲 Fetch lines & simulate (Soccer)"):
             continue
 
         if mkt in ("player_first_goal_scorer", "player_last_goal_scorer"):
-            # Conservative proxy: subset of anytime. You can refine with team goal models later.
-            lam = float(pr["mu_goals"])
+            lam = float(pr.get("mu_goals", np.nan))
+            if np.isnan(lam): continue
             p_any = poisson_yes(lam)
-            frac = 0.25  # ~ rough share
-            p = (p_any * frac)
+            frac = 0.25  # conservative share
+            p = p_any * frac
             p = p if side in ("Yes","Over") else (1.0 - p)
             out.append({"market": mkt, "player": pl, "side": side, "line": None,
                         "μ (per-game)": round(lam,3), "σ (per-game)": None,
@@ -352,8 +342,9 @@ if st.button("🎲 Fetch lines & simulate (Soccer)"):
             continue
 
         if mkt == "player_to_receive_card":
-            lam = float(pr["mu_yc"])
-            p_yes = min(0.95, max(0.0, lam))  # per-game yellow rate (bounded)
+            lam = float(pr.get("mu_yc", np.nan))
+            if np.isnan(lam): continue
+            p_yes = float(np.clip(lam, 0.0, 0.95))  # simple Bernoulli with cap
             p = p_yes if side in ("Yes","Over") else (1.0 - p_yes)
             out.append({"market": mkt, "player": pl, "side": side, "line": None,
                         "μ (per-game)": round(lam,3), "σ (per-game)": None,
@@ -361,8 +352,9 @@ if st.button("🎲 Fetch lines & simulate (Soccer)"):
             continue
 
         if mkt == "player_to_receive_red_card":
-            lam = float(pr["mu_rc"])
-            p_yes = min(0.50, max(0.0, lam))  # reds are rare; clamp to 50% ceiling
+            lam = float(pr.get("mu_rc", np.nan))
+            if np.isnan(lam): continue
+            p_yes = float(np.clip(lam, 0.0, 0.50))  # reds are rare; clamp to 50%
             p = p_yes if side in ("Yes","Over") else (1.0 - p_yes)
             out.append({"market": mkt, "player": pl, "side": side, "line": None,
                         "μ (per-game)": round(lam,3), "σ (per-game)": None,
@@ -371,11 +363,11 @@ if st.button("🎲 Fetch lines & simulate (Soccer)"):
 
         # Over/Under markets
         if mkt == "player_shots_on_target":
-            mu, sd = float(pr["mu_sog"]), float(pr["sd_sog"])
+            mu, sd = float(pr.get("mu_sog", np.nan)), float(pr.get("sd_sog", np.nan))
         elif mkt == "player_shots":
-            mu, sd = float(pr["mu_shots"]), float(pr["sd_shots"])
+            mu, sd = float(pr.get("mu_shots", np.nan)), float(pr.get("sd_shots", np.nan))
         elif mkt == "player_assists":
-            mu, sd = float(pr["mu_assists"]), float(pr["sd_assists"])
+            mu, sd = float(pr.get("mu_assists", np.nan)), float(pr.get("sd_assists", np.nan))
         else:
             continue
 
