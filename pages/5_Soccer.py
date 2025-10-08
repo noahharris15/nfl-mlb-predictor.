@@ -1,114 +1,86 @@
-# pages/5_Soccer.py
-# Soccer Player Props — Odds API + soccerdata (FBref) (per-game means; 10k sims)
-# Drop this file into your Streamlit "pages/" folder.
-# Requires: soccerdata (FBref backend)
+# pages/3_Soccer.py
+# Streamlit multi-page: Soccer props via The Odds API + soccerdata/FBref
+# Run whole app: streamlit run App.py
 
 import math
-import re
-import unicodedata
+import sys, subprocess, importlib
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from io import StringIO
+from typing import List, Optional, Dict
 
 import numpy as np
 import pandas as pd
+import streamlit as st
+from rapidfuzz import process, fuzz
 import requests
-import streamlit as st
-import sys, subprocess, importlib
-import streamlit as st
+import re
+import unicodedata
 
-def _ensure_pkg(pkg, spec=None):
-    """Try to import a package; if missing, install it, then import again."""
+# ----------------------- Robust auto-installs -----------------------
+def _ensure_pkg(pkg_name, pip_name=None):
     try:
-        importlib.import_module(pkg)
+        importlib.import_module(pkg_name)
         return True
     except ImportError:
-        if st.session_state.get(f"__installed_{pkg}", False):
-            return False  # avoid loops if install fails repeatedly
-        with st.spinner(f"Installing {pkg}…"):
-            cmd = [sys.executable, "-m", "pip", "install", spec or pkg]
+        if st.session_state.get(f"__installed_{pkg_name}", False):
+            return False
+        with st.spinner(f"Installing {pip_name or pkg_name}…"):
             try:
-                subprocess.check_call(cmd)
-                st.session_state[f"__installed_{pkg}"] = True
+                subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name or pkg_name])
+                st.session_state[f"__installed_{pkg_name}"] = True
                 importlib.invalidate_caches()
-                importlib.import_module(pkg)
+                importlib.import_module(pkg_name)
                 return True
             except Exception as e:
-                st.error(f"Auto-install failed for {pkg}: {e}")
+                st.error(f"Auto-install failed for {pip_name or pkg_name}: {e}")
                 return False
 
-# Ensure all needed packages are present
 ok = True
-ok &= _ensure_pkg("soccerdata", "soccerdata>=1.6")
-ok &= _ensure_pkg("beautifulsoup4", "beautifulsoup4>=4.12")
+ok &= _ensure_pkg("soccerdata", "soccerdata>=1.8.7")
+ok &= _ensure_pkg("bs4", "beautifulsoup4>=4.12")
 ok &= _ensure_pkg("lxml", "lxml>=4.9")
 ok &= _ensure_pkg("html5lib", "html5lib>=1.1")
-ok &= _ensure_pkg("requests_cache", "requests_cache>=0.9")
-
-# Show what versions we ended up with (helps debugging)
-try:
-    import importlib.metadata as md
-    st.caption(
-        "Packages → "
-        f"soccerdata {md.version('soccerdata')}, "
-        f"bs4 {md.version('beautifulsoup4')}, "
-        f"lxml {md.version('lxml')}, "
-        f"html5lib {md.version('html5lib')}, "
-        f"requests-cache {md.version('requests_cache')}"
-    )
-except Exception:
-    pass
-
+ok &= _ensure_pkg("requests_cache", "requests-cache>=1.2.1")
 if not ok:
     st.stop()
-# --- end drop-in block ---
-# ---- NEW: soccerdata (FBref) ----
-try:
-    from soccerdata import Fbref
-except Exception as e:
-    Fbref = None
 
-# ---------------- UI / constants ----------------
+from soccerdata import FBref  # now safe to import
+
+# ----------------------- Page setup -----------------------
 st.set_page_config(page_title="Soccer Player Props — Odds API + soccerdata", layout="wide")
-st.title("⚽ Soccer Player Props — Odds API + soccerdata (FBref)")
+st.title("⚽ Soccer Player Props — Odds API + soccerdata/FBref")
 
 SIM_TRIALS = 10_000
-
 VALID_MARKETS = [
-    # Yes/No
     "player_goal_scorer_anytime",
     "player_first_goal_scorer",
     "player_last_goal_scorer",
     "player_to_receive_card",
     "player_to_receive_red_card",
-    # O/U
     "player_shots_on_target",
     "player_shots",
     "player_assists",
 ]
 
-# League mapping: (UI name, FBref code for soccerdata, Odds API sport key)
-LEAGUES = [
-    ("English Premier League",   "ENG-Premier League",     "soccer_epl"),
-    ("La Liga (Spain)",          "ESP-La Liga",            "soccer_spain_la_liga"),
-    ("Serie A (Italy)",          "ITA-Serie A",            "soccer_italy_serie_a"),
-    ("Bundesliga (Germany)",     "GER-Bundesliga",         "soccer_germany_bundesliga"),
-    ("Ligue 1 (France)",         "FRA-Ligue 1",            "soccer_france_ligue_one"),
-    ("UEFA Champions League",    "UEFA-Champions League",  "soccer_uefa_champs_league"),
-    ("MLS (USA)",                "USA-MLS",                "soccer_usa_mls"),
-]
-
-# ---------------- Helpers ----------------
-def _norm_name(n: str) -> str:
+# ----------------------- Helpers -----------------------
+def normalize_name(n: str) -> str:
     n = str(n or "")
-    n = n.split("(")[0]
-    n = n.replace("-", " ")
+    n = n.replace("–","-")
     n = re.sub(r"[.,']", " ", n)
     n = re.sub(r"\s+", " ", n).strip()
-    return "".join(c for c in unicodedata.normalize("NFKD", n) if not unicodedata.combining(c))
+    n = "".join(c for c in unicodedata.normalize("NFKD", n) if not unicodedata.combining(c))
+    return n
 
-def _f(x) -> float:
-    try: return float(x)
-    except Exception: return float("nan")
+def fuzzy_pick(name: str, candidates: List[str], cutoff=86) -> Optional[str]:
+    if not candidates: return None
+    res = process.extractOne(normalize_name(name), [normalize_name(x) for x in candidates], scorer=fuzz.token_sort_ratio)
+    return candidates[res[2]] if res and res[1] >= cutoff else None
+
+def odds_get(url: str, params: dict) -> dict:
+    r = requests.get(url, params=params, timeout=25)
+    if r.status_code != 200:
+        raise requests.HTTPError(f"HTTP {r.status_code}: {r.text[:250]}")
+    return r.json()
 
 def t_over_prob(mu: float, sd: float, line: float, trials: int = SIM_TRIALS) -> float:
     sd = max(1e-6, float(sd))
@@ -116,319 +88,298 @@ def t_over_prob(mu: float, sd: float, line: float, trials: int = SIM_TRIALS) -> 
     return float((draws > line).mean())
 
 def poisson_yes(lam: float) -> float:
-    lam = max(1e-6, float(lam))
+    lam = max(1e-8, float(lam))
     return 1.0 - math.exp(-lam)
 
-def _sd_from_sums(sum_x, sum_x2, n, floor=0.1) -> float:
-    if n <= 1: return float("nan")
-    mean = sum_x / n
-    var = max((sum_x2 / n) - mean**2, 0.0)
-    var *= n / (n - 1)
-    return float(max(var**0.5, floor))
-
-def _season_list_for_dates(start_ymd: str, end_ymd: str) -> List[int]:
-    """
-    FBref seasons are labeled by the SPRING year (e.g., 2025 season spans ~Aug 2024–May 2025).
-    We'll include both start.year and end.year to be safe.
-    """
-    s = datetime.strptime(start_ymd, "%Y/%m/%d").year
-    e = datetime.strptime(end_ymd, "%Y/%m/%d").year
-    years = list(range(min(s, e), max(s, e)+1))
-    # Also include +1 to capture spring if spanning autumn → spring
-    if e == s:
-        years.append(e+1)
-    return sorted(list(dict.fromkeys(years)))
-
-# ---------------- soccerdata / FBref loader ----------------
-@st.cache_data(show_spinner=True)
-def build_soccer_means_fbref(fbref_league: str, start_slash: str, end_slash: str) -> pd.DataFrame:
-    """
-    Uses soccerdata.Fbref to pull player match logs for the league across seasons that
-    cover the desired date range, filters by date, and aggregates per-player per-game means/SDs.
-    """
-    if Fbref is None:
-        st.error("soccerdata not installed. Add 'soccerdata' to your requirements and restart.")
-        return pd.DataFrame()
-
-    # Seasons to request (see helper above)
-    seasons = _season_list_for_dates(start_slash, end_slash)
-
-    # Read player match stats (standard table) → includes: date, player, team, gls, ast, sh, sog, crdy, crdr, etc.
-    try:
-        fb = Fbref(leagues=[fbref_league], seasons=seasons, data_dir=None)
-        df = fb.read_player_match_stats(stat_type="standard")
-    except Exception as e:
-        st.error(f"FBref read failed for {fbref_league}, seasons {seasons}: {e}")
-        return pd.DataFrame()
-
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    # Normalize column names we need
-    # Typical FBref columns: 'date', 'player', 'team', 'gls', 'ast', 'sh', 'sot', 'crdy', 'crdr'
-    # Some installs may use full names; standardize to expected set.
-    cols = {c.lower(): c for c in df.columns}
-    def pick(*names):
-        for n in names:
-            if n in cols: return cols[n]
-        return None
-
-    col_date  = pick("date")
-    col_player= pick("player")
-    col_team  = pick("team","squad")
-    col_goals = pick("gls","goals")
-    col_ast   = pick("ast","assists")
-    col_sh    = pick("sh","shots")
-    col_sot   = pick("sot","shots_on_target","sot.1")
-    col_yc    = pick("crdy","cards_yellow","yellow_cards")
-    col_rc    = pick("crdr","cards_red","red_cards")
-    col_min   = pick("min","minutes")
-
-    need = [col_date, col_player, col_goals, col_ast, col_sh, col_sot, col_yc, col_rc]
-    if any(x is None for x in need):
-        st.error("FBref schema missing expected columns (date/player/goals/assists/shots/SoT/YC/RC).")
-        return pd.DataFrame()
-
-    df1 = df[[col_date, col_player, col_goals, col_ast, col_sh, col_sot, col_yc, col_rc] + ([col_team] if col_team else [])].copy()
-    df1.columns = ["date","player","goals","assists","shots","sog","yc","rc"] + (["team"] if col_team else [])
-    # Filter by date range
-    df1["date"] = pd.to_datetime(df1["date"], errors="coerce")
-    sdt = datetime.strptime(start_slash, "%Y/%m/%d")
-    edt = datetime.strptime(end_slash, "%Y/%m/%d") + timedelta(days=1)
-    df1 = df1[(df1["date"] >= sdt) & (df1["date"] < edt)].copy()
-    if df1.empty:
-        return pd.DataFrame()
-
-    # Coerce numerics
-    for c in ["goals","assists","shots","sog","yc","rc"]:
-        df1[c] = pd.to_numeric(df1[c], errors="coerce").fillna(0.0)
-
-    # Normalize names
-    df1["Player"] = df1["player"].astype(str).map(_norm_name)
-
-    # Build sums, sumsqs, and game count (appearance if any stat > 0)
-    totals: Dict[str, Dict[str, float]] = {}
-    sumsqs: Dict[str, Dict[str, float]] = {}
-    games: Dict[str, int] = {}
-
-    def pinit(p):
-        if p not in totals:
-            totals[p] = {"goals":0.0,"assists":0.0,"shots":0.0,"sog":0.0,"yc":0.0,"rc":0.0}
-            sumsqs[p] = {k:0.0 for k in totals[p]}
-            games[p]  = 0
-
-    for _, r in df1.iterrows():
-        p = r["Player"]; pinit(p)
-        if any(float(r[k]) > 0 for k in totals[p].keys()):
-            games[p] += 1
-        for k in totals[p]:
-            v = float(r.get(k, 0.0))
-            totals[p][k] += v
-            sumsqs[p][k] += v*v
-
-    rows = []
-    for p, sums in totals.items():
-        g = max(1, games.get(p, 0))
-        row = {"Player": p, "g": g}
-        for k, s in sums.items():
-            row[f"mu_{k}"] = s / g
-            row[f"sd_{k}"] = _sd_from_sums(s, sumsqs[p][k], g, floor=0.25 if k in ["goals","assists"] else 0.6)
-        rows.append(row)
-
-    return pd.DataFrame(rows)
-
-# ---------------- Odds API helpers ----------------
-def odds_get(url: str, params: dict) -> dict:
-    r = requests.get(url, params=params, timeout=30)
-    if r.status_code != 200:
-        raise requests.HTTPError(f"HTTP {r.status_code}: {r.text[:300]}")
-    return r.json()
-
-def list_soccer_events_odds(api_key: str, sport_key: str, lookahead_days: int, region: str):
-    return odds_get(
-        f"https://api.the-odds-api.com/v4/sports/{sport_key}/events",
-        {"apiKey": api_key, "daysFrom": 0, "daysTo": lookahead_days, "regions": region},
+# ----------------------- 1) Scope -----------------------
+st.header("1) Choose leagues & date window")
+cols = st.columns([1,1,1,1])
+with cols[0]:
+    # Common domestic leagues + MLS + UCL
+    leagues = st.multiselect(
+        "Leagues",
+        [
+            "ENG-Premier League",
+            "ESP-La Liga",
+            "ITA-Serie A",
+            "GER-Bundesliga",
+            "FRA-Ligue 1",
+            "USA-MLS",
+            "UEFA-Champions League",
+        ],
+        default=["ENG-Premier League"]
     )
+with cols[1]:
+    d1 = st.date_input("Start date", value=(datetime.utcnow() - timedelta(days=14)).date(), format="YYYY/MM/DD")
+with cols[2]:
+    d2 = st.date_input("End date", value=datetime.utcnow().date(), format="YYYY/MM/DD")
+with cols[3]:
+    minutes_floor = st.number_input("Min minutes to count a game", 1, 90, value=15)
 
-def fetch_event_props(api_key: str, sport_key: str, event_id: str, region: str, markets: List[str]):
-    return odds_get(
-        f"https://api.the-odds-api.com/v4/sports/{sport_key}/events/{event_id}/odds",
-        {"apiKey": api_key, "regions": region, "markets": ",".join(markets), "oddsFormat": "american"},
-    )
+st.caption("We compute **per-game averages** between these dates (inclusive).")
 
-# ---------------- UI: league + date range ----------------
-st.header("1) League & Date Range")
-col0, col1, col2 = st.columns([1.6,1,1])
-with col0:
-    league = st.selectbox("League", LEAGUES, format_func=lambda x: x[0])
-    LEAGUE_NAME, FBREF_LEAGUE, ODDS_KEY = league
-with col1:
-    start_date = st.text_input("Start (YYYY/MM/DD)", value=datetime.now().strftime("%Y/%m/01"))
-with col2:
-    end_date   = st.text_input("End (YYYY/MM/DD)",   value=datetime.now().strftime("%Y/%m/%d"))
-
-# ---------------- Build projections ----------------
+# ----------------------- 2) Build averages -----------------------
 st.header("2) Build per-player averages from soccerdata / FBref")
-if st.button("📥 Build Soccer projections"):
-    soc = build_soccer_means_fbref(FBREF_LEAGUE, start_date, end_date)
-    if soc.empty:
-        st.error("No data returned from soccerdata/FBref for this league/date window.")
+build = st.button("📥 Build Soccer projections")
+
+@st.cache_data(show_spinner=True)
+def fetch_fbref_player_game_logs(leagues: List[str], start_date: str, end_date: str) -> pd.DataFrame:
+    frames = []
+    for lg in leagues:
+        try:
+            # season string: FBref expects e.g. '2024-2025' but game logs carry dates; we’ll pull both current + prior season
+            this_year = datetime.strptime(start_date, "%Y-%m-%d").year
+            # Cover two adjacent seasons to be safe around summer breaks
+            seasons = [f"{this_year-1}-{this_year}", f"{this_year}-{this_year+1}"]
+            fb = FBref(leagues=[lg], seasons=seasons, no_cache=True)
+            # Player match logs (standard + shooting + passing + cards)
+            std = fb.read_player_match_stats(stat_type="standard")     # minutes, goals, cards (y/r)
+            shooting = fb.read_player_match_stats(stat_type="shooting") # shots, sot
+            passing = fb.read_player_match_stats(stat_type="passing")   # assists in standard too, but keep
+            # Merge on identifiers
+            df = std.merge(shooting, on=["player_id","player","date","team","opponent","competition","match_report"], how="left", suffixes=("","_shot"))
+            df = df.merge(passing[["player_id","date","team","assists"]], on=["player_id","date","team"], how="left")
+            df["league"] = lg
+            frames.append(df)
+        except Exception as e:
+            st.warning(f"FBref fetch warning for {lg}: {e}")
+    if not frames:
+        return pd.DataFrame()
+    all_df = pd.concat(frames, ignore_index=True)
+    # Date filter
+    all_df["date"] = pd.to_datetime(all_df["date"], errors="coerce")
+    mask = (all_df["date"] >= pd.to_datetime(start_date)) & (all_df["date"] <= pd.to_datetime(end_date))
+    return all_df.loc[mask].copy()
+
+@st.cache_data(show_spinner=False)
+def build_player_avgs(leagues: List[str], d1: datetime.date, d2: datetime.date, minutes_floor: int) -> pd.DataFrame:
+    logs = fetch_fbref_player_game_logs(leagues, str(d1), str(d2))
+    if logs.empty:
+        return pd.DataFrame()
+
+    # Defensive columns names vary by soccerdata version; normalize best-effort
+    # Standard table usually has:
+    # 'player','minutes','goals','assists','shots','shots_on_target','cards_yellow','cards_red'
+    rename_map = {
+        "minutes": "min",
+        "goals": "goals",
+        "assists": "assists",
+        "shots": "shots",
+        "shots_on_target": "sot",
+        "cards_yellow": "yc",
+        "cards_red": "rc",
+    }
+    # Coerce to numeric
+    for col in rename_map:
+        if col in logs.columns:
+            logs[col] = pd.to_numeric(logs[col], errors="coerce")
+    # Some versions label shots columns differently
+    for alt in ["sh", "shots total", "shots_total"]:
+        if "shots" not in logs.columns and alt in logs.columns:
+            logs["shots"] = pd.to_numeric(logs[alt], errors="coerce")
+    for alt in ["sot", "shots on target", "shots_on_target_total"]:
+        if "shots_on_target" not in logs.columns and alt in logs.columns:
+            logs["shots_on_target"] = pd.to_numeric(logs[alt], errors="coerce")
+    # Cards fallbacks
+    if "cards_yellow" not in logs.columns and "yellow_cards" in logs.columns:
+        logs["cards_yellow"] = pd.to_numeric(logs["yellow_cards"], errors="coerce")
+    if "cards_red" not in logs.columns and "red_cards" in logs.columns:
+        logs["cards_red"] = pd.to_numeric(logs["red_cards"], errors="coerce")
+
+    logs["min"] = pd.to_numeric(logs.get("minutes", logs.get("min", np.nan)), errors="coerce")
+    logs["player"] = logs["player"].astype(str)
+
+    use = logs[logs["min"].fillna(0) >= float(minutes_floor)].copy()
+    if use.empty:
+        return pd.DataFrame()
+
+    grp = use.groupby("player", dropna=False).agg(
+        g=("player","size"),
+        goals=("goals","sum"),
+        assists=("assists","sum"),
+        shots=("shots","sum"),
+        sot=("shots_on_target","sum"),
+        yc=("cards_yellow","sum"),
+        rc=("cards_red","sum"),
+        minutes=("min","sum"),
+    ).reset_index()
+
+    # Per-game averages
+    grp["mu_goals"] = grp["goals"] / grp["g"]
+    grp["mu_assists"] = grp["assists"] / grp["g"]
+    grp["mu_shots"] = grp["shots"] / grp["g"]
+    grp["mu_sot"] = grp["sot"] / grp["g"]
+    grp["mu_yc"] = grp["yc"] / grp["g"]
+    grp["mu_rc"] = grp["rc"] / grp["g"]
+
+    # SDs for O/U (empirical with Bessel)
+    def sd_from_logs(name):
+        s = use.groupby("player")[name].std(ddof=1)
+        return s
+
+    for col, out in [("shots","sd_shots"), ("shots_on_target","sd_sot"), ("assists","sd_ast")]:
+        if col in use.columns:
+            s = sd_from_logs(col)
+            grp[out] = grp["player"].map(s).fillna(1.0) * 1.05
+        else:
+            grp[out] = 1.0
+
+    grp.rename(columns={"player":"Player"}, inplace=True)
+    grp["Player_norm"] = grp["Player"].map(normalize_name)
+    return grp
+
+if build:
+    avgs = build_player_avgs(leagues, d1, d2, minutes_floor)
+    if avgs.empty:
+        st.error("No data returned from soccerdata/FBref for this selection.")
         st.stop()
-    # Store
-    st.session_state["soc_proj"] = soc.copy()
+    st.session_state["soccer_avgs"] = avgs
+    st.success(f"Built {len(avgs)} per-player averages.")
+    st.dataframe(avgs[["Player","g","mu_goals","mu_assists","mu_shots","mu_sot","mu_yc","mu_rc"]]
+                 .sort_values("g", ascending=False).head(50),
+                 use_container_width=True)
 
-    # Preview: raw μ table
-    with st.expander("Preview — Per-game averages (μ) & σ", expanded=False):
-        cols = ["Player","g",
-                "mu_goals","sd_goals",
-                "mu_assists","sd_assists",
-                "mu_shots","sd_shots",
-                "mu_sog","sd_sog",
-                "mu_yc","sd_yc","mu_rc","sd_rc"]
-        view = [c for c in cols if c in soc.columns]
-        st.dataframe(soc[view].sort_values("mu_goals", ascending=False).head(50), use_container_width=True)
-    st.success(f"Built projections for {len(soc)} players.")
-
-# ---------------- Odds API: pick match + markets ----------------
-st.header("3) Pick a match & markets from The Odds API")
+# ----------------------- 3) Odds API game picker -----------------------
+st.header("3) Pick a game & markets from The Odds API")
 api_key = (st.secrets.get("odds_api_key") if hasattr(st, "secrets") else None) or st.text_input(
     "Odds API Key (kept local to your session)", value="", type="password"
 )
 region = st.selectbox("Region", ["us","us2","eu","uk"], index=0)
-lookahead = st.slider("Lookahead days", 0, 7, value=2)
+lookahead = st.slider("Lookahead days", 0, 7, value=1)
 markets = st.multiselect("Markets to fetch", VALID_MARKETS, default=VALID_MARKETS)
+
+def list_soccer_events(api_key: str, lookahead_days: int, region: str):
+    # Use generic soccer endpoint (covers top leagues; Odds API groups many under soccer)
+    return odds_get("https://api.the-odds-api.com/v4/sports/soccer/events",
+                    {"apiKey": api_key, "daysFrom": 0, "daysTo": lookahead_days, "regions": region})
+
+def fetch_event_props(api_key: str, event_id: str, region: str, markets: List[str]):
+    return odds_get(f"https://api.the-odds-api.com/v4/sports/soccer/events/{event_id}/odds",
+                    {"apiKey": api_key, "regions": region, "markets": ",".join(markets), "oddsFormat": "american"})
 
 events = []
 if api_key:
     try:
-        events = list_soccer_events_odds(api_key, ODDS_KEY, lookahead, region)
+        events = list_soccer_events(api_key, lookahead, region)
     except Exception as e:
         st.error(f"Events fetch error: {e}")
 
 if not events:
-    st.info("Enter your Odds API key to list matches in this league.")
+    st.info("Enter your Odds API key and pick a lookahead to list soccer matches.")
     st.stop()
 
-labels = [f'{e["away_team"]} @ {e["home_team"]} — {e.get("commence_time","")}' for e in events]
-pick = st.selectbox("Match", labels)
-event = events[labels.index(pick)]
+event_labels = [f'{e["away_team"]} @ {e["home_team"]} — {e.get("commence_time","")}' for e in events]
+pick = st.selectbox("Match", event_labels)
+event = events[event_labels.index(pick)]
 event_id = event["id"]
 
-# ---------------- Simulate ----------------
+# ----------------------- 4) Simulate -----------------------
 st.header("4) Fetch lines & simulate")
-if st.button("🎲 Fetch lines & simulate (Soccer)"):
-    proj = st.session_state.get("soc_proj", pd.DataFrame())
-    if proj.empty:
+go = st.button("🎲 Fetch lines & simulate (Soccer)")
+
+if go:
+    avgs = st.session_state.get("soccer_avgs", pd.DataFrame())
+    if avgs.empty:
         st.warning("Build Soccer projections first (Step 2).")
         st.stop()
 
-    # index by normalized name
-    proj = proj.copy()
-    proj["PN"] = proj["Player"].apply(_norm_name)
-    proj.set_index("PN", inplace=True)
-
     try:
-        odds = fetch_event_props(api_key, ODDS_KEY, event_id, region, markets)
+        data = fetch_event_props(api_key, event_id, region, markets)
     except Exception as e:
         st.error(f"Props fetch failed: {e}")
         st.stop()
 
+    # Flatten bookmaker outcomes, median line per (market, player, side)
     rows = []
-    for bk in odds.get("bookmakers", []):
+    for bk in data.get("bookmakers", []):
         for m in bk.get("markets", []):
-            key = m.get("key")
+            mkey = str(m.get("key"))
             for o in m.get("outcomes", []):
-                name = _norm_name(o.get("description"))
-                side = o.get("name")
+                name = normalize_name(o.get("description") or o.get("participant") or "")
+                side = o.get("name")  # Over/Under or Yes/No
                 point = o.get("point")
-                if key not in VALID_MARKETS or not name or not side:
+                if mkey not in VALID_MARKETS or not name or not side:
                     continue
                 rows.append({
-                    "market": key,
-                    "player": name,
+                    "market": mkey,
+                    "player_norm": name,
                     "side": side,
-                    "point": None if point is None else float(point),
+                    "point": (None if point is None else float(point)),
                 })
     if not rows:
-        st.warning("No player outcomes returned for these markets.")
+        st.warning("No player outcomes returned for selected markets.")
         st.stop()
 
-    props = (pd.DataFrame(rows)
-             .groupby(["market","player","side"], as_index=False)
-             .agg(line=("point","median"), books=("point","size")))
+    props_df = (pd.DataFrame(rows)
+                .groupby(["market","player_norm","side"], as_index=False)
+                .agg(line=("point","median"), n_books=("point","size")))
 
+    # Prepare name matching
+    name_map = dict(zip(avgs["Player_norm"], avgs["Player"]))
     out = []
 
-    for _, r in props.iterrows():
-        pl, mkt, side, line = r["player"], r["market"], r["side"], r["line"]
-        if pl not in proj.index:
+    for _, r in props_df.iterrows():
+        market, pnorm, side, line = r["market"], r["player_norm"], r["side"], r["line"]
+        # Direct match or fuzzy
+        match_key = pnorm if pnorm in name_map else fuzzy_pick(pnorm, list(name_map.keys()), cutoff=86)
+        if not match_key:
             continue
-        pr = proj.loc[pl]
+        player = name_map[match_key]
+        row = avgs.loc[avgs["Player"] == player].iloc[0]
 
-        # Yes/No markets
-        if mkt == "player_goal_scorer_anytime":
-            lam = float(pr.get("mu_goals", np.nan))
-            if np.isnan(lam): continue
-            p_yes = poisson_yes(lam)
-            p = p_yes if side in ("Yes","Over") else (1.0 - p_yes)
-            out.append({"market": mkt, "player": pl, "side": side, "line": None,
-                        "μ (per-game)": round(lam,3), "σ (per-game)": None,
-                        "Win Prob %": round(100*p,2), "books": int(r["books"])})
-            continue
+        # Build model inputs from per-game averages
+        if market == "player_shots" and pd.notna(line):
+            mu = float(row["mu_shots"]); sd = float(row["sd_shots"])
+            p_over = t_over_prob(mu, sd, float(line), SIM_TRIALS)
+            p = p_over if side == "Over" else 1.0 - p_over
+            out.append({"market":market,"player":player,"side":side,"line":line,
+                        "μ (per-game)":round(mu,2),"σ (per-game)":round(sd,2),"Win Prob %":round(100*p,2),"books":int(r["n_books"])})
 
-        if mkt in ("player_first_goal_scorer", "player_last_goal_scorer"):
-            lam = float(pr.get("mu_goals", np.nan))
-            if np.isnan(lam): continue
+        elif market == "player_shots_on_target" and pd.notna(line):
+            mu = float(row["mu_sot"]); sd = float(row["sd_sot"])
+            p_over = t_over_prob(mu, sd, float(line), SIM_TRIALS)
+            p = p_over if side == "Over" else 1.0 - p_over
+            out.append({"market":market,"player":player,"side":side,"line":line,
+                        "μ (per-game)":round(mu,2),"σ (per-game)":round(sd,2),"Win Prob %":round(100*p,2),"books":int(r["n_books"])})
+
+        elif market == "player_assists" and pd.notna(line):
+            mu = float(row["mu_assists"]); sd = float(row["sd_ast"])
+            p_over = t_over_prob(mu, sd, float(line), SIM_TRIALS)
+            p = p_over if side == "Over" else 1.0 - p_over
+            out.append({"market":market,"player":player,"side":side,"line":line,
+                        "μ (per-game)":round(mu,3),"σ (per-game)":round(sd,3),"Win Prob %":round(100*p,2),"books":int(r["n_books"])})
+
+        elif market in ("player_goal_scorer_anytime","player_first_goal_scorer","player_last_goal_scorer"):
+            # Poisson for goals per game; “first/last” approximated by scaling anytime (heuristic)
+            lam = float(row["mu_goals"])
             p_any = poisson_yes(lam)
-            frac = 0.25  # conservative share
-            p = p_any * frac
-            p = p if side in ("Yes","Over") else (1.0 - p)
-            out.append({"market": mkt, "player": pl, "side": side, "line": None,
-                        "μ (per-game)": round(lam,3), "σ (per-game)": None,
-                        "Win Prob %": round(100*p,2), "books": int(r["books"])})
-            continue
+            if market == "player_goal_scorer_anytime":
+                p = p_any if side in ("Yes","Over") else (1.0 - p_any)
+            else:
+                # crude: assume first/last ≈ p_any * 0.35 (depends on team scoring share & match pace)
+                scale = 0.35
+                p_fl = min(max(p_any * scale, 0.0), 1.0)
+                p = p_fl if side in ("Yes","Over") else (1.0 - p_fl)
+            out.append({"market":market,"player":player,"side":side,"line":None,
+                        "μ (per-game)":round(lam,3),"σ (per-game)":None,"Win Prob %":round(100*p,2),"books":int(r["n_books"])})
 
-        if mkt == "player_to_receive_card":
-            lam = float(pr.get("mu_yc", np.nan))
-            if np.isnan(lam): continue
-            p_yes = float(np.clip(lam, 0.0, 0.95))  # simple Bernoulli with cap
-            p = p_yes if side in ("Yes","Over") else (1.0 - p_yes)
-            out.append({"market": mkt, "player": pl, "side": side, "line": None,
-                        "μ (per-game)": round(lam,3), "σ (per-game)": None,
-                        "Win Prob %": round(100*p,2), "books": int(r["books"])})
-            continue
+        elif market == "player_to_receive_card":
+            lam = float(row["mu_yc"])
+            p = poisson_yes(lam) if side in ("Yes","Over") else (1.0 - poisson_yes(lam))
+            out.append({"market":market,"player":player,"side":side,"line":None,
+                        "μ (per-game)":round(lam,3),"σ (per-game)":None,"Win Prob %":round(100*p,2),"books":int(r["n_books"])})
 
-        if mkt == "player_to_receive_red_card":
-            lam = float(pr.get("mu_rc", np.nan))
-            if np.isnan(lam): continue
-            p_yes = float(np.clip(lam, 0.0, 0.50))  # reds are rare; clamp to 50%
-            p = p_yes if side in ("Yes","Over") else (1.0 - p_yes)
-            out.append({"market": mkt, "player": pl, "side": side, "line": None,
-                        "μ (per-game)": round(lam,3), "σ (per-game)": None,
-                        "Win Prob %": round(100*p,2), "books": int(r["books"])})
-            continue
+        elif market == "player_to_receive_red_card":
+            lam = float(row["mu_rc"])
+            p = poisson_yes(lam) if side in ("Yes","Over") else (1.0 - poisson_yes(lam))
+            out.append({"market":market,"player":player,"side":side,"line":None,
+                        "μ (per-game)":round(lam,4),"σ (per-game)":None,"Win Prob %":round(100*p,2),"books":int(r["n_books"])})
 
-        # Over/Under markets
-        if mkt == "player_shots_on_target":
-            mu, sd = float(pr.get("mu_sog", np.nan)), float(pr.get("sd_sog", np.nan))
-        elif mkt == "player_shots":
-            mu, sd = float(pr.get("mu_shots", np.nan)), float(pr.get("sd_shots", np.nan))
-        elif mkt == "player_assists":
-            mu, sd = float(pr.get("mu_assists", np.nan)), float(pr.get("sd_assists", np.nan))
         else:
             continue
 
-        if line is None or np.isnan(mu) or np.isnan(sd):
-            continue
-        p_over = t_over_prob(mu, sd, float(line), SIM_TRIALS)
-        p = p_over if side == "Over" else (1.0 - p_over)
-
-        out.append({"market": mkt, "player": pl, "side": side, "line": float(line),
-                    "μ (per-game)": round(mu,2), "σ (per-game)": round(sd,2),
-                    "Win Prob %": round(100*p,2), "books": int(r["books"])})
-
     if not out:
-        st.warning("No matched props to simulate.")
+        st.warning("Could not match props to any players with averages.")
         st.stop()
 
     results = (pd.DataFrame(out)
@@ -436,19 +387,24 @@ if st.button("🎲 Fetch lines & simulate (Soccer)"):
                .sort_values(["market","Win Prob %"], ascending=[True, False])
                .reset_index(drop=True))
 
-    cfg = {
-        "player": st.column_config.TextColumn("Player", width="large"),
+    st.subheader("Results")
+    colcfg = {
+        "player": st.column_config.TextColumn("Player", width="medium"),
         "side": st.column_config.TextColumn("Side", width="small"),
         "line": st.column_config.NumberColumn("Line", format="%.2f"),
-        "μ (per-game)": st.column_config.NumberColumn("μ (per-game)", format="%.2f"),
-        "σ (per-game)": st.column_config.NumberColumn("σ (per-game)", format="%.2f"),
+        "μ (per-game)": st.column_config.NumberColumn("μ (per-game)", format="%.3f"),
+        "σ (per-game)": st.column_config.NumberColumn("σ (per-game)", format="%.3f"),
         "Win Prob %": st.column_config.ProgressColumn("Win Prob %", format="%.2f%%", min_value=0, max_value=100),
         "books": st.column_config.NumberColumn("#Books", width="small"),
     }
-    st.subheader(f"Results — {LEAGUE_NAME}")
-    st.dataframe(results, use_container_width=True, hide_index=True, column_config=cfg)
+    st.dataframe(results, use_container_width=True, hide_index=True, column_config=colcfg)
+
+    # Quick “Top Picks” chart (excluding Yes/No with no line is fine)
+    top = results.sort_values("Win Prob %", ascending=False).head(15)
+    st.bar_chart(top.set_index("player")["Win Prob %"], use_container_width=True)
+
     st.download_button(
-        "⬇️ Download Soccer results CSV",
+        "⬇️ Download results CSV",
         results.to_csv(index=False).encode("utf-8"),
         file_name="soccer_props_results.csv",
         mime="text/csv",
