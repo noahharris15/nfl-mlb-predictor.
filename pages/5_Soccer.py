@@ -13,7 +13,54 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import sys, subprocess, importlib
+import streamlit as st
 
+def _ensure_pkg(pkg, spec=None):
+    """Try to import a package; if missing, install it, then import again."""
+    try:
+        importlib.import_module(pkg)
+        return True
+    except ImportError:
+        if st.session_state.get(f"__installed_{pkg}", False):
+            return False  # avoid loops if install fails repeatedly
+        with st.spinner(f"Installing {pkg}…"):
+            cmd = [sys.executable, "-m", "pip", "install", spec or pkg]
+            try:
+                subprocess.check_call(cmd)
+                st.session_state[f"__installed_{pkg}"] = True
+                importlib.invalidate_caches()
+                importlib.import_module(pkg)
+                return True
+            except Exception as e:
+                st.error(f"Auto-install failed for {pkg}: {e}")
+                return False
+
+# Ensure all needed packages are present
+ok = True
+ok &= _ensure_pkg("soccerdata", "soccerdata>=1.6")
+ok &= _ensure_pkg("beautifulsoup4", "beautifulsoup4>=4.12")
+ok &= _ensure_pkg("lxml", "lxml>=4.9")
+ok &= _ensure_pkg("html5lib", "html5lib>=1.1")
+ok &= _ensure_pkg("requests_cache", "requests_cache>=0.9")
+
+# Show what versions we ended up with (helps debugging)
+try:
+    import importlib.metadata as md
+    st.caption(
+        "Packages → "
+        f"soccerdata {md.version('soccerdata')}, "
+        f"bs4 {md.version('beautifulsoup4')}, "
+        f"lxml {md.version('lxml')}, "
+        f"html5lib {md.version('html5lib')}, "
+        f"requests-cache {md.version('requests_cache')}"
+    )
+except Exception:
+    pass
+
+if not ok:
+    st.stop()
+# --- end drop-in block ---
 # ---- NEW: soccerdata (FBref) ----
 try:
     from soccerdata import Fbref
