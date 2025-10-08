@@ -4,4 +4,4 @@ numpy
 requests
 rapidfuzz
 nfl_data_py
-soccerdata
+soccerdata>=1.6
