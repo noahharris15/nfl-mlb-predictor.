@@ -1,8 +1,8 @@
 # NBA Player Props — Odds API + NBA Stats (nba_api), per-game averages + 10k sims
 # Place this file at: pages/1_NBA.py
-# IMPORTANT: Do NOT call st.set_page_config here (it's in app.py / NFL page).
+# IMPORTANT: Do NOT call st.set_page_config here (it's in your main app).
 
-import re, unicodedata, datetime as dt
+import re, unicodedata, datetime as dt, time, random
 from typing import List, Optional, Dict, Tuple
 
 import numpy as np
@@ -69,11 +69,10 @@ def t_over_prob(mu: float, sd: float, line: float, trials: int = SIM_TRIALS) -> 
 
 def sample_sd(sum_x: float, sum_x2: float, g: int, floor: float = 0.0) -> float:
     g = int(g)
-    if g <= 1:
-        return float("nan")
+    if g <= 1: return float("nan")
     mean = sum_x / g
-    var = (sum_x2 / g) - (mean ** 2)
-    var = var * (g / (g - 1))
+    var  = (sum_x2 / g) - (mean**2)
+    var  = var * (g / (g - 1))
     return float(max(np.sqrt(max(var, 1e-9)), floor))
 
 # ------------------ NBA Stats helpers ------------------
@@ -82,47 +81,52 @@ def _players_index() -> pd.DataFrame:
     # index of all players: id, full_name, first, last
     plist = nba_players.get_players()
     df = pd.DataFrame(plist)
-    # normalize a few keys for lookup
-    df["name_norm"] = df["full_name"].apply(normalize_name)
+    df["name_norm"]  = df["full_name"].apply(normalize_name)
     df["first_norm"] = df["first_name"].apply(normalize_name)
     df["last_norm"]  = df["last_name"].apply(normalize_name)
     return df[["id","full_name","name_norm","first_norm","last_norm"]]
 
 def find_player_id_by_name(name: str) -> Optional[int]:
+    """Robust matcher: handles initials, partials, accents, suffixes."""
     df = _players_index()
     n = normalize_name(name)
-    # exact match
+    parts = n.split()
+
+    # Exact full-name match
     hit = df.loc[df["name_norm"] == n]
     if not hit.empty:
         return int(hit.iloc[0]["id"])
-    # fallback: last-name contains + first initial
-    parts = n.split()
-    if len(parts) >= 2:
-        first, last = parts[0], parts[-1]
-        hit = df.loc[(df["last_norm"] == last) & (df["first_norm"].str.startswith(first[:1]))]
-        if not hit.empty:
-            return int(hit.iloc[0]["id"])
-    # final fallback: contains
-    hit = df.loc[df["name_norm"].str.contains(last if len(parts) else n)]
-    if not hit.empty:
-        return int(hit.iloc[0]["id"])
+
+    # Common "A. Lastname" or short forms
+    if len(parts) == 2:
+        first, last = parts
+        cand = df.loc[df["last_norm"].str.startswith(last)]
+        if cand.empty:
+            cand = df.loc[df["last_norm"].str.contains(last)]
+        if not cand.empty:
+            cand = cand.loc[cand["first_norm"].str.startswith(first[:1]) | cand["first_norm"].str.contains(first)]
+            if not cand.empty:
+                return int(cand.iloc[0]["id"])
+
+    # Loose fallback: last name substring
+    last = parts[-1] if parts else n
+    cand = df.loc[df["name_norm"].str.contains(last)]
+    if not cand.empty:
+        return int(cand.iloc[0]["id"])
+
     return None
 
 def fetch_player_gamelog_df(player_id: int, season: str, season_type: str) -> pd.DataFrame:
-    # Live fetch every time (no cache), per user request
+    # nba_api is rate-limited; add a small jitter to be polite.
+    time.sleep(0.25 + random.random()*0.15)
     gl = playergamelog.PlayerGameLog(player_id=player_id, season=season, season_type_all_star=season_type)
     df = gl.get_data_frames()[0]
-    # Normalize columns we need
-    # Columns include: GAME_DATE, PTS, REB, AST, STL, BLK, TOV, FG3M, FGM, FGA, FTM, FTA
     if "GAME_DATE" in df.columns:
         df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
     return df
 
-def agg_stats_in_range(df: pd.DataFrame, start: dt.date, end: dt.date) -> Dict[str, float]:
-    # Filter by date range inclusive
-    if "GAME_DATE" in df.columns:
-        mask = (df["GAME_DATE"] >= pd.Timestamp(start)) & (df["GAME_DATE"] <= pd.Timestamp(end))
-        df = df.loc[mask].copy()
+def agg_full_season(df: pd.DataFrame) -> Dict[str, float]:
+    """Compute full-season per-game means & SDs from NBA game log df."""
     g = int(df.shape[0])
     if g == 0:
         return {"g": 0}
@@ -143,28 +147,42 @@ def agg_stats_in_range(df: pd.DataFrame, start: dt.date, end: dt.date) -> Dict[s
         out["sd_"+col] = sample_sd(sums[col], sums["sq_"+col], g, floor=0.0)
     return out
 
-# ------------------ UI: date scope ------------------
-st.markdown("### 1) Pick a season & date range")
-season_year = st.number_input("Season start year (e.g., 2024 for 2024-25)", 2015, 2100, 2025, step=1)
-season_str = f"{season_year}-{str(season_year+1)[-2:]}"
-season_type = st.selectbox("Season Type", ["Regular Season", "Playoffs"], index=0)
+def detect_season_with_one_week_rule() -> str:
+    """
+    Use 2024-25 by default. Switch to 2025-26 only if >= 7 distinct game dates
+    are available for any of a few headline players (robustness).
+    """
+    # Base/fallback season
+    fallback = "2024-25"
 
-# flexible dates inside the season
-default_start = dt.date(season_year, 10, 1)
-default_end   = dt.date(season_year+1, 6, 30)
-start_date, end_date = st.date_input("Dates (inclusive)", (default_start, default_end), format="YYYY-MM-DD")
+    today = dt.date.today()
+    # Only consider upgrading in Oct or later.
+    if today.month < 10:
+        return fallback
 
-# ------------------ Build projections (live from NBA Stats) ------------------
-st.markdown("### 2) Build per-player projections from NBA Stats (live)")
-st.caption("We’ll only build projections **for players who appear in the selected game’s props** (fast). Choose the game below first, then click build.")
+    # Sample a few stable players
+    sample_ids = [201939, 2544, 1628369]  # Curry, LeBron, Tatum
+    try:
+        for pid in sample_ids:
+            df = fetch_player_gamelog_df(pid, "2025-26", "Regular Season")
+            if "GAME_DATE" in df.columns and df["GAME_DATE"].nunique() >= 7:
+                return "2025-26"
+    except Exception:
+        pass
+    return fallback
+
+# ------------------ UI: season choice (auto with 1-week rule) ------------------
+st.markdown("### 1) Season (auto with 1-week rule)")
+season_locked = detect_season_with_one_week_rule()
+st.caption(f"Using NBA season: **{season_locked}** (will switch to the new season only after ≥ 7 distinct game dates exist)")
 
 # ------------------ Odds API ------------------
-st.markdown("### 3) Pick a game & markets (Odds API)")
-api_key = (st.secrets.get("odds_api_key") if hasattr(st, "secrets") else None) or st.text_input(
-    "Odds API Key (kept local to your session)", value="", type="password"
-)
+st.markdown("### 2) Pick a game & markets (Odds API)")
+api_key = st.text_input("Odds API Key (kept local to your session)", value="", type="password")
 region = st.selectbox("Region", ["us","us2","eu","uk"], index=0)
 lookahead = st.slider("Lookahead days", 0, 7, value=1)
+
+# Show all markets to pick; we’ll hide unsupported ones later automatically
 markets_pickable = VALID_MARKETS + sorted(list(UNSUPPORTED_MARKETS_HIDE))
 markets = st.multiselect("Markets to fetch", markets_pickable, default=VALID_MARKETS)
 
@@ -199,45 +217,62 @@ event = events[event_labels.index(pick)]
 event_id = event["id"]
 
 # ------------------ Build projections for players in this event ------------------
-if st.button("📥 Build NBA projections (from NBA Stats)"):
+st.markdown("### 3) Build per-player projections from NBA Stats (full season averages)")
+build = st.button("📥 Build NBA projections")
+
+if build:
+    # Pull props once to know which players to build
     try:
-        # Pull props once to know which players to build
         data_preview = fetch_event_props(api_key, event_id, region, list(set(markets)))
     except Exception as e:
         st.error(f"Props fetch failed: {e}")
         st.stop()
 
-    # Collect unique player names appearing in outcomes
+    # Collect unique player names appearing in outcomes (skip markets with no players)
     player_names = set()
     for bk in data_preview.get("bookmakers", []):
         for m in bk.get("markets", []):
-            for o in m.get("outcomes", []):
+            if m.get("key") in UNSUPPORTED_MARKETS_HIDE:
+                continue
+            for o in m.get("outcomes", []) or []:
                 nm = normalize_name(o.get("description"))
-                if nm:
-                    player_names.add(nm)
+                if nm: player_names.add(nm)
+
+    # Fallback: try core markets if nothing came back for the user’s selection
+    if not player_names:
+        core = ["player_points","player_rebounds","player_assists","player_threes"]
+        try:
+            data_core = fetch_event_props(api_key, event_id, region, core)
+            for bk in data_core.get("bookmakers", []):
+                for m in bk.get("markets", []):
+                    for o in m.get("outcomes", []) or []:
+                        nm = normalize_name(o.get("description"))
+                        if nm: player_names.add(nm)
+        except Exception:
+            pass
 
     if not player_names:
-        st.warning("No player names found in props; try different markets.")
+        st.warning("No player names found in props for this game. Try adding core markets (points/reb/ast/threes).")
         st.stop()
 
-    # Build projections by fetching game logs for each player
     rows = []
     missing_map = {}
-    st.write(f"Found **{len(player_names)}** players in props. Pulling NBA logs live…")
+
+    st.write(f"Found **{len(player_names)}** players in props. Building **{season_locked}** averages…")
     for pn in sorted(player_names):
         pid = find_player_id_by_name(pn)
         if not pid:
             missing_map[pn] = "player_id_not_found"
             continue
         try:
-            gldf = fetch_player_gamelog_df(pid, season_str, season_type)
+            gldf = fetch_player_gamelog_df(pid, season_locked, "Regular Season")
         except Exception as e:
-            missing_map[pn] = f"log_error: {e}"
+            missing_map[pn] = f"log_error: {str(e)[:120]}"
             continue
 
-        ag = agg_stats_in_range(gldf, start_date, end_date)
+        ag = agg_full_season(gldf)
         if ag["g"] == 0:
-            missing_map[pn] = "no_games_in_range"
+            missing_map[pn] = "no_games_in_season"
             continue
 
         rows.append({
@@ -254,25 +289,25 @@ if st.button("📥 Build NBA projections (from NBA Stats)"):
         })
 
     if missing_map:
-        with st.expander("⚠️ Players not built (ID not found / no games):"):
+        with st.expander("⚠️ Players not built (ID not found / no season games):"):
             st.json(missing_map)
 
     if not rows:
-        st.error("No projections built. Try a different game/date range.")
+        st.error("No projections built. Try a different game.")
         st.stop()
 
     st.session_state["nba_proj"] = pd.DataFrame(rows)
-    st.success("Built projections from NBA Stats.")
+    st.success("Built projections from NBA Stats (full season).")
     st.dataframe(st.session_state["nba_proj"].head(25), use_container_width=True)
 
 # ------------------ Simulate ------------------
-st.markdown("### 4) Fetch lines & simulate")
+st.markdown("### 4) Fetch lines & simulate (10k draws)")
 go = st.button("Fetch lines & simulate (NBA)")
 
 if go:
     proj = st.session_state.get("nba_proj", pd.DataFrame())
     if proj.empty:
-        st.warning("Build NBA projections first (Step 2)."); st.stop()
+        st.warning("Build NBA projections first (Step 3)."); st.stop()
 
     try:
         data = fetch_event_props(api_key, event_id, region, list(set(markets)))
@@ -289,14 +324,13 @@ if go:
     for bk in data.get("bookmakers", []):
         for m in bk.get("markets", []):
             mkey = m.get("key")
-            for o in m.get("outcomes", []):
+            if mkey in UNSUPPORTED_MARKETS_HIDE:
+                continue
+            for o in m.get("outcomes", []) or []:
                 name = normalize_name(o.get("description"))
                 side = o.get("name")
                 point = o.get("point")
-                if not name or mkey in UNSUPPORTED_MARKETS_HIDE:
-                    continue
-                # only keep simulated markets
-                if mkey not in VALID_MARKETS:
+                if not name or mkey not in VALID_MARKETS:
                     continue
                 rows.append({
                     "market": mkey,
@@ -324,26 +358,16 @@ if go:
         mu = sd = raw = None
 
         # Singles
-        if mkt == "player_points":
-            raw, mu, sd = row["mu_pts"], row["mu_pts"], row["sd_pts"]
-        elif mkt == "player_rebounds":
-            raw, mu, sd = row["mu_reb"], row["mu_reb"], row["sd_reb"]
-        elif mkt == "player_assists":
-            raw, mu, sd = row["mu_ast"], row["mu_ast"], row["sd_ast"]
-        elif mkt == "player_threes":
-            raw, mu, sd = row["mu_tpm"], row["mu_tpm"], row["sd_tpm"]
-        elif mkt == "player_blocks":
-            raw, mu, sd = row["mu_blk"], row["mu_blk"], row["sd_blk"]
-        elif mkt == "player_steals":
-            raw, mu, sd = row["mu_stl"], row["mu_stl"], row["sd_stl"]
-        elif mkt == "player_turnovers":
-            raw, mu, sd = row["mu_turn"], row["mu_turn"], row["sd_turn"]
-        elif mkt == "player_field_goals":
-            raw, mu, sd = row["mu_fgm"], row["mu_fgm"], row["sd_fgm"]
-        elif mkt == "player_frees_made":
-            raw, mu, sd = row["mu_ftm"], row["mu_ftm"], row["sd_ftm"]
-        elif mkt == "player_frees_attempts":
-            raw, mu, sd = row["mu_fta"], row["mu_fta"], row["sd_fta"]
+        if   mkt == "player_points":   raw = mu = row["mu_pts"];  sd = row["sd_pts"]
+        elif mkt == "player_rebounds": raw = mu = row["mu_reb"];  sd = row["sd_reb"]
+        elif mkt == "player_assists":  raw = mu = row["mu_ast"];  sd = row["sd_ast"]
+        elif mkt == "player_threes":   raw = mu = row["mu_tpm"];  sd = row["sd_tpm"]
+        elif mkt == "player_blocks":   raw = mu = row["mu_blk"];  sd = row["sd_blk"]
+        elif mkt == "player_steals":   raw = mu = row["mu_stl"];  sd = row["sd_stl"]
+        elif mkt == "player_turnovers":raw = mu = row["mu_turn"]; sd = row["sd_turn"]
+        elif mkt == "player_field_goals": raw = mu = row["mu_fgm"]; sd = row["sd_fgm"]
+        elif mkt == "player_frees_made":  raw = mu = row["mu_ftm"]; sd = row["sd_ftm"]
+        elif mkt == "player_frees_attempts": raw = mu = row["mu_fta"]; sd = row["sd_fta"]
 
         # Combos (variance ≈ sum of variances, assuming weak correlation)
         elif mkt == "player_points_rebounds_assists":
@@ -367,7 +391,7 @@ if go:
             mu  = raw
             sd  = np.sqrt(row["sd_blk"]**2 + row["sd_stl"]**2)
         else:
-            continue  # not supported
+            continue  # hidden/unsupported
 
         if mu is None or sd is None or pd.isna(mu) or pd.isna(sd):
             continue
@@ -381,7 +405,7 @@ if go:
             "side": side,
             "line": round(float(line), 2),
             "Avg (raw)": round(float(raw), 2),
-            "μ (scaled)": round(float(mu), 2),          # currently same as raw (no defense scaling)
+            "μ (scaled)": round(float(mu), 2),   # currently same as raw (no defense scaling yet)
             "σ (per-game)": round(float(sd), 2),
             "Win Prob %": round(100 * p, 2),
             "books": int(r["n_books"]),
@@ -395,7 +419,7 @@ if go:
                .sort_values(["market","Win Prob %"], ascending=[True, False])
                .reset_index(drop=True))
 
-    # Display (Market-first order, as requested)
+    # Display in your requested order (Market-first)
     st.dataframe(results, use_container_width=True, hide_index=True)
     st.download_button(
         "⬇️ Download results CSV",
