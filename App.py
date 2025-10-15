@@ -30,40 +30,41 @@ VALID_MARKETS = [
     "player_field_goals",
 ]
 
+
 # ---------------- Embedded 2025 defense EPA (updated) ----------------
 DEFENSE_EPA_2025 = """Team,EPA_Pass,EPA_Rush,Comp_Pct
-Minnesota Vikings,-0.30,0.05,0.6522
+Denver Broncos,-0.16,-0.11,0.5767
+Minnesota Vikings,-0.31,0.05,0.6522
 Houston Texans,-0.19,-0.01,0.5882
-Detroit Lions,-0.05,-0.18,0.6329
-Denver Broncos,-0.07,-0.11,0.5814
-Indianapolis Colts,-0.09,-0.06,0.6705
-Jacksonville Jaguars,-0.12,0.04,0.6193
-Atlanta Falcons,-0.13,0.05,0.5769
-Philadelphia Eagles,-0.07,-0.02,0.5795
-Los Angeles Chargers,-0.07,0.01,0.5909
-San Francisco 49ers,0.02,-0.11,0.6706
-Cleveland Browns,0.12,-0.22,0.6691
-Los Angeles Rams,-0.02,-0.03,0.6667
-Arizona Cardinals,0.06,-0.16,0.6184
-New Orleans Saints,0.04,-0.06,0.6954
-Kansas City Chiefs,-0.08,0.09,0.6781
-Green Bay Packers,0.03,-0.07,0.6815
-Chicago Bears,0.01,0.00,0.7368
-Washington Commanders,0.06,-0.07,0.6410
-Seattle Seahawks,0.12,-0.18,0.7027
-Buffalo Bills,-0.02,0.07,0.6466
-Tampa Bay Buccaneers,0.11,-0.10,0.6813
-Pittsburgh Steelers,0.11,-0.05,0.6957
-Carolina Panthers,0.09,-0.01,0.6536
-New England Patriots,0.18,-0.14,0.7115
-Las Vegas Raiders,0.19,-0.14,0.6564
-New York Giants,0.04,0.10,0.6458
-Tennessee Titans,0.13,0.02,0.7025
-Cincinnati Bengals,0.18,0.01,0.6780
-New York Jets,0.26,0.02,0.6500
-Baltimore Ravens,0.21,0.12,0.6895
-Dallas Cowboys,0.30,0.03,0.7238
-Miami Dolphins,0.26,0.17,0.7445
+Los Angeles Rams,-0.10,-0.06,0.6587
+Atlanta Falcons,-0.15,0.05,0.5769
+Jacksonville Jaguars,-0.06,-0.06,0.6161
+Indianapolis Colts,-0.05,-0.05,0.6591
+Detroit Lions,0.03,-0.15,0.6489
+Los Angeles Chargers,-0.06,0.05,0.6043
+Chicago Bears,0.05,-0.07,0.7357
+Philadelphia Eagles,-0.03,0.02,0.5891
+Pittsburgh Steelers,0.02,-0.05,0.6579
+Cleveland Browns,0.15,-0.19,0.6746
+Las Vegas Raiders,0.09,-0.14,0.6617
+Arizona Cardinals,0.06,-0.10,0.6329
+Tampa Bay Buccaneers,0.07,-0.09,0.6834
+Seattle Seahawks,0.10,-0.16,0.6916
+San Francisco 49ers,0.07,-0.08,0.6788
+New Orleans Saints,0.12,-0.11,0.6949
+Kansas City Chiefs,-0.03,0.07,0.6971
+Green Bay Packers,0.05,-0.06,0.6733
+Washington Commanders,0.07,-0.02,0.6324
+Buffalo Bills,-0.02,0.09,0.6424
+New England Patriots,0.15,-0.13,0.7198
+Tennessee Titans,0.12,-0.06,0.7072
+New York Giants,0.02,0.07,0.6578
+Carolina Panthers,0.16,-0.07,0.6684
+New York Jets,0.21,-0.02,0.6471
+Cincinnati Bengals,0.19,0.03,0.6847
+Baltimore Ravens,0.19,0.08,0.6852
+Dallas Cowboys,0.27,0.06,0.7184
+Miami Dolphins,0.25,0.14,0.748
 """
 
 @st.cache_data(show_spinner=False)
