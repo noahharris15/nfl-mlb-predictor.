@@ -10,3 +10,4 @@ beautifulsoup4
 lxml>=4.9
 html5lib>=1.1
 requests_cache>=0.9
+nba_api
