@@ -147,34 +147,10 @@ def agg_full_season(df: pd.DataFrame) -> Dict[str, float]:
         out["sd_"+col] = sample_sd(sums[col], sums["sq_"+col], g, floor=0.0)
     return out
 
-def detect_season_with_one_week_rule() -> str:
-    """
-    Use 2024-25 by default. Switch to 2025-26 only if >= 7 distinct game dates
-    are available for any of a few headline players (robustness).
-    """
-    # Base/fallback season
-    fallback = "2024-25"
-
-    today = dt.date.today()
-    # Only consider upgrading in Oct or later.
-    if today.month < 10:
-        return fallback
-
-    # Sample a few stable players
-    sample_ids = [201939, 2544, 1628369]  # Curry, LeBron, Tatum
-    try:
-        for pid in sample_ids:
-            df = fetch_player_gamelog_df(pid, "2025-26", "Regular Season")
-            if "GAME_DATE" in df.columns and df["GAME_DATE"].nunique() >= 7:
-                return "2025-26"
-    except Exception:
-        pass
-    return fallback
-
-# ------------------ UI: season choice (auto with 1-week rule) ------------------
-st.markdown("### 1) Season (auto with 1-week rule)")
-season_locked = detect_season_with_one_week_rule()
-st.caption(f"Using NBA season: **{season_locked}** (will switch to the new season only after ≥ 7 distinct game dates exist)")
+# ------------------ UI: season choice (forced to 2025-26) ------------------
+st.markdown("### 1) Season Locked to 2025-26")
+season_locked = "2025-26"
+st.caption(f"Using NBA season: **{season_locked}** only (full season stats).")
 
 # ------------------ Odds API ------------------
 st.markdown("### 2) Pick a game & markets (Odds API)")
@@ -264,16 +240,30 @@ if build:
         if not pid:
             missing_map[pn] = "player_id_not_found"
             continue
+
+        # Try 2025-26 first
         try:
             gldf = fetch_player_gamelog_df(pid, season_locked, "Regular Season")
         except Exception as e:
-            missing_map[pn] = f"log_error: {str(e)[:120]}"
+            missing_map[pn] = f"log_error_2025_26: {str(e)[:120]}"
             continue
 
         ag = agg_full_season(gldf)
+
+        # INJURY FALLBACK: if 0 games in 2025-26, use 2024-25
         if ag["g"] == 0:
-            missing_map[pn] = "no_games_in_season"
-            continue
+            try:
+                gldf_fb = fetch_player_gamelog_df(pid, "2024-25", "Regular Season")
+                ag_fb = agg_full_season(gldf_fb)
+            except Exception as e:
+                missing_map[pn] = f"log_error_2024_25: {str(e)[:120]}"
+                continue
+
+            if ag_fb["g"] == 0:
+                missing_map[pn] = "no_games_in_2025_26_or_2024_25"
+                continue
+
+            ag = ag_fb  # use fallback season stats
 
         rows.append({
             "Player": pn,
