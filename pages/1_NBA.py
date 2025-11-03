@@ -160,15 +160,23 @@ if st.button("📥 Build Player Averages"):
 
     player_names = set()
 
-    # ✅ safe name extraction (fixes your error)
-    for bk in props.get("bookmakers", []):
-        for m in bk.get("markets", []):
-            if m.get("key") in UNSUPPORTED_MARKETS_HIDE: continue
-            for o in m.get("outcomes", []) or []:
-                desc = o.get("description")
-                if not isinstance(desc, str): continue
-                nm = normalize_name(desc)
-                if nm: player_names.add(nm)
+for bk in props.get("bookmakers", []) or []:
+    for m in bk.get("markets", []) or []:
+        if m.get("key") in UNSUPPORTED_MARKETS_HIDE:
+            continue
+        for o in m.get("outcomes", []) or []:
+            desc = o.get("description", "")
+            # ✅ Skip anything that is not a real player name string
+            if not isinstance(desc, str):
+                continue
+            nm = normalize_name(desc)
+            if nm and nm not in ["", "team", "yes", "no"]:
+                player_names.add(nm)
+
+# ✅ stop if nothing valid came through
+if not player_names:
+    st.error("No valid player props found — try selecting points / rebounds / assists markets.")
+    st.stop()
 
     if not player_names:
         st.error("⚠️ No player props found. Add core markets like points/reb/ast.")
