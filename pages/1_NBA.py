@@ -1,7 +1,5 @@
-st.warning("🔥 LOADED NEW NBA SCRIPT")
 # pages/1_NBA.py
 # NBA Player Props — 30,000 Sims + Defense + Team Map
-
 import re, unicodedata, time, random
 from typing import Optional
 import numpy as np
