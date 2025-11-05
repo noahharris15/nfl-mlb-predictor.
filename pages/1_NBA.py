@@ -156,15 +156,11 @@ def odds_get(url: str, params: dict) -> dict:
     r = requests.get(url, params=params, timeout=25)
     return r.json()
 
-### ✅ FIXED ONLY THIS — event API changed arguments
 def list_events(api_key: str, lookahead_days: int, region: str):
-    params = {
-        "apiKey": api_key,
-        "regions": region,
-        "daysFrom": 0,
-        "daysTo": lookahead_days if lookahead_days > 0 else 1
-    }
-    return odds_get(f"https://api.the-odds-api.com/v4/sports/{ODDS_SPORT}/events", params)
+    return odds_get(
+        f"https://api.the-odds-api.com/v4/sports/{ODDS_SPORT}/events",
+        {"apiKey": api_key, "regions": region, "daysFrom": 0, "daysTo": lookahead_days if lookahead_days > 0 else 1}
+    )
 
 def fetch_event_props(api_key: str, event_id: str, region: str, markets: List[str]):
     base = f"https://api.the-odds-api.com/v4/sports/{ODDS_SPORT}/events/{event_id}/odds"
@@ -178,18 +174,19 @@ if not events:
     st.info("Enter your Odds API key and pick a lookahead to list upcoming games.")
     st.stop()
 
-### ✅ DO NOT CHANGE — works fine and avoids Streamlit f-string issue
+# ✅ SAFE home/away block so script never crashes
 event_labels = []
 for e in events:
-    away = e["away_team"]
-    home = e["home_team"]
-    event_labels.append(f"{away} @ {home} — {e.get('commence_time','')}")
+    away = e.get("away_team") or e.get("teams",[None,None])[0] or "Away"
+    home = e.get("home_team") or e.get("teams",[None,None])[1] or "Home"
+    date = e.get("commence_time","")
+    event_labels.append(f"{away} @ {home} — {date}")
 
 pick = st.selectbox("Game", event_labels)
 event = events[event_labels.index(pick)]
 event_id = event["id"]
 
-# ------------------ Build projections ------------------
+# ------------------ Build projections for players in this event ------------------
 st.markdown("### 3) Build per-player projections from NBA Stats (full season averages)")
 build = st.button("📥 Build NBA projections")
 
@@ -203,71 +200,62 @@ if build:
     player_names = set()
     for bk in data_preview.get("bookmakers", []):
         for m in bk.get("markets", []):
-            if m.get("key") in UNSUPPORTED_MARKETS_HIDE: continue
+            if m.get("key") in UNSUPPORTED_MARKETS_HIDE:
+                continue
             for o in m.get("outcomes", []) or []:
                 nm = normalize_name(o.get("description"))
                 if nm: player_names.add(nm)
 
     if not player_names:
         core = ["player_points","player_rebounds","player_assists","player_threes"]
-        try:
-            data_core = fetch_event_props(api_key, event_id, region, core)
-            for bk in data_core.get("bookmakers", []):
-                for m in bk.get("markets", []):
-                    for o in m.get("outcomes", []) or []:
-                        nm = normalize_name(o.get("description"))
-                        if nm: player_names.add(nm)
-        except Exception:
-            pass
+        data_core = fetch_event_props(api_key, event_id, region, core)
+        for bk in data_core.get("bookmakers", []):
+            for m in bk.get("markets", []):
+                for o in m.get("outcomes", []) or []:
+                    nm = normalize_name(o.get("description"))
+                    if nm: player_names.add(nm)
 
     if not player_names:
-        st.warning("No player names found. Try adding core markets.")
+        st.warning("No players detected — try adding core markets.")
         st.stop()
 
     rows = []
     missing_map = {}
 
-    st.write(f"Found **{len(player_names)}** players. Building averages…")
     for pn in sorted(player_names):
         pid = find_player_id_by_name(pn)
         if not pid:
-            missing_map[pn] = "player_id_not_found"
+            missing_map[pn] = "not found"
             continue
 
         try:
             gldf = fetch_player_gamelog_df(pid, season_locked, "Regular Season")
         except Exception as e:
-            missing_map[pn] = f"log_error {str(e)[:120]}"
+            missing_map[pn] = str(e)
             continue
 
         ag = agg_full_season(gldf)
 
         if ag["g"] == 0:
-            try:
-                gldf_fb = fetch_player_gamelog_df(pid, "2024-25", "Regular Season")
-                ag_fb = agg_full_season(gldf_fb)
-            except Exception as e:
-                missing_map[pn] = f"log_error_fb {str(e)[:120]}"
-                continue
-
+            gldf_fb = fetch_player_gamelog_df(pid, "2024-25", "Regular Season")
+            ag_fb = agg_full_season(gldf_fb)
             if ag_fb["g"] == 0:
-                missing_map[pn] = "no games found"
+                missing_map[pn] = "no data"
                 continue
-
             ag = ag_fb
 
         rows.append({"Player": pn, "g": ag["g"], **ag})
 
     if missing_map:
-        with st.expander("⚠️ Players not built"):
+        with st.expander("⚠️ Missing"):
             st.json(missing_map)
 
     if not rows:
-        st.error("No projections built.")
+        st.warning("No projections built.")
         st.stop()
 
     st.session_state["nba_proj"] = pd.DataFrame(rows)
-    st.success("✅ Player data ready")
+    st.success("Projections ready")
     st.dataframe(st.session_state["nba_proj"], use_container_width=True)
 
 # ------------------ Simulate ------------------
@@ -277,36 +265,32 @@ go = st.button("Fetch lines & simulate (NBA)")
 if go:
     proj = st.session_state.get("nba_proj", pd.DataFrame())
     if proj.empty:
-        st.warning("Build NBA projections first.")
+        st.warning("Build projections first.")
         st.stop()
 
-    try:
-        data = fetch_event_props(api_key, event_id, region, list(set(markets)))
-    except Exception as e:
-        st.error(f"Props fetch failed: {e}")
-        st.stop()
+    props = fetch_event_props(api_key, event_id, region, list(set(markets)))
 
     proj = proj.copy()
     proj["player_norm"] = proj["Player"].apply(normalize_name)
     idx = proj.set_index("player_norm")
 
     rows = []
-    for bk in data.get("bookmakers", []):
+    for bk in props.get("bookmakers", []):
         for m in bk.get("markets", []):
             mkey = m.get("key")
             if mkey in UNSUPPORTED_MARKETS_HIDE: continue
-
-            for o in (m.get("outcomes", []) or []):
+            for o in m.get("outcomes", []) or []:
                 name = normalize_name(o.get("description"))
-                if name not in idx.index or mkey not in VALID_MARKETS: continue
                 side = o.get("name")
-                point = float(o.get("point"))
+                point = o.get("point")
+                if not name or mkey not in VALID_MARKETS or point is None:
+                    continue
 
-                row = idx.loc[name]
+                row = idx.loc.get(name)
+                if row is None: continue
 
-                mu = sd = raw = None
+                raw = mu = sd = None
 
-                # Singles
                 if   mkey == "player_points":   raw = mu = row["mu_PTS"];  sd = row["sd_PTS"]
                 elif mkey == "player_rebounds": raw = mu = row["mu_REB"];  sd = row["sd_REB"]
                 elif mkey == "player_assists":  raw = mu = row["mu_AST"];  sd = row["sd_AST"]
@@ -317,8 +301,6 @@ if go:
                 elif mkey == "player_field_goals": raw = mu = row["mu_FGM"]; sd = row["sd_FGM"]
                 elif mkey == "player_frees_made": raw = mu = row["mu_FTM"]; sd = row["sd_FTM"]
                 elif mkey == "player_frees_attempts": raw = mu = row["mu_FTA"]; sd = row["sd_FTA"]
-
-                # Combos
                 elif mkey == "player_points_rebounds_assists":
                     raw = row["mu_PTS"]+row["mu_REB"]+row["mu_AST"]
                     mu = raw
