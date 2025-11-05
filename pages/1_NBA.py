@@ -145,13 +145,6 @@ if not events:
     st.info("Enter API key & lookahead to load games")
     st.stop()
 
-### ✅ FIXED — removed f-string in list loop (was causing your error)
-event_labels = []
-for e in events:
-    away = e["away_team"]
-    home = e["home_team"]
-    event_labels.append(f"{away} @ {home}")
-
 pick = st.selectbox("Game", event_labels)
 event = events[event_labels.index(pick)]
 event_id = event["id"]
