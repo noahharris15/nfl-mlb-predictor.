@@ -130,11 +130,6 @@ if not api_key: st.stop()
 events = list_events()
 if not events: st.stop()
 
-# ✅ remove emoji dash to fix streamlit crash
-event_labels = [f'{e["away_team"]} @ {e["home_team"]}' for e in events]
-pick = st.selectbox("Game", event_labels)
-event = events[event_labels.index(pick)]
-event_id = event["id"]
 
 def fetch_event_props(eid, mkts):
     return odds_get(
