@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+st.cache_data.clear()
 
 # NBA API
 from nba_api.stats.static import players as nba_players
