@@ -1,129 +1,26 @@
-# NBA Player Props — Odds API + NBA Stats (nba_api) + Defense Scalars + 10k sims
+# NBA Player Props — Odds API + NBA Stats (nba_api), per-game averages + 10k sims + Defense Scaling
 # Place this file at: pages/1_NBA.py
+# IMPORTANT: Do NOT call st.set_page_config here (it's in your main app).
 
-import re, unicodedata, time, random
+import re, unicodedata, datetime as dt, time, random
+from typing import List, Optional, Dict, Tuple
+
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from typing import Optional, Dict, List, Tuple
 
+# ---------- NBA Stats ----------
 from nba_api.stats.static import players as nba_players
-from nba_api.stats.endpoints import playergamelog
+from nba_api.stats.endpoints import playergamelog, commonplayerinfo
 
-st.title("🏀 NBA Player Props — Defense-Adjusted Sims (10k)")
+# ✅ Title
+st.title("🏀 NBA Player Props — Advanced Model (with Defense Strength)")
 
-SIM_TRIALS = 10_000
+SIM_TRIALS = 10000
 
-# ---------------------------------------------------------
-# ✅ TEAM NORMALIZATION TABLE (strict)
-# ---------------------------------------------------------
-TEAM_NORMALIZE = {
-    # WEST
-    "oklahoma city thunder": "Oklahoma City Thunder",
-    "okc thunder": "Oklahoma City Thunder",
-    "thunder": "Oklahoma City Thunder",
-
-    "san antonio spurs": "San Antonio Spurs",
-    "spurs": "San Antonio Spurs",
-
-    "portland trail blazers": "Portland Trail Blazers",
-    "portland blazers": "Portland Trail Blazers",
-    "blazers": "Portland Trail Blazers",
-
-    "denver nuggets": "Denver Nuggets",
-    "nuggets": "Denver Nuggets",
-
-    "dallas mavericks": "Dallas Mavericks",
-    "mavericks": "Dallas Mavericks",
-    "mavs": "Dallas Mavericks",
-
-    "golden state warriors": "Golden State Warriors",
-    "warriors": "Golden State Warriors",
-
-    "houston rockets": "Houston Rockets",
-    "rockets": "Houston Rockets",
-
-    "los angeles clippers": "Los Angeles Clippers",
-    "la clippers": "Los Angeles Clippers",
-    "clippers": "Los Angeles Clippers",
-
-    "los angeles lakers": "Los Angeles Lakers",
-    "la lakers": "Los Angeles Lakers",
-    "lakers": "Los Angeles Lakers",
-
-    "memphis grizzlies": "Memphis Grizzlies",
-    "grizzlies": "Memphis Grizzlies",
-
-    "minnesota timberwolves": "Minnesota Timberwolves",
-    "wolves": "Minnesota Timberwolves",
-    "timberwolves": "Minnesota Timberwolves",
-
-    "new orleans pelicans": "New Orleans Pelicans",
-    "pelicans": "New Orleans Pelicans",
-
-    "phoenix suns": "Phoenix Suns",
-    "suns": "Phoenix Suns",
-
-    "sacramento kings": "Sacramento Kings",
-    "kings": "Sacramento Kings",
-
-    "utah jazz": "Utah Jazz",
-    "jazz": "Utah Jazz",
-
-    # EAST
-    "atlanta hawks": "Atlanta Hawks",
-    "hawks": "Atlanta Hawks",
-
-    "boston celtics": "Boston Celtics",
-    "celtics": "Boston Celtics",
-
-    "brooklyn nets": "Brooklyn Nets",
-    "nets": "Brooklyn Nets",
-
-    "charlotte hornets": "Charlotte Hornets",
-    "hornets": "Charlotte Hornets",
-
-    "chicago bulls": "Chicago Bulls",
-    "bulls": "Chicago Bulls",
-
-    "cleveland cavaliers": "Cleveland Cavaliers",
-    "cavaliers": "Cleveland Cavaliers",
-    "cavs": "Cleveland Cavaliers",
-
-    "detroit pistons": "Detroit Pistons",
-    "pistons": "Detroit Pistons",
-
-    "indiana pacers": "Indiana Pacers",
-    "pacers": "Indiana Pacers",
-
-    "miami heat": "Miami Heat",
-    "heat": "Miami Heat",
-
-    "milwaukee bucks": "Milwaukee Bucks",
-    "bucks": "Milwaukee Bucks",
-
-    "new york knicks": "New York Knicks",
-    "knicks": "New York Knicks",
-
-    "orlando magic": "Orlando Magic",
-    "magic": "Orlando Magic",
-
-    "philadelphia 76ers": "Philadelphia 76ers",
-    "76ers": "Philadelphia 76ers",
-    "sixers": "Philadelphia 76ers",
-
-    "toronto raptors": "Toronto Raptors",
-    "raptors": "Toronto Raptors",
-
-    "washington wizards": "Washington Wizards",
-    "wizards": "Washington Wizards",
-}
-
-# ---------------------------------------------------------
-# ✅ DEFENSE MULTIPLIERS (No fallback allowed)
-# ---------------------------------------------------------
-DEF_MULT = {
+# ✅ Defense multipliers you provided
+DEF_RATINGS = {
     "Oklahoma City Thunder": 1.031,
     "San Antonio Spurs": 1.053,
     "Portland Trail Blazers": 1.073,
@@ -156,234 +53,457 @@ DEF_MULT = {
     "Brooklyn Nets": 1.249,
 }
 
-# ---------------------------------------------------------
-# ------------------ HELPER FUNCTIONS ---------------------
-# ---------------------------------------------------------
+# -------------------- VALID MARKETS --------------------
+VALID_MARKETS = [
+    "player_points", "player_rebounds", "player_assists", "player_threes",
+    "player_blocks", "player_steals", "player_blocks_steals", "player_turnovers",
+    "player_points_rebounds_assists", "player_points_rebounds",
+    "player_points_assists", "player_rebounds_assists",
+    "player_field_goals", "player_frees_made", "player_frees_attempts",
+]
 
+UNSUPPORTED_MARKETS_HIDE = {
+    "player_first_basket","player_first_team_basket","player_double_double",
+    "player_triple_double","player_points_q1","player_rebounds_q1","player_assists_q1",
+}
+
+ODDS_SPORT = "basketball_nba"
+
+# ------------------ Utilities ------------------
 def strip_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 
 def normalize_name(n: str) -> str:
-    n = n.lower().strip()
-    n = re.sub(r"[.,'()-]", " ", n)
-    n = re.sub(r"\s+", " ", n)
-    return strip_accents(n)
+    n = str(n or "")
+    n = n.split("(")[0]
+    n = n.replace("-", " ")
+    n = re.sub(r"[.,']", " ", n)
+    n = re.sub(r"\s+", " ", n).strip()
+    return strip_accents(n).lower()
 
-def t_sim(mu: float, sd: float, line: float, sims=SIM_TRIALS):
-    sd = max(sd, 1e-6)
-    draws = mu + sd * np.random.standard_t(df=5, size=sims)
-    prob = float((draws > line).mean())
-    return prob, draws
+def t_sim(mu: float, sd: float, line: float, trials: int = SIM_TRIALS):
+    sd = max(1e-6, sd)
+    draws = mu + sd * np.random.standard_t(df=5, size=trials)
+    win_prob = (draws > line).mean()
+    projection = np.median(draws)
+    return win_prob, projection, draws
 
-def fetch_event_props(api_key: str, event_id: str, region: str, mkts: List[str]):
-    url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
-    return requests.get(url, params={"apiKey": api_key, "regions": region, "markets": ",".join(mkts)}).json()
+def sample_sd(sum_x, sum_x2, g, floor=0.0):
+    if g <= 1:
+        return 0.0
+    mean = sum_x / g
+    var = (sum_x2 / g) - (mean**2)
+    var = var * (g / (g - 1))
+    return max(np.sqrt(max(var, 1e-9)), floor)
 
-# ---------------------------------------------------------
-# ✅ UI: Odds API
-# ---------------------------------------------------------
+# ------------------ Player Index ------------------
+@st.cache_data(show_spinner=False)
+def _players_index():
+    plist = nba_players.get_players()
+    df = pd.DataFrame(plist)
+    df["name_norm"] = df["full_name"].apply(normalize_name)
+    df["first_norm"] = df["first_name"].apply(normalize_name)
+    df["last_norm"] = df["last_name"].apply(normalize_name)
+    return df[["id","full_name","name_norm","first_norm","last_norm"]]
 
-st.markdown("### Enter Odds API Key")
-api_key = st.text_input("Odds API Key", "", type="password")
-region = st.selectbox("Region", ["us", "us2", "eu", "uk"], 0)
-lookahead = st.slider("Lookahead days", 0, 7, 1)
+def find_player_id_by_name(name):
+    df = _players_index()
+    n = normalize_name(name)
+    parts = n.split()
 
-if not api_key:
-    st.stop()
+    hit = df[df["name_norm"] == n]
+    if not hit.empty:
+        return int(hit.iloc[0]["id"])
 
-# ---------------------------------------------------------
-# ✅ EVENTS LIST
-# ---------------------------------------------------------
+    if len(parts) == 2:
+        f, l = parts
+        cand = df[df["last_norm"].str.contains(l)]
+        cand = cand[cand["first_norm"].str.contains(f[:1])]
+        if not cand.empty:
+            return int(cand.iloc[0]["id"])
 
-def list_events(api_key, region, lookahead):
-    url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
-    return requests.get(url, params={"apiKey": api_key, "regions": region, "daysFrom": 0, "daysTo": lookahead}).json()
+    cand = df[df["name_norm"].str.contains(parts[-1])]
+    if not cand.empty:
+        return int(cand.iloc[0]["id"])
 
-events = list_events(api_key, region, lookahead)
+    return None
 
-if not events or isinstance(events, dict):
-    st.error("No events returned. Check API key or usage limit.")
-    st.stop()
-
-# ---------------------------------------------------------
-# ✅ BUILD LABELS (home/away parsed safely)
-# ---------------------------------------------------------
-
-labels = []
-for e in events:
-    away = e.get("away_team", "")
-    home = e.get("home_team", "")
-    time_str = e.get("commence_time", "")
-    labels.append(f"{away} @ {home} — {time_str}")
-
-pick = st.selectbox("Select Game", labels)
-event = events[labels.index(pick)]
-event_id = event["id"]
-
-# ---------------------------------------------------------
-# ✅ PLAYER PROJECTIONS
-# ---------------------------------------------------------
-
-st.markdown("### Build Projections")
-build = st.button("Build NBA Projections")
-
-@st.cache_data
-def fetch_games(pid, season):
-    time.sleep(0.25)
-    df = playergamelog.PlayerGameLog(player_id=pid, season=season, season_type_all_star="Regular Season").get_data_frames()[0]
-    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+# ------------------ Game logs ------------------
+def fetch_gamelog(player_id, season):
+    time.sleep(0.2)
+    gl = playergamelog.PlayerGameLog(player_id=player_id, season=season, season_type_all_star="Regular Season")
+    df = gl.get_data_frames()[0]
     return df
 
-if build:
+def agg_full_season(df):
+    g = len(df)
+    if g == 0:
+        return {"g":0}
 
-    # pull props once so we know which players are involved
-    props_preview = fetch_event_props(api_key, event_id, region, ["player_points"])
-    players = set()
+    sums = {}
+    for col in ["PTS","REB","AST","STL","BLK","TOV","FG3M","FGM","FTM","FTA"]:
+        x = pd.to_numeric(df[col], errors="coerce").fillna(0).to_numpy()
+        sums[col] = x.sum()
+        sums["sq_"+col] = (x**2).sum()
 
+    out = {"g": g}
+    for col in ["PTS","REB","AST","STL","BLK","TOV","FG3M","FGM","FTM","FTA"]:
+        out["mu_"+col] = sums[col] / g
+        out["sd_"+col] = sample_sd(sums[col], sums["sq_"+col], g)
+    return out
+
+# ------------------ UI ------------------
+st.markdown("### 1) Season Locked to 2025-26")
+SEASON = "2025-26"
+FALLBACK = "2024-25"
+
+st.markdown("### 2) Odds API Settings")
+api_key = st.text_input("Odds API Key", "", type="password")
+region = st.selectbox("Region", ["us","us2","eu","uk"], 0)
+lookahead = st.slider("Lookahead days", 0, 7, 1)
+
+markets = st.multiselect("Markets:", VALID_MARKETS + list(UNSUPPORTED_MARKETS_HIDE), VALID_MARKETS)
+
+def odds_get(url, params):
+    r = requests.get(url, params=params, timeout=25)
+    return r.json()
+
+def list_events():
+    return odds_get(
+        f"https://api.the-odds-api.com/v4/sports/{ODDS_SPORT}/events",
+        {"apiKey": api_key, "regions": region, "daysFrom": 0, "daysTo": lookahead if lookahead>0 else 1}
+    )
+
+if not api_key:
+    st.info("Enter API key to load games.")
+    st.stop()
+
+events = list_events()
+
+if not events:
+    st.error("No games found.")
+    st.stop()
+
+# Build event labels
+event_labels = []
+for e in events:
+    away = e.get("away_team") or "Away"
+    home = e.get("home_team") or "Home"
+    date = e.get("commence_time","")
+    event_labels.append(f"{away} @ {home} — {date}")
+
+pick = st.selectbox("Game", event_labels)
+event = events[event_labels.index(pick)]
+event_id = event["id"]
+
+home_team = event.get("home_team","")
+away_team = event.get("away_team","")
+
+# ------------------ Build projections ------------------
+st.markdown("### 3) Build Player Projections")
+if st.button("📥 Build NBA projections"):
+
+    props_preview = odds_get(
+        f"https://api.the-odds-api.com/v4/sports/{ODDS_SPORT}/events/{event_id}/odds",
+        {"apiKey": api_key, "regions": region, "markets": ",".join(markets)}
+    )
+
+    player_names = set()
     for bk in props_preview.get("bookmakers", []):
         for m in bk.get("markets", []):
+            if m.get("key") in UNSUPPORTED_MARKETS_HIDE: continue
             for o in m.get("outcomes", []):
-                nm = normalize_name(o["description"])
+                nm = normalize_name(o.get("description"))
                 if nm:
-                    players.add(nm)
-
-    index = pd.DataFrame(nba_players.get_players())
-    index["norm"] = index["full_name"].apply(normalize_name)
+                    player_names.add(nm)
 
     rows = []
 
-    for p in players:
-        match = index.loc[index["norm"] == p]
-        if match.empty:
+    for pn in sorted(player_names):
+        pid = find_player_id_by_name(pn)
+        if not pid:
             continue
 
-        pid = int(match.iloc[0]["id"])
+        # ✅ Fetch player's actual team
+        info = commonplayerinfo.CommonPlayerInfo(player_id=pid).get_data_frames()[0]
+        player_team = info["TEAM_NAME"].iloc[0]
 
-        df = fetch_games(pid, "2025-26")
+        # ✅ Determine opponent correctly
+        if player_team == home_team:
+            opponent = away_team
+        else:
+            opponent = home_team
 
-        if df.empty:
-            df = fetch_games(pid, "2024-25")
+        # ✅ Get defense multiplier
+        def_mult = DEF_RATINGS.get(opponent, 1.0)
 
-        if df.empty:
+        # ✅ Load logs
+        df = fetch_gamelog(pid, SEASON)
+        stats = agg_full_season(df)
+
+        if stats["g"] == 0:
+            df = fetch_gamelog(pid, FALLBACK)
+            stats = agg_full_season(df)
+
+        if stats["g"] == 0:
             continue
 
-        def get(col):
-            x = pd.to_numeric(df[col], errors="coerce").fillna(0)
-            return x.mean(), x.std(ddof=1)
+        stats["player"] = pn
+        stats["team"] = player_team
+        stats["opponent"] = opponent
+        stats["def_multiplier"] = def_mult
 
-        mu_pts, sd_pts   = get("PTS")
-        mu_reb, sd_reb   = get("REB")
-        mu_ast, sd_ast   = get("AST")
-        mu_tpm, sd_tpm   = get("FG3M")
+        rows.append(stats)
 
-        rows.append({
-            "Player": p,
-            "norm": p,
-            "mu_pts": mu_pts, "sd_pts": sd_pts,
-            "mu_reb": mu_reb, "sd_reb": sd_reb,
-            "mu_ast": mu_ast, "sd_ast": sd_ast,
-            "mu_tpm": mu_tpm, "sd_tpm": sd_tpm,
-        })
+    proj = pd.DataFrame(rows)
+    proj["player_norm"] = proj["player"].apply(normalize_name)
 
-    df = pd.DataFrame(rows)
-    st.session_state["proj"] = df
-    st.success("Projections Built ✅")
-    st.dataframe(df)
+    st.session_state["proj"] = proj
+    st.success("Projections built.")
+    st.dataframe(proj)
 
-# ---------------------------------------------------------
-# ✅ SIMULATION SECTION
-# ---------------------------------------------------------
+# ------------------ Run Simulation ------------------
+st.markdown("### 4) Simulate Props (10k Sims)")
+if st.button("🎯 Run Simulation"):
 
-st.markdown("### 4) Run Simulation")
-run = st.button("Run Simulation")
-
-if run:
-
-    if "proj" not in st.session_state:
-        st.error("Build projections first.")
+    proj = st.session_state.get("proj", pd.DataFrame())
+    if proj.empty:
+        st.warning("Build projections first.")
         st.stop()
 
-    proj = st.session_state["proj"].set_index("norm")
+    props = odds_get(
+        f"https://api.the-odds-api.com/v4/sports/{ODDS_SPORT}/events/{event_id}/odds",
+        {"apiKey": api_key, "regions": region, "markets": ",".join(markets)}
+    )
 
-    # fetch props
-    props = fetch_event_props(api_key, event_id, region, ["player_points", "player_rebounds", "player_assists", "player_threes"])
+    proj = proj.set_index("player_norm")
 
-    # get teams
-    away_team_raw = normalize_name(event.get("away_team"))
-    home_team_raw = normalize_name(event.get("home_team"))
-
-    # normalize to official names
-    if away_team_raw not in TEAM_NORMALIZE:
-        st.error(f"Unrecognized team name: {event.get('away_team')}")
-        st.stop()
-
-    if home_team_raw not in TEAM_NORMALIZE:
-        st.error(f"Unrecognized team name: {event.get('home_team')}")
-        st.stop()
-
-    away_team = TEAM_NORMALIZE[away_team_raw]
-    home_team = TEAM_NORMALIZE[home_team_raw]
-
-    results = []
+    out_rows = []
 
     for bk in props.get("bookmakers", []):
         for m in bk.get("markets", []):
             mkey = m.get("key")
-            if mkey not in ["player_points", "player_rebounds", "player_assists", "player_threes"]:
+            if mkey not in VALID_MARKETS:
                 continue
 
             for o in m.get("outcomes", []):
-                name = normalize_name(o["description"])
-                side = o["name"]
-                line = float(o["point"])
-
+                name = normalize_name(o.get("description"))
                 if name not in proj.index:
                     continue
 
                 row = proj.loc[name]
+                side = o["name"]
+                line = float(o["point"])
 
-                # pick stat
-                if mkey == "player_points":
-                    mu, sd = row["mu_pts"], row["sd_pts"]
-                elif mkey == "player_rebounds":
-                    mu, sd = row["mu_reb"], row["sd_reb"]
-                elif mkey == "player_assists":
-                    mu, sd = row["mu_ast"], row["sd_ast"]
-                elif mkey == "player_threes":
-                    mu, sd = row["mu_tpm"], row["sd_tpm"]
+                # ✅ Base means & SDs
+                def get(col):
+                    return row[f"mu_{col}"], row[f"sd_{col}"]
 
-                # ---------------------------------------------------------
-                # ✅ DEFENSE ADJUSTMENT (STRICT — MUST MATCH A TEAM)
-                # ---------------------------------------------------------
-                opponent_raw = home_team if side == "Over" else away_team
-                opponent = opponent_raw  # already normalized above
+                # ✅ Determine μ and σ normally
+                if mkey=="player_points":   mu,sd = get("PTS")
+                elif mkey=="player_rebounds": mu,sd = get("REB")
+                elif mkey=="player_assists":  mu,sd = get("AST")
+                elif mkey=="player_threes":   mu,sd = get("FG3M")
+                elif mkey=="player_blocks":   mu,sd = get("BLK")
+                elif mkey=="player_steals":   mu,sd = get("STL")
+                elif mkey=="player_turnovers": mu,sd = get("TOV")
+                elif mkey=="player_field_goals": mu,sd = get("FGM")
+                elif mkey=="player_frees_made": mu,sd = get("FTM")
+                elif mkey=="player_frees_attempts": mu,sd = get("FTA")
+                elif mkey=="player_points_rebounds_assists":
+                    mu = row["mu_PTS"]+row["mu_REB"]+row["mu_AST"]
+                    sd = np.sqrt(row["sd_PTS"]**2 + row["sd_REB"]**2 + row["sd_AST"]**2)
+                elif mkey=="player_points_rebounds":
+                    mu = row["mu_PTS"]+row["mu_REB"]
+                    sd = np.sqrt(row["sd_PTS"]**2 + row["sd_REB"]**2)
+                elif mkey=="player_points_assists":
+                    mu = row["mu_PTS"]+row["mu_AST"]
+                    sd = np.sqrt(row["sd_PTS"]**2 + row["sd_AST"]**2)
+                elif mkey=="player_rebounds_assists":
+                    mu = row["mu_REB"]+row["mu_AST"]
+                    sd = np.sqrt(row["sd_REB"]**2 + row["sd_AST"]**2)
+                elif mkey=="player_blocks_steals":
+                    mu = row["mu_BLK"]+row["mu_STL"]
+                    sd = np.sqrt(row["sd_BLK"]**2 + row["sd_STL"]**2)
+                else:
+                    continue
 
-                if opponent not in DEF_MULT:
-                    st.error(f"Defense multiplier missing for: {opponent}")
-                    st.stop()
+                # ✅ APPLY DEFENSE MULTIPLIER TO EVERYTHING
+                mu = mu * row["def_multiplier"]
 
-                mult = DEF_MULT[opponent]
+                # ✅ RUN SIM
+                win_prob, projection, draws = t_sim(mu, sd, line)
 
-                mu_adj = mu / mult
-                sd_adj = sd / mult
+                if side=="Under":
+                    win_prob = 1 - win_prob
 
-                # simulate
-                p_over, draws = t_sim(mu_adj, sd_adj, line)
-                proj_val = float(np.median(draws))
-                win_prob = p_over if side == "Over" else (1 - p_over)
-
-                results.append({
-                    "Player": row["Player"],
+                out_rows.append({
+                    "Player": row["player"],
+                    "Team": row["team"],
+                    "Opponent": row["opponent"],
+                    "Defense Multiplier": row["def_multiplier"],
                     "Market": mkey,
                     "Side": side,
                     "Line": line,
-                    "Projection": round(proj_val,2),
-                    "Win %": round(win_prob*100,2),
-                    "Opponent": opponent,
-                    "Defense Mult": mult,
+                    "Model Projection": round(projection,2),
+                    "Win Prob %": round(win_prob*100,2),
                 })
 
-    out = pd.DataFrame(results).sort_values("Win %", ascending=False)
-    st.dataframe(out, use_container_width=True)
+    results = pd.DataFrame(out_rows)
+    results = results.sort_values(["Market","Win Prob %"], ascending=[True,False])
 
-    st.download_button("Download CSV", out.to_csv(index=False), "nba_sim_results.csv")
+    st.dataframe(results)
+
+    st.download_button(
+        "⬇️ Download CSV",
+        results.to_csv(index=False).encode(),
+        "nba_sim_results.csv",
+        "text/csv"
+    )
+
+# ------------------ FULL SLATE VALUE REPORT ------------------
+st.markdown("### 5) 🔥 Full-Slate Value Finder")
+
+if st.button("📊 Run Full Slate Value Report"):
+
+    all_events = list_events()
+    master = []
+
+    for ev in all_events:
+
+        eid = ev["id"]
+        homeT = ev.get("home_team","")
+        awayT = ev.get("away_team","")
+
+        props = odds_get(
+            f"https://api.the-odds-api.com/v4/sports/{ODDS_SPORT}/events/{eid}/odds",
+            {"apiKey": api_key, "regions": region, "markets": ",".join(markets)}
+        )
+
+        # collect players
+        pnames = set()
+        for bk in props.get("bookmakers", []):
+            for m in bk.get("markets", []):
+                if m.get("key") in UNSUPPORTED_MARKETS_HIDE: continue
+                for o in m.get("outcomes", []):
+                    nm = normalize_name(o.get("description"))
+                    if nm: pnames.add(nm)
+
+        rows = []
+        # build projections
+        for pn in sorted(pnames):
+
+            pid = find_player_id_by_name(pn)
+            if not pid:
+                continue
+
+            info = commonplayerinfo.CommonPlayerInfo(player_id=pid).get_data_frames()[0]
+            pteam = info["TEAM_NAME"].iloc[0]
+
+            opp = awayT if pteam == homeT else homeT
+
+            mult = DEF_RATINGS.get(opp, 1.0)
+
+            df = fetch_gamelog(pid, SEASON)
+            stx = agg_full_season(df)
+            if stx["g"]==0:
+                df = fetch_gamelog(pid, FALLBACK)
+                stx = agg_full_season(df)
+            if stx["g"] == 0:
+                continue
+
+            stx["player"]=pn
+            stx["team"]=pteam
+            stx["opponent"]=opp
+            stx["mult"]=mult
+            rows.append(stx)
+
+        if not rows:
+            continue
+
+        proj = pd.DataFrame(rows)
+        proj["player_norm"]=proj["player"].apply(normalize_name)
+        proj = proj.set_index("player_norm")
+
+        # simulate all props
+        for bk in props.get("bookmakers", []):
+            for m in bk.get("markets", []):
+                mkey = m.get("key")
+                if mkey not in VALID_MARKETS:
+                    continue
+                for o in m.get("outcomes", []):
+                    nm = normalize_name(o.get("description"))
+                    if nm not in proj.index:
+                        continue
+                    if pd.isna(o.get("point")):
+                        continue
+
+                    row = proj.loc[nm]
+                    side = o["name"]
+                    line = float(o["point"])
+
+                    # get base μ, σ
+                    def g(col):
+                        return row[f"mu_{col}"], row[f"sd_{col}"]
+
+                    if mkey=="player_points": mu,sd=g("PTS")
+                    elif mkey=="player_rebounds": mu,sd=g("REB")
+                    elif mkey=="player_assists": mu,sd=g("AST")
+                    elif mkey=="player_threes": mu,sd=g("FG3M")
+                    elif mkey=="player_blocks": mu,sd=g("BLK")
+                    elif mkey=="player_steals": mu,sd=g("STL")
+                    elif mkey=="player_turnovers": mu,sd=g("TOV")
+                    elif mkey=="player_field_goals": mu,sd=g("FGM")
+                    elif mkey=="player_frees_made": mu,sd=g("FTM")
+                    elif mkey=="player_frees_attempts": mu,sd=g("FTA")
+                    elif mkey=="player_points_rebounds_assists":
+                        mu=row["mu_PTS"]+row["mu_REB"]+row["mu_AST"]
+                        sd=np.sqrt(row["sd_PTS"]**2+row["sd_REB"]**2+row["sd_AST"]**2)
+                    elif mkey=="player_points_rebounds":
+                        mu=row["mu_PTS"]+row["mu_REB"]
+                        sd=np.sqrt(row["sd_PTS"]**2+row["sd_REB"]**2)
+                    elif mkey=="player_points_assists":
+                        mu=row["mu_PTS"]+row["mu_AST"]
+                        sd=np.sqrt(row["sd_PTS"]**2+row["sd_AST"]**2)
+                    elif mkey=="player_rebounds_assists":
+                        mu=row["mu_REB"]+row["mu_AST"]
+                        sd=np.sqrt(row["sd_REB"]**2+row["sd_AST"]**2)
+                    elif mkey=="player_blocks_steals":
+                        mu=row["mu_BLK"]+row["mu_STL"]
+                        sd=np.sqrt(row["sd_BLK"]**2+row["sd_STL"]**2)
+                    else:
+                        continue
+
+                    # ✅ Apply defense scaling
+                    mu = mu * row["mult"]
+
+                    win_prob, projection, draws = t_sim(mu,sd,line)
+                    edge = projection - line
+
+                    master.append({
+                        "Game": f"{awayT} @ {homeT}",
+                        "Player": row["player"],
+                        "Team": row["team"],
+                        "Opponent": row["opponent"],
+                        "Market": mkey,
+                        "Side": side,
+                        "Line": line,
+                        "Projection": round(projection,2),
+                        "Edge": round(edge,2),
+                    })
+
+    full = pd.DataFrame(master)
+    full = full.sort_values("Edge", ascending=False)
+
+    st.markdown("## 🔥 Top Value Plays (Full Slate)")
+    st.dataframe(full.head(50))
+
+    chart = full.head(20)[["Player","Edge"]].set_index("Player")
+    st.bar_chart(chart)
+
+    st.download_button(
+        "⬇️ Download Full Slate CSV",
+        full.to_csv(index=False).encode(),
+        "full_slate_edges.csv",
+        "text/csv"
+    )
