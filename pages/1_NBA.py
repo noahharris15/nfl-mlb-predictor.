@@ -18,7 +18,41 @@ st.title("🏀 NBA Player Props — Odds API + NBA Stats (live)")
 
 SIM_TRIALS = 10_000
 
-# -------------------- VALID MARKETS (simulated) --------------------
+# ✅ DEFENSE MULTIPLIERS (Converted from your rankings)
+DEFENSE_MULTIPLIERS = {
+    "Oklahoma City Thunder": 1.031,
+    "San Antonio Spurs": 1.053,
+    "Portland Trail Blazers": 1.073,
+    "Miami Heat": 1.073,
+    "Denver Nuggets": 1.074,
+    "Detroit Pistons": 1.076,
+    "Cleveland Cavaliers": 1.084,
+    "Dallas Mavericks": 1.093,
+    "Boston Celtics": 1.097,
+    "Orlando Magic": 1.100,
+    "Houston Rockets": 1.106,
+    "Golden State Warriors": 1.109,
+    "Indiana Pacers": 1.112,
+    "Philadelphia 76ers": 1.116,
+    "Chicago Bulls": 1.122,
+    "Atlanta Hawks": 1.123,
+    "Los Angeles Lakers": 1.127,
+    "Milwaukee Bucks": 1.133,
+    "Minnesota Timberwolves": 1.135,
+    "Phoenix Suns": 1.137,
+    "New York Knicks": 1.138,
+    "Los Angeles Clippers": 1.141,
+    "Memphis Grizzlies": 1.147,
+    "Charlotte Hornets": 1.149,
+    "Utah Jazz": 1.150,
+    "Toronto Raptors": 1.152,
+    "Sacramento Kings": 1.153,
+    "Washington Wizards": 1.167,
+    "New Orleans Pelicans": 1.226,
+    "Brooklyn Nets": 1.249,
+}
+
+# -------------------- VALID MARKETS --------------------
 VALID_MARKETS = [
     "player_points",
     "player_rebounds",
@@ -66,8 +100,8 @@ def t_distribution_draws(mu: float, sd: float, trials: int = SIM_TRIALS):
     return mu + sd * np.random.standard_t(df=5, size=trials)
 
 def sample_sd(sum_x: float, sum_x2: float, g: int, floor: float = 0.0) -> float:
-    g = int(g)
-    if g <= 1: return float("nan")
+    if g <= 1:
+        return float("nan")
     mean = sum_x / g
     var = (sum_x2 / g) - (mean**2)
     var = var * (g / (g - 1))
@@ -98,10 +132,8 @@ def find_player_id_by_name(name: str) -> Optional[int]:
         if cand.empty:
             cand = df.loc[df["last_norm"].str.contains(last)]
         if not cand.empty:
-            cand = cand.loc[
-                cand["first_norm"].str.startswith(first[:1])
-                | cand["first_norm"].str.contains(first)
-            ]
+            cand = cand.loc[cand["first_norm"].str.startswith(first[:1]) |
+                            cand["first_norm"].str.contains(first)]
             if not cand.empty:
                 return int(cand.iloc[0]["id"])
 
@@ -113,55 +145,46 @@ def find_player_id_by_name(name: str) -> Optional[int]:
     return None
 
 def fetch_player_gamelog_df(player_id: int, season: str, season_type: str) -> pd.DataFrame:
-    time.sleep(0.25 + random.random() * 0.15)
-    gl = playergamelog.PlayerGameLog(
-        player_id=player_id, season=season, season_type_all_star=season_type
-    )
+    time.sleep(0.25 + random.random()*0.15)
+    gl = playergamelog.PlayerGameLog(player_id=player_id, season=season, season_type_all_star=season_type)
     df = gl.get_data_frames()[0]
-    if "GAME_DATE" in df.columns:
+    if "GAME_DATE" in df:
         df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
     return df
 
 def agg_full_season(df: pd.DataFrame) -> Dict[str, float]:
-    g = int(df.shape[0])
+    g = len(df)
     if g == 0:
         return {"g": 0}
 
-    def s(col: str) -> Tuple[float, float]:
-        x = pd.to_numeric(df[col], errors="coerce").fillna(0.0).to_numpy()
-        return float(x.sum()), float((x**2).sum())
+    def s(col):
+        arr = pd.to_numeric(df[col], errors="coerce").fillna(0).to_numpy()
+        return float(arr.sum()), float((arr**2).sum())
 
     sums = {}
-    for col in ["PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M", "FGM", "FTM", "FTA"]:
-        sums[col], sums["sq_" + col] = s(col)
+    for col in ["PTS","REB","AST","STL","BLK","TOV","FG3M","FGM","FTM","FTA"]:
+        sums[col], sums["sq_"+col] = s(col)
 
     out = {"g": g}
-    for col in ["PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M", "FGM", "FTM", "FTA"]:
-        out["mu_" + col] = sums[col] / g
-        out["sd_" + col] = sample_sd(sums[col], sums["sq_" + col], g, floor=0.0)
-
+    for col in ["PTS","REB","AST","STL","BLK","TOV","FG3M","FGM","FTM","FTA"]:
+        out["mu_"+col] = sums[col]/g
+        out["sd_"+col] = sample_sd(sums[col], sums["sq_"+col], g)
     return out
 
 # ------------------ Odds API ------------------
 def odds_get(url: str, params: dict) -> dict:
-    r = requests.get(url, params=params, timeout=25)
+    r = requests.get(url, params=params, timeout=30)
     return r.json()
 
-def list_events(api_key: str, lookahead: int, region: str):
+def list_events(api_key, lookahead, region):
     return odds_get(
         f"https://api.the-odds-api.com/v4/sports/{ODDS_SPORT}/events",
-        {
-            "apiKey": api_key,
-            "regions": region,
-            "daysFrom": 0,
-            "daysTo": lookahead if lookahead > 0 else 1,
-        },
+        {"apiKey": api_key, "regions": region, "daysFrom": 0, "daysTo": lookahead or 1},
     )
 
-def fetch_event_props(api_key: str, event_id: str, region: str, markets: List[str]):
-    base = f"https://api.the-odds-api.com/v4/sports/{ODDS_SPORT}/events/{event_id}/odds"
+def fetch_event_props(api_key, event_id, region, markets):
     return odds_get(
-        base,
+        f"https://api.the-odds-api.com/v4/sports/{ODDS_SPORT}/events/{event_id}/odds",
         {
             "apiKey": api_key,
             "regions": region,
@@ -173,30 +196,24 @@ def fetch_event_props(api_key: str, event_id: str, region: str, markets: List[st
 # ------------------ UI ------------------
 st.markdown("### 1) Season Locked to 2025-26")
 season_locked = "2025-26"
-st.caption(f"Using NBA season: **{season_locked}**")
 
-st.markdown("### 2) Pick a game & markets (Odds API)")
-api_key = st.text_input("Odds API Key", value="", type="password")
-region = st.selectbox("Region", ["us", "us2", "eu", "uk"], 0)
+api_key = st.text_input("Odds API Key", "", type="password")
+region = st.selectbox("Region", ["us","us2","eu","uk"])
 lookahead = st.slider("Lookahead days", 0, 7, 1)
 
 markets_pickable = VALID_MARKETS + sorted(list(UNSUPPORTED_MARKETS_HIDE))
-markets = st.multiselect("Markets to fetch", markets_pickable, default=VALID_MARKETS)
+markets = st.multiselect("Markets", markets_pickable, default=VALID_MARKETS)
 
-if api_key:
-    events = list_events(api_key, lookahead, region)
-else:
-    events = []
+events = list_events(api_key, lookahead, region) if api_key else []
 
 if not events:
-    st.info("Enter your Odds API key and pick a lookahead to list games.")
+    st.info("Enter API key.")
     st.stop()
 
-# ✅ Safe home/away parsing
 event_labels = []
 for e in events:
-    away = e.get("away_team") or (e.get("teams") or ["Away", "Home"])[0]
-    home = e.get("home_team") or (e.get("teams") or ["Away", "Home"])[1]
+    away = e.get("away_team") or (e.get("teams") or ["Away","Home"])[0]
+    home = e.get("home_team") or (e.get("teams") or ["Away","Home"])[1]
     date = e.get("commence_time", "")
     event_labels.append(f"{away} @ {home} — {date}")
 
@@ -204,29 +221,23 @@ pick = st.selectbox("Game", event_labels)
 event = events[event_labels.index(pick)]
 event_id = event["id"]
 
-# ------------------ Build projections ------------------
-st.markdown("### 3) Build per-player projections")
+# ------------------ Build Projections ------------------
+st.markdown("### 3) Build Projections")
 build = st.button("📥 Build NBA projections")
 
 if build:
-
-    preview = fetch_event_props(
-        api_key, event_id, region, list(set(markets))
-    )
+    preview = fetch_event_props(api_key, event_id, region, list(set(markets)))
 
     player_names = set()
     for bk in preview.get("bookmakers", []):
         for m in bk.get("markets", []):
-            if m.get("key") in UNSUPPORTED_MARKETS_HIDE:
-                continue
+            if m.get("key") in UNSUPPORTED_MARKETS_HIDE: continue
             for o in m.get("outcomes", []):
                 nm = normalize_name(o.get("description"))
-                if nm:
-                    player_names.add(nm)
+                if nm: player_names.add(nm)
 
     rows = []
     for pn in sorted(player_names):
-
         pid = find_player_id_by_name(pn)
         if not pid:
             continue
@@ -234,42 +245,44 @@ if build:
         df = fetch_player_gamelog_df(pid, season_locked, "Regular Season")
         stats = agg_full_season(df)
 
-        # fallback
         if stats["g"] == 0:
             df2 = fetch_player_gamelog_df(pid, "2024-25", "Regular Season")
             stats2 = agg_full_season(df2)
             if stats2["g"] == 0:
                 continue
-            df = df2
-            stats = stats2
+            df, stats = df2, stats2
 
         rows.append({
             "Player": pn,
             **stats,
-            "game_log": df   # ✅ STORE GAME LOG FOR EMPIRICAL SAMPLING
+            "game_log": df
         })
 
     proj = pd.DataFrame(rows)
     proj["player_norm"] = proj["Player"].apply(normalize_name)
     st.session_state["nba_proj"] = proj
 
-    st.dataframe(proj, use_container_width=True)
+    st.dataframe(proj)
 
 # ------------------ Simulation ------------------
-st.markdown("### 4) Fetch lines & simulate (10k draws)")
-go = st.button("Fetch lines & simulate (NBA)")
+st.markdown("### 4) Fetch lines & simulate")
+go = st.button("Run Simulation")
 
 if go:
 
     proj = st.session_state.get("nba_proj", pd.DataFrame())
     if proj.empty:
-        st.warning("Build projections first")
+        st.warning("Build projections first.")
         st.stop()
 
     props = fetch_event_props(api_key, event_id, region, list(set(markets)))
     proj = proj.set_index("player_norm")
 
     rows = []
+
+    # ✅ Get opponent team
+    home_team = event.get("home_team")
+    away_team = event.get("away_team")
 
     for bk in props.get("bookmakers", []):
         for m in bk.get("markets", []):
@@ -286,14 +299,15 @@ if go:
 
                 row = proj.loc[name]
                 df = row["game_log"]
-
                 side = o["name"]
                 line = float(o["point"])
 
+                # -----------------------------------------
+                # Determine stat column
+                # -----------------------------------------
                 def grab(col):
                     return row[f"mu_{col}"], row[f"sd_{col}"], col
 
-                # Determine stat column
                 if mkey=="player_points":   mu,sd,stat="PTS"
                 elif mkey=="player_rebounds": mu,sd,stat="REB"
                 elif mkey=="player_assists":  mu,sd,stat="AST"
@@ -308,38 +322,43 @@ if go:
                 elif mkey=="player_points_rebounds_assists":
                     stat=None
                     mu=row["mu_PTS"]+row["mu_REB"]+row["mu_AST"]
-                    sd=(row["sd_PTS"]**2+row["sd_REB"]**2+row["sd_AST"]**2)**0.5
+                    sd=(row["sd_PTS"]**2 + row["sd_REB"]**2 + row["sd_AST"]**2)**0.5
 
                 elif mkey=="player_points_rebounds":
                     stat=None
                     mu=row["mu_PTS"]+row["mu_REB"]
-                    sd=(row["sd_PTS"]**2+row["sd_REB"]**2)**0.5
+                    sd=(row["sd_PTS"]**2 + row["sd_REB"]**2)**0.5
 
                 elif mkey=="player_points_assists":
                     stat=None
                     mu=row["mu_PTS"]+row["mu_AST"]
-                    sd=(row["sd_PTS"]**2+row["sd_AST"]**2)**0.5
+                    sd=(row["sd_PTS"]**2 + row["sd_AST"]**2)**0.5
 
                 elif mkey=="player_rebounds_assists":
                     stat=None
                     mu=row["mu_REB"]+row["mu_AST"]
-                    sd=(row["sd_REB"]**2+row["sd_AST"]**2)**0.5
+                    sd=(row["sd_REB"]**2 + row["sd_AST"]**2)**0.5
 
                 elif mkey=="player_blocks_steals":
                     stat=None
                     mu=row["mu_BLK"]+row["mu_STL"]
-                    sd=(row["sd_BLK"]**2+row["sd_STL"]**2)**0.5
+                    sd=(row["sd_BLK"]**2 + row["sd_STL"]**2)**0.5
+
                 else:
                     continue
 
-                # ✅ SHARPER SIMULATION (EMPIRICAL + T-DIST FALLBACK)
-                if stat is not None and stat in df.columns and df.shape[0] >= 6:
-                    stat_vals = df[stat].astype(float).to_numpy()
-                    draws = np.random.choice(stat_vals, SIM_TRIALS, replace=True)
+                # ✅ APPLY DEFENSE ADJUSTMENT
+                opp_team = home_team if side=="Over" else away_team
+                def_mult = DEFENSE_MULTIPLIERS.get(opp_team, 1.0)
+                mu = mu / def_mult
+                sd = sd / def_mult
+
+                # ✅ SHARPER SIMULATION
+                if stat and stat in df.columns and df.shape[0] >= 6:
+                    draws = np.random.choice(df[stat].astype(float).to_numpy(), SIM_TRIALS, True)
                 else:
                     draws = t_distribution_draws(mu, sd)
 
-                # Results
                 projection = float(np.median(draws))
                 win_prob = float((draws > line).mean()) if side=="Over" else float((draws <= line).mean())
 
@@ -347,18 +366,18 @@ if go:
                     "market": mkey,
                     "player": row["Player"],
                     "side": side,
-                    "line": round(line, 2),
-                    "Avg (raw)": round(mu, 2),
-                    "Model Projection": round(projection, 2),
-                    "Win Prob %": round(win_prob * 100, 2),
+                    "line": round(line,2),
+                    "Avg (raw)": round(mu,2),
+                    "Model Projection": round(projection,2),
+                    "Win Prob %": round(win_prob*100,2),
                 })
 
-    results = pd.DataFrame(rows).sort_values(["market", "Win Prob %"], ascending=[True, False])
+    results = pd.DataFrame(rows).sort_values(["market","Win Prob %"], ascending=[True,False])
     st.dataframe(results, use_container_width=True)
 
     st.download_button(
-        "⬇️ Download results CSV",
-        results.to_csv(index=False).encode("utf-8"),
-        file_name="nba_props_sim_results.csv",
-        mime="text/csv",
+        "Download CSV",
+        results.to_csv(index=False).encode(),
+        "nba_props_sim_results.csv",
+        "text/csv",
     )
