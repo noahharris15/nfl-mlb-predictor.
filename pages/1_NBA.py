@@ -48,7 +48,8 @@ nba_defense_season_2025 = {
     "Sacramento": 1.167,
     "Utah": 1.175,
     "New Orleans": 1.176,
-    "Washington": 1.201
+    "Washington": 1.201,
+}
 }
 }
 
