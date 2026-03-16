@@ -3,11 +3,10 @@ pandas>=2.0
 numpy>=1.24
 requests>=2.31
 rapidfuzz>=3.0
-
-# Soccer / FBref support
-soccerdata>=1.6
-beautifulsoup4
-lxml>=4.9
-html5lib>=1.1
-requests_cache>=0.9
+streamlit
+pandas
+numpy
+requests
 nba_api
+scikit-learn
+python-dotenv
