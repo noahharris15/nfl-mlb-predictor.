@@ -3,5 +3,3 @@ pandas
 numpy
 requests
 nba_api
-scikit-learn
-python-dotenv
