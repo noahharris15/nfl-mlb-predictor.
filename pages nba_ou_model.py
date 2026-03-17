@@ -597,9 +597,18 @@ def build_output() -> pd.DataFrame:
     return out
 
 
-def main() -> None:
-    out = build_output()
+def build_ou_output() -> pd.DataFrame:
+    return build_output()
+
+
+def save_ou_output() -> pd.DataFrame:
+    out = build_ou_output()
     out.to_csv(OUTPUT_CSV, index=False)
+    return out
+
+
+def main() -> None:
+    out = save_ou_output()
 
     print(f"\nSaved: {OUTPUT_CSV}\n")
     show_cols = [
@@ -609,5 +618,7 @@ def main() -> None:
     print(out[show_cols].to_string(index=False))
 
 
+# Leave this only if you want to run this file directly from terminal.
+# Streamlit will NOT trigger this when importing the file.
 if __name__ == "__main__":
     main()
