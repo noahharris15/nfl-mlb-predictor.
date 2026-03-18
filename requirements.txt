@@ -3,3 +3,7 @@ pandas
 numpy
 requests
 nba_api
+scikit-learn
+scipy
+joblib
+threadpoolctl
